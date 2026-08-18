@@ -1,0 +1,19 @@
+# The dsh-feishu bundle patch: a Feishu/Lark chat surface directly over dsh-base.
+# It mounts no Host, HTTP server, Web runtime, or browser plugin — same stance
+# as dsh-headless. One plugin row carries the whole bridge; configuration lives
+# in a JSON file (default $DSH_HOME/feishu/config.json) so the row config stays
+# a pointer. Secrets come from the environment (FEISHU_APP_ID / FEISHU_APP_SECRET).
+
+- id: system-prompt
+  config:
+    persona: >-
+      You are a coding agent powered by the {{model}} model. Your working directory is {{cwd}}.
+
+# Same Code Mode opt-in as the Web/headless surfaces.
+- id: tools
+  config:
+    mode: !!js process.env.DSH_TOOLS_MODE
+
+- insert:
+    - id: feishu-bridge
+      name: 'dsh-feishu'

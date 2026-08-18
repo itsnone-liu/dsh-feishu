@@ -1,0 +1,12 @@
+# Your patch layer for the feishu profile. The default layer mounts the
+# bridge plugin by relative path (offline-friendly, no npm install needed);
+# keep the system-prompt/tools rows in the bundle's own patch.
+#
+# If you later install the bundle as a real package
+#   dsh plugin --profile feishu add <dsh-feishu-package>
+# replace the relative name below with 'dsh-feishu'.
+- insert:
+    - id: feishu-bridge
+      name: ../../../dsh-ws/dsh-feishu/src/index.js
+      config:
+        configFile: ''
