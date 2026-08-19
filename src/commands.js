@@ -5,6 +5,7 @@
  *   /new [cwd]         start a fresh session (old one stays on disk)
  *   /stop              cancel the active turn (queued work survives)
  *   /status            binding + live agent state
+ *   /mode [name]       show / switch permission mode (read-only · workspace-write · danger-full-access)
  *   /sessions          list persisted sessions for this workspace (headers only)
  *   /resume <prefix>   rebind this chat to a persisted session
  *   /cwd <path>        set the workspace for the NEXT /new (whitelisted)
@@ -21,20 +22,37 @@ const HELP = [
   '',
   '- 直接发文字 = 和 agent 说话（运行中发送会作为下一步转向输入）',
   '- `/new [cwd]` 新会话 · `/stop` 停止本轮 · `/status` 状态',
+  '- `/mode` 查看/切换权限模式（`/mode ro` 只读 · `/mode rw` 工作区可写 · `/mode full` 全权）',
   '- `/sessions` 列出本工作区会话 · `/resume <id前缀>` 接续旧会话',
   '- `/cwd <路径>` 设定下次新会话的工作区',
   '',
   'agent 提问或请求审批时会弹出按钮卡片；直接回复文字等于自由输入。',
 ].join('\n');
 
+/** Friendly aliases → preset table keys (applied only when the key exists). */
+const MODE_ALIASES = {
+  ro: 'read-only',
+  readonly: 'read-only',
+  read: 'read-only',
+  rw: 'workspace-write',
+  write: 'workspace-write',
+  ww: 'workspace-write',
+  ws: 'workspace-write',
+  full: 'danger-full-access',
+  danger: 'danger-full-access',
+  god: 'danger-full-access',
+};
+
 export class Commands {
-  constructor({ config, store, driver, renderer, transport }) {
+  constructor({ config, store, driver, renderer, transport, permissionPresets }) {
     this.config = config;
     this.store = store;
     this.driver = driver;
     this.renderer = renderer;
     this.transport = transport;
+    this.permissionPresets = permissionPresets;
   }
+
 
   /** Returns true when the text was a command (and has been answered). */
   async handle(chatId, text) {
@@ -53,6 +71,9 @@ export class Commands {
           return await this.cmdStop(chatId);
         case 'status':
           return await this.cmdStatus(chatId);
+        case 'mode':
+        case 'permission':
+          return await this.cmdMode(chatId, arg);
         case 'sessions':
         case 'ls':
           return await this.cmdSessions(chatId);
@@ -124,6 +145,90 @@ export class Commands {
     }
     lines.push(`审批模式：\`${this.config.approval}\``);
     await this.transport.sendCard(chatId, buildInfoCard('桥状态', lines.join('\n')));
+    return true;
+  }
+
+  /** Resolve the live session behind a chat for mode switching (ensure if needed). */
+  async #sessionForMode(chatId) {
+    const binding = this.store.get(chatId);
+    if (!binding?.sessionId && !binding?.cwd) {
+      return { error: '当前聊天还没有会话；先发条消息或 /new 创建，模式随会话生效。' };
+    }
+    try {
+      const agent = await this.driver.ensure(binding);
+      this.store.update(chatId, { sessionId: binding.sessionId, cwd: binding.cwd });
+      if (this.renderer.chatOf(agent.id) !== chatId) this.renderer.attach(agent.id, chatId);
+      return { agent };
+    } catch (e) {
+      return { error: `无法恢复会话：${e.message}` };
+    }
+  }
+
+  #modeLine(service, name, current) {
+    let spec;
+    try {
+      spec = service.resolve(name);
+    } catch {
+      return `- \`${name}\``;
+    }
+    const label = service.optionOf(name)?.label ?? name;
+    const desc = spec.description ? ` — ${spec.description}` : '';
+    const mark = name === current ? ' ← 当前' : '';
+    return `- \`${name}\`（${label}）：sandbox \`${spec.sandbox}\` · 审批 \`${spec.approval}\`${desc}${mark}`;
+  }
+
+  async cmdMode(chatId, arg) {
+    const service = this.permissionPresets;
+    if (!service) {
+      await this.transport.sendCard(chatId, buildErrorCard('模式服务不可用', '本 composition 未加载 dsh-permission-presets。'));
+      return true;
+    }
+
+    const res = await this.#sessionForMode(chatId);
+    if (res.error) {
+      await this.transport.sendCard(chatId, buildInfoCard('模式', res.error, { template: 'grey' }));
+      return true;
+    }
+    const { agent } = res;
+
+    if (!arg) {
+      // bare /mode — current + table
+      const current = service.current(agent.session.events);
+      const names = [...service.names];
+      if (!names.includes(current)) names.push(current); // e.g. 'custom'
+      const lines = [
+        `当前会话：\`${agent.id.replace(/^session-/, '').slice(0, 8)}\``,
+        `当前模式：**${current}**`,
+        '',
+        '可切换：',
+        ...names.map((n) => this.#modeLine(service, n, current)),
+        '',
+        '用法：`/mode <名称或别名>`（ro / rw / full）',
+      ];
+      await this.transport.sendCard(chatId, buildInfoCard('权限模式', lines.join('\n')));
+      return true;
+    }
+
+    // resolve alias → table key
+    const key = arg.toLowerCase();
+    const target = service.names.includes(key) ? key : MODE_ALIASES[key];
+    if (!target || !service.names.includes(target)) {
+      await this.transport.sendCard(chatId, buildErrorCard('未知模式', `\`${arg}\`\n可用：${service.names.join('、')}\n别名：ro / rw / full`));
+      return true;
+    }
+    const before = service.current(agent.session.events);
+    service.set(agent.session, target);
+    const after = service.current(agent.session.events);
+    const spec = service.resolve(target);
+    const lines = [
+      `${before} → **${after}**`,
+      `sandbox：\`${spec.sandbox}\` · 审批：\`${spec.approval}\``,
+      '',
+      after === 'danger-full-access'
+        ? '⚠️ 全权模式：沙箱不限制文件写入，审批自动拒绝改为直通。'
+        : '下一回合起生效（模型会收到模式切换通知）。',
+    ];
+    await this.transport.sendCard(chatId, buildInfoCard('模式已切换', lines.join('\n'), { template: 'orange' }));
     return true;
   }
 

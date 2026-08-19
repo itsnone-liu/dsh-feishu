@@ -18,7 +18,9 @@ resume 全部由 DSH session 层拥有。
 - 一个 turn 一张**流式卡片**：思考摘要 / 正文 / 工具行（✅❌ + 结果预览）/ token 用量 / 耗时
 - `ask_user_question` → 按钮卡片（点按钮或直接回文字均可），回合取消自动失效
 - 工具审批 → 允许一次 / 拒绝 两键卡片（fail-closed）
-- `/new /stop /status /sessions /resume /cwd /help`
+- `/new /stop /status /mode /sessions /resume /cwd /help`
+- **`/mode` 权限模式切换**：`/mode` 查看，`/mode ro|r w|full` 切换（read-only / workspace-write / danger-full-access），
+  走官方 `ctx.permissionPresets`——一次切换联动 sandbox + 审批策略并落审计事件，下一回合对模型生效
 - open_id 白名单（fail-closed，静默丢弃）+ 工作区白名单
 - 事件渲染以 `assistant/message` 权威快照落定——流式抖动不会留错字
 

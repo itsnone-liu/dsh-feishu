@@ -2,7 +2,7 @@
 
 > **实现状态（2026-08-19）：V0.1 已完成并通过全部离线测试。**
 > 代码在本仓库（`src/`），部署见 README.md。
-> - `test/scenario.mjs` 16/16 —— mock agent 全链路（真实 profile boot + 真实 session 事件管线）
+> - `test/scenario.mjs` 20/20 —— 含 `/mode` 权限模式切换（官方 permissionPresets seam）
 > - `test/scenario-real.mjs` 6/6 —— 真实 agent：create / 失败回合 / 磁盘持久化 / **跨进程 resume**
 > - 待真实飞书凭据验证：`vendored` WS 握手（生产建议 `transport: sdk`）
 >

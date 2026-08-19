@@ -90,6 +90,16 @@ const script = [
   { wait: 400 },
   { resumeFromBindings: 0 }, // /resume the FIRST bound session
   { wait: 500 },
+  { text: '/mode' },
+  { wait: 400 },
+  { text: '/mode ro' },
+  { wait: 400 },
+  { text: '/mode' },
+  { wait: 400 },
+  { text: '/mode full' },
+  { wait: 400 },
+  { text: '/mode bogus' },
+  { wait: 400 },
   { text: 'ERR: 报个错' },
   { wait: 900 },
 ];
@@ -157,6 +167,15 @@ check('whitelist drops stranger', !cards.some((c) => md(c).includes('收到：le
 const bindings = JSON.parse(fs.readFileSync(path.join(home, 'feishu', 'bindings.json'), 'utf8'));
 const bound = Object.values(bindings)[0];
 check('bindings persisted', Boolean(bound?.sessionId && bound?.cwd === workspace), JSON.stringify(bound));
+
+// /mode: bare shows table; ro switch; second bare shows read-only (derived from
+// REAL session events written by permissionPresets.set); full warns; bogus errors
+const modeCards = cards.filter((c) => (c.card?.header?.title?.content ?? '') === '权限模式');
+const modeSwitch = cards.find((c) => (c.card?.header?.title?.content ?? '') === '模式已切换');
+check('/mode lists preset table', modeCards.length >= 1 && md(modeCards[0]).includes('read-only') && md(modeCards[0]).includes('workspace-write'));
+check('/mode ro switches (event-backed)', Boolean(modeSwitch && md(modeSwitch).includes('read-only') && modeCards.some((c) => md(c).includes('当前模式：**read-only**'))));
+check('/mode full warns + auto-never approval', Boolean(cards.some((c) => (c.card?.header?.title?.content ?? '') === '模式已切换' && md(c).includes('danger-full-access') && md(c).includes('审批：`never`'))));
+check('/mode bogus rejected', Boolean(cards.some((c) => (c.card?.header?.title?.content ?? '').includes('未知模式'))));
 
 // sessions actually persisted to disk (real session pipeline ran)
 const sessionsRoot = path.join(home, 'sessions');
