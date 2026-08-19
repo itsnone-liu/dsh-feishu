@@ -20,7 +20,7 @@ import { createTransport } from './transport/index.js';
 
 const name = 'feishu-bridge';
 
-const inject = ['agents', 'sessions', 'agentDefaultModel', 'userQuestions', 'approval', 'permissionPresets'];
+const inject = ['agents', 'sessions', 'agentDefaultModel', 'userQuestions', 'approval', 'permissionPresets', 'llm', 'agentPresets'];
 
 const Config = z.object({
   /** Path to the bridge JSON config; empty = $DSH_HOME/feishu/config.json */
@@ -48,7 +48,7 @@ function apply(ctx, config) {
         config: cfg,
         chatOfSession: (sessionId) => renderer.chatOf(sessionId),
       });
-      const commands = new Commands({ config: cfg, store, driver, renderer, transport, permissionPresets: ctx.permissionPresets });
+      const commands = new Commands({ config: cfg, store, driver, renderer, transport, permissionPresets: ctx.permissionPresets, llm: ctx.llm, agentPresets: ctx.agentPresets });
       const router = new ChatRouter({ config: cfg, store, driver, renderer, transport, interactions, commands });
 
       // ---- outbound seams ----

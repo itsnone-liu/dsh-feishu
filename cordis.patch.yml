@@ -17,3 +17,12 @@
 - insert:
     - id: feishu-bridge
       name: 'dsh-feishu'
+
+# The preset roster (same row web mounts). The launcher auto-injects the
+# shipped system root beside the installed app for any profile that has this
+# row; $DSH_HOME/.agent-presets stays the user-authorable root.
+- insert:
+    - id: agent-presets
+      name: '@deepseek-ai/dsh-agent-presets'
+      config:
+        default: standard

@@ -6,6 +6,9 @@
  *   /stop              cancel the active turn (queued work survives)
  *   /status            binding + live agent state
  *   /mode [name]       show / switch permission mode (read-only · workspace-write · danger-full-access)
+ *   /model [p/m]       show / switch model (/model glm-5.3, /model glm-coding/glm-5.3)
+ *   /preset [id]       show / switch agent preset (blank session switches live;
+ *                      a session with history starts a fresh one on the preset)
  *   /sessions          list persisted sessions for this workspace (headers only)
  *   /resume <prefix>   rebind this chat to a persisted session
  *   /cwd <path>        set the workspace for the NEXT /new (whitelisted)
@@ -23,6 +26,8 @@ const HELP = [
   '- 直接发文字 = 和 agent 说话（运行中发送会作为下一步转向输入）',
   '- `/new [cwd]` 新会话 · `/stop` 停止本轮 · `/status` 状态',
   '- `/mode` 查看/切换权限模式（`/mode ro` 只读 · `/mode rw` 工作区可写 · `/mode full` 全权）',
+  '- `/model` 查看/切换模型（如 `/model glm-5.3`；跨厂商用 `厂商/模型` 全称）',
+  '- `/preset` 查看/切换预设（极简 minimal · 标准 standard · code · cordis；有历史的会话自动开新会话）',
   '- `/sessions` 列出本工作区会话 · `/resume <id前缀>` 接续旧会话',
   '- `/cwd <路径>` 设定下次新会话的工作区',
   '',
@@ -44,13 +49,15 @@ const MODE_ALIASES = {
 };
 
 export class Commands {
-  constructor({ config, store, driver, renderer, transport, permissionPresets }) {
+  constructor({ config, store, driver, renderer, transport, permissionPresets, llm, agentPresets }) {
     this.config = config;
     this.store = store;
     this.driver = driver;
     this.renderer = renderer;
     this.transport = transport;
     this.permissionPresets = permissionPresets;
+    this.llm = llm;
+    this.agentPresets = agentPresets;
   }
 
 
@@ -74,6 +81,12 @@ export class Commands {
         case 'mode':
         case 'permission':
           return await this.cmdMode(chatId, arg);
+        case 'model':
+        case 'models':
+          return await this.cmdModel(chatId, arg);
+        case 'preset':
+        case 'presets':
+          return await this.cmdPreset(chatId, arg);
         case 'sessions':
         case 'ls':
           return await this.cmdSessions(chatId);
@@ -104,8 +117,9 @@ export class Commands {
     if (binding.sessionId) await this.driver.unload(binding.sessionId).catch(() => {});
     binding.sessionId = null;
     binding.cwd = cwd;
-    this.store.update(chatId, binding);
     const agent = await this.driver.ensure(binding);
+    // persist AFTER ensure() minted the session id (ensure mutates binding)
+    this.store.update(chatId, { sessionId: binding.sessionId, cwd: binding.cwd });
     this.renderer.attach(agent.id, chatId);
     await this.transport.sendCard(chatId, buildInfoCard('新会话已就绪', [
       `session：\`${agent.id}\``,
@@ -229,6 +243,202 @@ export class Commands {
         : '下一回合起生效（模型会收到模式切换通知）。',
     ];
     await this.transport.sendCard(chatId, buildInfoCard('模式已切换', lines.join('\n'), { template: 'orange' }));
+    return true;
+  }
+
+  // ------------------------------------------------------------------ /model
+
+  /** All advertised (provider, model) pairs, tolerating slow/unavailable discovery. */
+  async #modelCatalog() {
+    const providers = this.llm?.listProviders?.() ?? [];
+    const rows = [];
+    await Promise.all(
+      providers.map(async (p) => {
+        const id = p.id ?? p.name ?? p.provider ?? String(p);
+        let models = [];
+        try {
+          models = await Promise.race([
+            this.llm.listModels(id),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 2500)),
+          ]);
+        } catch {}
+        rows.push({ provider: id, models: (models ?? []).map((m) => m.id ?? m.name ?? String(m)) });
+      })
+    );
+    return rows;
+  }
+
+  async cmdModel(chatId, arg) {
+    if (!this.llm) {
+      await this.transport.sendCard(chatId, buildErrorCard('模型服务不可用', '本 composition 未加载 dsh-llm。'));
+      return true;
+    }
+    const res = await this.#sessionForMode(chatId);
+    if (res.error) {
+      await this.transport.sendCard(chatId, buildInfoCard('模型', res.error, { template: 'grey' }));
+      return true;
+    }
+    const { agent } = res;
+    const current = this.driver.currentModel(agent);
+
+    if (!arg) {
+      const catalog = await this.#modelCatalog();
+      const lines = [`当前模型：**${current ? `${current.provider}/${current.model}` : '—'}**`, ''];
+      for (const row of catalog) {
+        const mark = current?.provider === row.provider ? ' ←' : '';
+        if (row.models.length === 0) {
+          lines.push(`- \`${row.provider}\`${mark}（未列举出模型）`);
+        } else {
+          lines.push(`- \`${row.provider}\`${mark}：${row.models.map((m) => `\`${m}\``).join(' · ')}`);
+        }
+      }
+      lines.push('', '用法：`/model <模型>`（唯一时）或 `/model <厂商>/<模型>`');
+      await this.transport.sendCard(chatId, buildInfoCard('模型', lines.join('\n')));
+      return true;
+    }
+
+    // resolve the target
+    let provider;
+    let model;
+    if (arg.includes('/')) {
+      [provider, model] = arg.split('/').map((x) => x.trim());
+    } else {
+      const catalog = await this.#modelCatalog();
+      const hits = catalog.filter((r) => r.models.includes(arg));
+      if (hits.length === 1) {
+        provider = hits[0].provider;
+        model = arg;
+      } else if (hits.length > 1) {
+        await this.transport.sendCard(chatId, buildErrorCard('模型名不唯一', `多个厂商都有 \`${arg}\`：\n${hits.map((h) => `- ${h.provider}/${arg}`).join('\n')}\n请用全称。`));
+        return true;
+      } else {
+        await this.transport.sendCard(chatId, buildErrorCard('未找到模型', `\`${arg}\` 不在已列举模型中。用 \`/model\` 查看列表，或 \`/model <厂商>/<模型>\` 直接指定。`));
+        return true;
+      }
+    }
+    if (!provider || !model) {
+      await this.transport.sendCard(chatId, buildErrorCard('用法', '/model <模型> 或 /model <厂商>/<模型>'));
+      return true;
+    }
+    if (!this.llm.listProviders().some((p) => (p.id ?? p.name ?? p.provider) === provider)) {
+      await this.transport.sendCard(chatId, buildErrorCard('无法切换', `厂商 \`${provider}\` 未注册（/model 查看可用厂商）`));
+      return true;
+    }
+    this.driver.setModel(agent, provider, model);
+    await this.transport.sendCard(chatId, buildInfoCard('模型已切换', [
+      `${current ? `${current.provider}/${current.model}` : '—'} → **${provider}/${model}**`,
+      '',
+      '下一回合起生效（prompt 变量与请求路由同步切换）。',
+    ].join('\n'), { template: 'green' }));
+    return true;
+  }
+
+  // ---------------------------------------------------------------- /preset
+
+  #sessionIsBlank(session) {
+    return !(session.events ?? []).some((e) => e.type === 'turn/start' || e.type === 'user/message');
+  }
+
+  #currentPreset(agent) {
+    if (this.agentPresets?.composedPreset && agent.ctx) {
+      const live = this.agentPresets.composedPreset(agent.ctx);
+      if (live) return live;
+    }
+    const events = agent.session?.events ?? [];
+    for (let i = events.length - 1; i >= 0; i--) {
+      if (events[i].type === 'agent-preset/selected') return events[i].data.agentPreset;
+    }
+    return agent.session?.header?.agentPreset ?? null;
+  }
+
+  async cmdPreset(chatId, arg) {
+    if (!this.agentPresets) {
+      await this.transport.sendCard(chatId, buildErrorCard('预设服务不可用', '本 composition 未加载 dsh-agent-presets。'));
+      return true;
+    }
+    let presets = [];
+    try {
+      presets = await this.agentPresets.list();
+    } catch (e) {
+      await this.transport.sendCard(chatId, buildErrorCard('预设列表读取失败', e.message));
+      return true;
+    }
+
+    if (!arg) {
+      const binding = this.store.get(chatId);
+      const entry = binding?.sessionId ? this.driver.live.get(binding.sessionId) : null;
+      const current = entry ? this.#currentPreset(entry.agent) : null;
+      const lines = [
+        `当前预设：**${current ?? '—'}**（新会话默认 \`${this.config.agentPreset}\`）`,
+        '',
+        ...presets.map((p) => {
+          const mark = p.id === current ? ' ← 当前' : '';
+          const broken = p.broken ? ` ⚠️ ${p.broken}` : '';
+          return `- \`${p.id}\`[${p.trust}]${broken}${mark}`;
+        }),
+        '',
+        '空白会话直接切换；有历史的会话将自动以该预设**开新会话**（旧会话保留在盘上）。',
+      ];
+      await this.transport.sendCard(chatId, buildInfoCard('Agent 预设', lines.join('\n')));
+      return true;
+    }
+
+    // resolve + validate the target preset
+    let preset;
+    try {
+      preset = await this.agentPresets.resolve(arg);
+      if (preset.broken) throw new Error(`预设损坏：${preset.broken}`);
+    } catch (e) {
+      await this.transport.sendCard(chatId, buildErrorCard('未知预设', `\`${arg}\`：${e.message}\n可用：${presets.filter((p) => !p.broken).map((p) => p.id).join('、')}`));
+      return true;
+    }
+
+    const binding = this.store.get(chatId) ?? { sessionId: null, cwd: this.config.defaultCwd };
+    const entry = binding.sessionId ? this.driver.live.get(binding.sessionId) : null;
+
+    // Blank live session → real in-place recompose (official supported path).
+    if (entry && this.#sessionIsBlank(entry.agent.session) && entry.agent.ctx && !this.config.mockAgent) {
+      try {
+        await this.agentPresets.recompose(entry.agent.ctx, preset.id);
+      } catch (e) {
+        await this.transport.sendCard(chatId, buildErrorCard('切换失败', e.message));
+        return true;
+      }
+      await this.transport.sendCard(chatId, buildInfoCard('预设已切换', [
+        `${this.#currentPreset(entry.agent)} → **${preset.id}**`,
+        '',
+        '会话仍为空白，已原地重组（工具与提示词即刻更换）。',
+      ].join('\n'), { template: 'green' }));
+      return true;
+    }
+
+    // Mock approximation of the blank switch: record the selection event only.
+    if (entry && this.#sessionIsBlank(entry.agent.session) && this.config.mockAgent) {
+      try {
+        entry.agent.session.append('agent-preset/selected', { agentPreset: preset.id });
+      } catch {}
+      await this.transport.sendCard(chatId, buildInfoCard('预设已切换（mock）', `${preset.id}（事件已记录）`));
+      return true;
+    }
+
+    // Session with history (or no live agent): start a fresh session on the preset.
+    if (binding.sessionId) await this.driver.unload(binding.sessionId).catch(() => {});
+    binding.sessionId = null;
+    binding.cwd = binding.cwd ?? this.config.defaultCwd;
+    this.store.update(chatId, binding);
+    try {
+      const agent = await this.driver.ensure(binding, { preset: preset.id });
+      this.renderer.attach(agent.id, chatId);
+      this.store.update(chatId, { sessionId: binding.sessionId, cwd: binding.cwd });
+      await this.transport.sendCard(chatId, buildInfoCard('已用新预设开会话', [
+        `预设：\`${preset.id}\` · session：\`${agent.id.replace(/^session-/, '').slice(0, 8)}\``,
+        `工作区：\`${binding.cwd}\``,
+        '',
+        '原会话有历史，预设不能原地切换（会破坏工具/提示词与历史的对应）；旧会话保留，`/sessions` 可回。',
+      ].join('\n'), { template: 'green' }));
+    } catch (e) {
+      await this.transport.sendCard(chatId, buildErrorCard('新会话创建失败', e.message));
+    }
     return true;
   }
 

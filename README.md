@@ -21,6 +21,10 @@ resume 全部由 DSH session 层拥有。
 - `/new /stop /status /mode /sessions /resume /cwd /help`
 - **`/mode` 权限模式切换**：`/mode` 查看，`/mode ro|r w|full` 切换（read-only / workspace-write / danger-full-access），
   走官方 `ctx.permissionPresets`——一次切换联动 sandbox + 审批策略并落审计事件，下一回合对模型生效
+- **`/model` 模型切换**：`/model` 列出各厂商模型，`/model glm-5.3`（唯一时）或 `/model glm-coding/glm-5.3`；
+  走 `installModelSelection` 可变 selection——下一回合路由切换并落 `request/header(change)`；resume 会保留上次模型
+- **`/preset` 预设切换**：`/preset` 列出 minimal/standard/code/cordis（含自建预设）；空白会话原地
+  `recompose()`（工具/提示词即刻更换），有历史的会话自动以新预设开新会话（历史锁定是官方防 replay 设计）
 - open_id 白名单（fail-closed，静默丢弃）+ 工作区白名单
 - 事件渲染以 `assistant/message` 权威快照落定——流式抖动不会留错字
 

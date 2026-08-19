@@ -102,6 +102,26 @@ const script = [
   { wait: 400 },
   { text: 'ERR: 报个错' },
   { wait: 900 },
+  { text: '/model' },
+  { wait: 800 },
+  { text: '/model deepseek-official/deepseek-v4-pro' },
+  { wait: 400 },
+  { text: '/model' },
+  { wait: 800 },
+  { text: '/model nosuch' },
+  { wait: 900 },
+  { text: '/preset' },
+  { wait: 500 },
+  { text: '/preset standard' },
+  { wait: 600 },   // session has history (ERR turn) → fresh session card
+  { text: '/preset' },
+  { wait: 500 },
+  { text: '/preset cordis' },
+  { wait: 600 },   // the fresh session is BLANK → mock live-switch card
+  { text: '/preset' },
+  { wait: 500 },   // bare re-read must show cordis (event-backed)
+  { text: '/preset bogus' },
+  { wait: 500 },
 ];
 const scriptFile = path.join(sandbox, 'script.json');
 fs.writeFileSync(scriptFile, JSON.stringify(script));
@@ -176,6 +196,20 @@ check('/mode lists preset table', modeCards.length >= 1 && md(modeCards[0]).incl
 check('/mode ro switches (event-backed)', Boolean(modeSwitch && md(modeSwitch).includes('read-only') && modeCards.some((c) => md(c).includes('当前模式：**read-only**'))));
 check('/mode full warns + auto-never approval', Boolean(cards.some((c) => (c.card?.header?.title?.content ?? '') === '模式已切换' && md(c).includes('danger-full-access') && md(c).includes('审批：`never`'))));
 check('/mode bogus rejected', Boolean(cards.some((c) => (c.card?.header?.title?.content ?? '').includes('未知模式'))));
+
+// /model
+const modelCards = cards.filter((c) => (c.card?.header?.title?.content ?? '') === '模型');
+const modelSwitch = cards.find((c) => (c.card?.header?.title?.content ?? '') === '模型已切换');
+check('/model bare lists providers', modelCards.length >= 1 && md(modelCards[0]).includes('当前模型'));
+check('/model explicit switch + reflected', Boolean(modelSwitch && md(modelSwitch).includes('deepseek-v4-pro') && modelCards.some((c) => md(c).includes('当前模型：**deepseek-official/deepseek-v4-pro**'))));
+check('/model unknown rejected', Boolean(cards.some((c) => (c.card?.header?.title?.content ?? '').includes('未找到模型'))));
+
+// /preset
+const presetCards = cards.filter((c) => (c.card?.header?.title?.content ?? '') === 'Agent 预设');
+check('/preset lists roster', presetCards.some((c) => md(c).includes('minimal') && md(c).includes('standard')));
+check('/preset on history → fresh session', Boolean(cards.some((c) => (c.card?.header?.title?.content ?? '') === '已用新预设开会话' && md(c).includes('standard'))));
+check('/preset blank → live switch (event)', Boolean(presetCards.some((c) => md(c).includes('当前预设：**cordis**'))));
+check('/preset bogus rejected', Boolean(cards.some((c) => (c.card?.header?.title?.content ?? '').includes('未知预设'))));
 
 // sessions actually persisted to disk (real session pipeline ran)
 const sessionsRoot = path.join(home, 'sessions');

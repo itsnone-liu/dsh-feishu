@@ -92,6 +92,12 @@ function runPhase(label, scriptSteps, tailWait) {
 const p1 = runPhase('p1', [
   { text: '/new' },
   { wait: 500 },
+  // blank real session → REAL recompose path (agentPresets service + live ctx)
+  { text: '/preset standard' },
+  { wait: 800 },
+  // real selection-object model switch (provider route check, no network)
+  { text: '/model deepseek-official/deepseek-v4-pro' },
+  { wait: 500 },
   { text: 'hi, this must fail offline' },
   { wait: 20000 }, // request + bounded retries + turn close
   { text: '/status' },
@@ -100,6 +106,8 @@ const p1 = runPhase('p1', [
 
 const p1cards = p1.filter((x) => x.kind === 'card');
 check('p1: /new created a real agent', p1cards.some((c) => md(c).includes('新会话已就绪')));
+check('p1: real blank-session preset recompose', p1cards.some((c) => (c.card?.header?.title?.content ?? '') === '预设已切换' && md(c).includes('standard')));
+check('p1: real model switch (selection object)', p1cards.some((c) => (c.card?.header?.title?.content ?? '') === '模型已切换' && md(c).includes('deepseek-v4-pro')));
 check('p1: request failure → error turn card', p1cards.some((c) => (c.card?.header?.title?.content ?? '').startsWith('✗')));
 check('p1: session persisted to real disk', (() => {
   const root = path.join(home, 'sessions');

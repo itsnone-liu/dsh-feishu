@@ -49,6 +49,13 @@ cat > "$PROFILE/cordis.patch.yml" << EOP
       name: $ESCAPED_REPO/src/index.js
       config:
         configFile: ''
+
+# The preset roster (same row web mounts); the launcher injects the shipped
+# system root automatically for any profile carrying this row.
+    - id: agent-presets
+      name: '@deepseek-ai/dsh-agent-presets'
+      config:
+        default: standard
 EOP
 
 # 3) bridge data dir + starter config
