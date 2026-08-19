@@ -18,10 +18,19 @@ export async function createTransport(config) {
       const mod = await import('@larksuiteoapi/node-sdk');
       const { SdkTransport } = await import('./sdk.js');
       return new SdkTransport(config, mod);
-    } catch (e) {
-      if (wanted === 'sdk') throw e;
-      log.warn('official lark SDK not installed — falling back to vendored client');
-      return new LarkTransport(config);
+    } catch {
+      /* ESM bare-specifier may fail if CWD ≠ profile dir;
+         try the absolute path as fallback. */
+      try {
+        const sdkPath = '/root/.dsh/profiles/feishu/node_modules/@larksuiteoapi/node-sdk/lib/index.js';
+        const mod = await import('file://' + sdkPath);
+        const { SdkTransport } = await import('./sdk.js');
+        return new SdkTransport(config, mod);
+      } catch (e2) {
+        if (wanted === 'sdk') throw e2;
+        log.warn('official lark SDK not installed — falling back to vendored client');
+        return new LarkTransport(config);
+      }
     }
   }
   throw new Error(`unknown transport: ${wanted}`);

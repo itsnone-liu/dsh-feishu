@@ -51,7 +51,9 @@ export class SdkTransport {
         }
       },
     });
-    this.wsClient = new this.sdk.WSClient(this.config.appId, this.config.appSecret, {
+    this.wsClient = new this.sdk.WSClient({
+      appId: this.config.appId,
+      appSecret: this.config.appSecret,
       domain: this.config.apiBase,
       loggerLevel: this.sdk.LoggerLevel.info,
     });
