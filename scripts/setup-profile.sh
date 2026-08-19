@@ -21,7 +21,7 @@ for cand in "$HOME/.dsh/profiles/node_modules" "$PROFILES/node_modules"; do
 done
 if [ -z "$SRC_MODULES" ]; then
   # fall back to the npx cache layout
-  hit="$(find /root/.npm/_npx -maxdepth 4 -type d -name 'schemastery' -path '*@deepseek-ai*' 2>/dev/null | head -1)"
+  hit="$(find "$HOME/.npm/_npx" -maxdepth 4 -type d -name 'schemastery' -path '*@deepseek-ai*' 2>/dev/null | head -1)"
   [ -n "$hit" ] && SRC_MODULES="$(dirname "$(dirname "$hit")")"
 fi
 echo "deepseek packages from: $SRC_MODULES"

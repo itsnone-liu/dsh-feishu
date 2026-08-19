@@ -5,6 +5,7 @@
  *   'vendored' → dependency-free REST+WS client (lark.js)
  *   'auto'     → sdk if importable, else vendored
  */
+import path from 'path';
 import { log } from '../log.js';
 import { MockTransport } from './mock.js';
 import { LarkTransport } from './lark.js';
@@ -22,7 +23,7 @@ export async function createTransport(config) {
       /* ESM bare-specifier may fail if CWD ≠ profile dir;
          try the absolute path as fallback. */
       try {
-        const sdkPath = '/root/.dsh/profiles/feishu/node_modules/@larksuiteoapi/node-sdk/lib/index.js';
+        const sdkPath = path.join(process.env.HOME || '', '.dsh/profiles/feishu/node_modules/@larksuiteoapi/node-sdk/lib/index.js');
         const mod = await import('file://' + sdkPath);
         const { SdkTransport } = await import('./sdk.js');
         return new SdkTransport(config, mod);

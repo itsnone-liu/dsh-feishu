@@ -31,7 +31,7 @@ resume 全部由 DSH session 层拥有。
 ## 安装（离线，无需 pnpm/网络）
 
 ```sh
-cd /root/dsh-ws/dsh-feishu
+cd dsh-feishu
 ./scripts/setup-profile.sh          # 安装到 ~/.dsh/profiles/feishu（symlink 方式）
 ```
 

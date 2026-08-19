@@ -20,7 +20,7 @@ import path from 'node:path';
 const REPO = path.resolve(import.meta.dirname, '..');
 const DSH_BIN =
   process.env.DSH_BIN ||
-  '/root/.npm/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/bin.js';
+  `${process.env.HOME}/.npm/_npx/1e7f6d9597241db0/node_modules/@deepseek-ai/dsh/lib/bin.js`;
 
 // ---------------------------------------------------------------- sandbox
 const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-feishu-e2e-'));

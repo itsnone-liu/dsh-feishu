@@ -64,7 +64,7 @@
 const handle = await ctx.agents.create({
   sessionId,                          // 自己 mint 的 id
   meta: {
-    cwd: '/root/project/foo',         // ✅ workspace 绑定就靠这个
+    cwd: '/home/user/project/foo',         // ✅ workspace 绑定就靠这个
     agentPreset: 'minimal',           // 用户当前用的极简 preset
   },
   agentOptions: {
@@ -220,8 +220,8 @@ agent.status === 'idle'
 
 ```json
 {
-  "chat_oc_xxx": { "sessionId": "session-<uuid>", "cwd": "/root/project/foo" },
-  "chat_oc_yyy": { "sessionId": null, "cwd": "/root/project/bar" }
+  "chat_oc_xxx": { "sessionId": "session-<uuid>", "cwd": "/home/user/project/foo" },
+  "chat_oc_yyy": { "sessionId": null, "cwd": "/home/user/project/bar" }
 }
 ```
 
