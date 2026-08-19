@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Feishu/Lark channel for DeepSeek Harness (dsh) — a sibling surface over dsh-base",
+  "description": "Feishu/Lark chat channel for DeepSeek Harness (dsh) — a sibling surface over dsh-base",
   "main": "src/index.js",
   "exports": {
     ".": "./src/index.js",
@@ -13,7 +13,32 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
-    }
+    },
+    "capabilities": {
+      "required": [
+        "dsh.profile.surface",
+        "channel.chat"
+      ],
+      "optional": [
+        "channel.chat.group",
+        "media.cards.interactive"
+      ]
+    },
+    "note": "no dsh.client section: this surface ships no browser components"
   },
-  "dependencies": {}
+  "dependencies": {},
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "feishu",
+    "lark"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "local"
+  }
 }

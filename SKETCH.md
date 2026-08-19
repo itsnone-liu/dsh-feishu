@@ -8,6 +8,27 @@
 >
 > 基于 `@deepseek-ai/dsh@0.1.0-rc.7`（本机 npx 缓存实测）+ 飞书 oapi-sdk。
 
+## 9. 与 DSH Desktop / Community Fabric 的关系（2026-08-19 调研）
+
+调研了 [anywhere-labs/deepseek-harness-desktop](https://github.com/anywhere-labs/deepseek-harness-desktop)
+（Electron 桌面壳 + 社区插件市场 + Fabric 互操作标准草案）。结论：
+
+- **它没有飞书桥**：全仓库无 feishu/lark 代码；其"手机远程控制"是 iOS/Android app 连
+  Desktop，且尚在"即将推出"状态。与本桥**互补不竞争**：他们做本机 GUI Presentation，
+  我们做聊天通道 Presentation，共用同一个 DSH Runtime。
+- **RFC 0002（Runtime/Presentation/Control/Transport 分层）验证了本桥的核心决策**：
+  - "插件不能依据 isRemote/hostType/Transport 分支"——本桥的 DSH 侧（driver/renderer 数据面）
+    完全不知道飞书存在，只走 `ctx.agents` / session 事件 / 两个 seam；飞书特异性全部
+    封在 transport/ 与 cards.js。天然对齐。
+  - "短期敏感数据不得进持久化 session 结果"——ask/approval 的 pending 状态只存内存
+    （InteractionManager 的 Map），session 里只有审计事件。对齐。
+  - 未来若 Fabric 落地，本桥可作为现成的 Transport+Presentation 参考实现接入。
+- **分发准备已做**：`package.json` 按 dsh-community-market 的 catalog schema 约定声明了
+  `dsh.capabilities`（字符串已过 schema 正则校验）与 npm 元数据；待发布时补构建层
+  （参考 dsh-plugin-desktop 的 tsdown+tsc 布局）。不设 `dsh.client`（本桥无浏览器组件）。
+- 他们的"不魔改上游、固定版本运行官方 Harness"原则与本桥 seam-only/锁 rc.7 策略一致。
+
+
 ## 0. 架构修正（相对原分析的三个变化）
 
 ```

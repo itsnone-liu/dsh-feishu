@@ -100,3 +100,12 @@ node test/dump-session-events.mjs   # session 事件录制/检查工具
   `/resume` 接续已验证可用。V0.2 计划加文件锁与占用提示。
 - 群聊、图片/文件消息、@ 触发、长输出转文件、todo/diff 卡片。
 - `vendored` WS 协议未经真实凭据验证（优先用 `sdk`）。
+
+## 与 DSH Desktop 的关系
+
+[anywhere-labs/deepseek-harness-desktop](https://github.com/anywhere-labs/deepseek-harness-desktop)
+是社区桌面客户端（Electron 壳 + 插件市场），**不含飞书桥**；其手机远程（iOS/Android 连桌面）
+尚在开发中。本桥与它互补：同一 DSH Runtime 的不同 Presentation。
+`package.json` 已按其市场 catalog schema 约定声明 capabilities，未来可经其插件市场分发。
+详见 SKETCH.md §9。
+
