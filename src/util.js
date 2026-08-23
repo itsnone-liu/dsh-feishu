@@ -22,6 +22,29 @@ export function newSessionId() {
   return `session-${randomUUID()}`;
 }
 
+/**
+ * Group-message admission per config.groups:
+ *  - 'off'     p2p only, never respond in groups (default, fail-closed)
+ *  - 'mention' only when the bot itself is @-mentioned; unknown bot identity
+ *              (open_id unresolvable) also fails closed
+ *  - 'all'     any group message (sender still passes the open_id whitelist)
+ * Non-text messages in groups require 'all' (images/files cannot carry a
+ * mention). Mention shape per official docs: { key: '@_user_1',
+ * id: { open_id } } — to be cross-checked by research R2.
+ * @returns {{ ok: boolean, botMentionKey?: string }}
+ */
+export function groupAdmission(config, chatType, messageType, mentions = [], botOpenId = null) {
+  if (chatType === 'p2p') return { ok: true };
+  const mode = config.groups ?? 'off';
+  if (mode === 'off') return { ok: false };
+  if (mode === 'all') return { ok: true };
+  // 'mention'
+  if (messageType !== 'text') return { ok: false };
+  if (!botOpenId) return { ok: false };
+  const hit = (mentions ?? []).find((m) => m?.id?.open_id === botOpenId || m?.open_id === botOpenId);
+  return hit ? { ok: true, botMentionKey: hit.key } : { ok: false };
+}
+
 /** Random interaction id (ask / approval cards). */
 export function newInteractionId(prefix) {
   return `${prefix}_${randomUUID().slice(0, 8)}`;

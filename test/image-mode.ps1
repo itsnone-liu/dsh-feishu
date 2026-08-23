@@ -122,6 +122,31 @@ Run-Bridge 'C 文件消息' @{} @(
   }
 }
 
+# ---------------------------------------------------------------- 场景 D
+Run-Bridge 'D 群聊@门控' @{ groups = 'mention' } @(
+  @{ text = '你好私聊' },
+  @{ wait = 600 },
+  @{ text = '群里@提问'; group = $true; mentionBot = $true },
+  @{ wait = 1200 },
+  @{ text = 'no reply please'; group = $true },
+  @{ wait = 800 },
+  @{ text = 'p2p again' },
+  @{ wait = 1200 }
+) {
+  param($name, $cards, $allText, $homeDir)
+  $checks = @(
+    @{ pat = '你好私聊'; want = $true; desc = '私聊正常' },
+    @{ pat = '群里@提问'; want = $true; desc = '群内@触发' },
+    @{ pat = 'no reply please'; want = $false; desc = '群内未@静默' },
+    @{ pat = 'p2p again'; want = $true; desc = '私聊恢复' }
+  )
+  foreach ($c in $checks) {
+    $has = $allText.IndexOf($c.pat) -ge 0
+    if ($has -eq $c.want) { Write-Host "PASS [$name] $($c.desc)"; $script:pass++ }
+    else { Write-Host "FAIL [$name] $($c.desc)（want=$($c.want) has=$has）"; $script:fail++ }
+  }
+}
+
 Write-Host ''
 Write-Host "结果：$pass 通过 / $fail 失败"
 exit $(if ($fail -gt 0) { 1 } else { 0 })

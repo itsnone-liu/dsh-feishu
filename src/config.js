@@ -28,8 +28,9 @@ const DEFAULTS = {
   dataDir: '',
   /** HARD security gate: only these open_ids may talk to the bridge. */
   allowedOpenIds: [],
-  /** Also allow group chats (V0.2 semantics: requires @mention). */
-  allowGroupChats: false,
+  /** Group chats: 'off' (p2p only, fail-closed) | 'mention' (@bot only,
+   *  text messages) | 'all' (any message, sender still whitelisted). */
+  groups: 'off',
   /** Default workspace cwd for new chats; must be inside allowedWorkspaces. */
   defaultCwd: '',
   /** cwd whitelist — chat bindings and /cwd may only use these. */
@@ -72,6 +73,9 @@ function coerce(raw) {
   if (process.env.DSH_FEISHU_TRANSPORT) cfg.transport = process.env.DSH_FEISHU_TRANSPORT;
   if (process.env.DSH_FEISHU_DATA_DIR) cfg.dataDir = process.env.DSH_FEISHU_DATA_DIR;
   if (process.env.DSH_FEISHU_MOCK_AGENT === '1') cfg.mockAgent = true;
+  // legacy boolean → groups enum
+  if (raw?.allowGroupChats === true) cfg.groups = 'mention';
+  if (!['off', 'mention', 'all'].includes(cfg.groups)) cfg.groups = 'off';
   if (!cfg.dataDir) cfg.dataDir = path.join(dshHome(), 'feishu');
   cfg.appId = process.env.FEISHU_APP_ID || process.env.DSH_FEISHU_APP_ID || '';
   cfg.appSecret = process.env.FEISHU_APP_SECRET || process.env.DSH_FEISHU_APP_SECRET || '';

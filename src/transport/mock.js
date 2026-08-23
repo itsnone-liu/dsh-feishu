@@ -12,13 +12,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
-import { sleep } from '../util.js';
+import { sleep, groupAdmission } from '../util.js';
 import { log } from '../log.js';
 
 let seq = 0;
 const nextId = (p) => `${p}_${Date.now().toString(36)}_${(seq++).toString(36)}`;
 
 export class MockTransport {
+  /** Fixed bot identity for group-gate emulation in tests. */
+  static BOT_OPEN_ID = 'ou_mock_bot';
   constructor(config) {
     this.kind = 'mock';
     this.config = config;
@@ -84,6 +86,8 @@ export class MockTransport {
           images: [{ data, name: step.image }],
           chatId: step.chatId,
           openId: step.openId,
+          group: step.group,
+          mentionBot: step.mentionBot,
         });
         continue;
       }
@@ -96,11 +100,19 @@ export class MockTransport {
           files: [{ data, name }],
           chatId: step.chatId,
           openId: step.openId,
+          group: step.group,
+          mentionBot: step.mentionBot,
         });
         continue;
       }
       if (step.text !== undefined) {
-        await this.userMessage({ text: step.text, chatId: step.chatId, openId: step.openId });
+        await this.userMessage({
+          text: step.text,
+          chatId: step.chatId,
+          openId: step.openId,
+          group: step.group,
+          mentionBot: step.mentionBot,
+        });
         continue;
       }
       if (step.click) {
@@ -123,13 +135,24 @@ export class MockTransport {
     if (process.env.DSH_FEISHU_MOCK_EXIT !== '0') process.exit(0);
   }
 
-  async userMessage({ text, images, files, chatId, openId, messageId }) {
+  async userMessage({ text, images, files, chatId, openId, messageId, group, mentionBot }) {
     if (!this.handlers) throw new Error('mock: not started');
+    const chatType = group ? 'group' : 'p2p';
+    // emulate the group gate of the real transports (bot id is fixed here)
+    const mentions = mentionBot
+      ? [{ key: '@_user_1', id: { open_id: MockTransport.BOT_OPEN_ID }, name: 'bot' }]
+      : [];
+    const adm = groupAdmission(this.config, chatType, images?.length ? 'image' : files?.length ? 'file' : 'text', mentions, MockTransport.BOT_OPEN_ID);
+    if (!adm.ok) {
+      log.info(`mock: dropped ${chatType} message (group gate: ${this.config.groups})`);
+      return;
+    }
     const msg = {
-      chatId: chatId ?? this.defaultChat,
+      chatId: chatId ?? (group ? 'oc_mock_group' : this.defaultChat),
       openId: openId ?? this.defaultOpen,
       messageId: messageId ?? nextId('in'),
-      text,
+      chatType,
+      text: String(text ?? '').replace(/@_user_\d+/g, '').trim(),
       images: images ?? [],
       files: files ?? [],
     };

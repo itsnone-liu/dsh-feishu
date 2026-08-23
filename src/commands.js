@@ -163,6 +163,11 @@ export class Commands {
       ? (this.config.appId ? 'auto → sdk（长连接）' : 'auto → 未配置 FEISHU_APP_ID')
       : this.config.transport;
     rows.push(`${this.config.transport === 'mock' ? '⚠️' : '✅'} 传输模式：\`${t}\`${this.config.mockAgent ? '（mockAgent 测试模式）' : ''}`);
+    const gm = this.config.groups;
+    rows.push(`ℹ️ 群聊模式：\`${gm}\`${
+      gm === 'off' ? '（仅私聊响应）'
+      : gm === 'mention' ? '（仅群内 @机器人 的文本消息；机器人身份运行时经 bot/v3/info 解析）'
+      : '（群内全部消息，发送者白名单仍生效）'}`);
 
     // current session model + image capability
     const binding = this.store.get(chatId);

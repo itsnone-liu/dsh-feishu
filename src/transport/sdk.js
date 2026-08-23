@@ -7,6 +7,7 @@
  *   dsh plugin --profile feishu add @larksuiteoapi/node-sdk
  */
 import { log } from '../log.js';
+import { groupAdmission } from '../util.js';
 
 export class SdkTransport {
   constructor(config, sdk) {
@@ -19,15 +20,43 @@ export class SdkTransport {
       appType: sdk.AppType.SelfBuild,
       domain: config.apiBase,
     });
+    /** Cached bot open_id (null while unresolved). */
+    this.botOpenId = undefined;
+  }
+  #botInfoAt = 0;
+
+  /**
+   * Resolve our own open_id via GET /open-apis/bot/v3/info (cached, retried
+   * at most once per minute). Group @-mention gating fails closed without it.
+   */
+  async #ensureBotOpenId() {
+    if (this.botOpenId !== undefined) return this.botOpenId;
+    if (Date.now() - this.#botInfoAt < 60000) return null;
+    this.#botInfoAt = Date.now();
+    try {
+      const res = await this.client.request({ url: '/open-apis/bot/v3/info', method: 'GET' });
+      this.botOpenId = res?.data?.bot?.open_id ?? res?.bot?.open_id ?? null;
+      if (this.botOpenId) log.info(`bot open_id resolved: ${this.botOpenId}`);
+      else log.warn('bot/v3/info returned no open_id — group mention gating fails closed');
+    } catch (e) {
+      this.botOpenId = null;
+      log.warn(`bot/v3/info failed（群聊 @ 门控将失效关闭）: ${e.message}`);
+    }
+    return this.botOpenId;
   }
 
   async start(handlers) {
     const dispatcher = new this.sdk.EventDispatcher({}).register({
       'im.message.receive_v1': async (data) => {
         const message = data?.message ?? {};
-        if (message.chat_type !== 'p2p' && !this.config.allowGroupChats) return;
+        const chatType = message.chat_type;
         const type = message.message_type;
         if (type !== 'text' && type !== 'image' && type !== 'file') return;
+        // group gate (p2p always passes)
+        if (chatType !== 'p2p') {
+          const adm = groupAdmission(this.config, chatType, type, message.mentions ?? [], await this.#ensureBotOpenId());
+          if (!adm.ok) return;
+        }
         let text = '';
         let images = [];
         let imageError = '';

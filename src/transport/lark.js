@@ -17,9 +17,11 @@
  * this vendored path exists so the bridge runs with zero npm dependencies.
  */
 import { log } from '../log.js';
-import { sleep } from '../util.js';
+import { sleep, groupAdmission } from '../util.js';
 
 export class LarkTransport {
+  #botInfoAt = 0;
+
   constructor(config) {
     this.kind = 'vendored';
     this.config = config;
@@ -30,6 +32,8 @@ export class LarkTransport {
     this.ws = null;
     this.closed = false;
     this.heartbeatTimer = null;
+    /** Cached bot open_id (null while unresolved). */
+    this.botOpenId = undefined;
   }
 
   // ------------------------------------------------------------- REST core
@@ -64,6 +68,26 @@ export class LarkTransport {
     });
     if (!res.ok) throw new Error(`feishu http ${res.status} ${path}`);
     return await res.json();
+  }
+
+  /**
+   * Resolve our own open_id via GET /open-apis/bot/v3/info (cached, retried
+   * at most once per minute). Group @-mention gating fails closed without it.
+   */
+  async #ensureBotOpenId() {
+    if (this.botOpenId !== undefined) return this.botOpenId;
+    if (Date.now() - this.#botInfoAt < 60000) return null;
+    this.#botInfoAt = Date.now();
+    try {
+      const res = await this.#rawRequest('GET', '/open-apis/bot/v3/info');
+      this.botOpenId = res?.bot?.open_id ?? null;
+      if (this.botOpenId) log.info(`bot open_id resolved: ${this.botOpenId}`);
+      else log.warn('bot/v3/info returned no open_id — group mention gating fails closed');
+    } catch (e) {
+      this.botOpenId = null;
+      log.warn(`bot/v3/info failed（群聊 @ 门控将失效关闭）: ${e.message}`);
+    }
+    return this.botOpenId;
   }
 
   async #api(method, path, body, query = '') {
@@ -253,9 +277,12 @@ export class LarkTransport {
       const message = event.message ?? {};
       const sender = event.sender ?? {};
       const chatType = message.chat_type;
-      if (chatType !== 'p2p' && !this.config.allowGroupChats) return;
       const type = message.message_type;
       if (type !== 'text' && type !== 'image' && type !== 'file') return;
+      if (chatType !== 'p2p') {
+        const adm = groupAdmission(this.config, chatType, type, message.mentions ?? [], await this.#ensureBotOpenId());
+        if (!adm.ok) return;
+      }
       let text = '';
       let images = [];
       let imageError = '';
