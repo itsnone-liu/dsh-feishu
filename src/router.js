@@ -38,6 +38,14 @@ export class ChatRouter {
       try {
         await this.#handle(msg);
       } catch (e) {
+        if (e?.occupied) {
+          log.warn(`chat ${msg.chatId}: session occupied elsewhere`);
+          await this.transport.sendCard(msg.chatId, buildErrorCard(
+            '会话正被另一端使用',
+            '该会话当前由其他程序（如 WebUI 或另一个桥进程）占用。\n\n- 在另一端退出/关闭后重发消息即可接续；\n- 或发 `/new` 在本聊天开一个全新会话。',
+          )).catch(() => {});
+          return;
+        }
         log.error(`chat ${msg.chatId}: ${e.stack ?? e}`);
         await this.transport
           .sendCard(msg.chatId, buildErrorCard('桥内部错误', e.message))
@@ -231,6 +239,13 @@ export class ChatRouter {
         const agent = await this.#agentFor(chatId);
         await this.#submitImages(chatId, agent, batch);
       } catch (e) {
+        if (e?.occupied) {
+          await this.transport.sendCard(chatId, buildErrorCard(
+            '会话正被另一端使用',
+            '该会话当前由其他程序（如 WebUI 或另一个桥进程）占用。\n\n- 在另一端退出/关闭后重发图片；\n- 或发 `/new` 开一个全新会话。',
+          )).catch(() => {});
+          return;
+        }
         log.error(`chat ${chatId}: image flush: ${e.stack ?? e}`);
         await this.transport.sendCard(chatId, buildErrorCard('图片提交失败', e.message)).catch(() => {});
       }

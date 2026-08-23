@@ -44,9 +44,16 @@ export class SessionDriver {
     return sel ?? { provider: 'deepseek-official', model: 'deepseek-v4-flash' };
   }
 
+  /** Heuristic: does this error mean the session is owned elsewhere? */
+  static looksOccupied(e) {
+    return /in use|locked|occupi|another process|另一|占用|已被.*使用/i.test(String(e?.message ?? ''));
+  }
+
   /**
    * Return a live agent for the binding, creating or resuming as needed.
    * Mutates `binding.sessionId` when a new session is created.
+   * Throws with `.occupied = true` when the session is owned by another
+   * process (WebUI / second bridge) — callers must NOT silently fork.
    */
   async ensure(binding, { allowCreate = true, preset } = {}) {
     const existing = binding.sessionId ? this.live.get(binding.sessionId) : null;
@@ -63,6 +70,10 @@ export class SessionDriver {
       } catch (e) {
         log.warn(`resume ${binding.sessionId} failed: ${e.message}`);
         if (!allowCreate) throw e;
+        if (SessionDriver.looksOccupied(e)) {
+          e.occupied = true;
+          throw e;
+        }
         // fall through: start a fresh session, keep the stale one on disk
       }
     }
