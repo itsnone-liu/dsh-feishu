@@ -8,6 +8,7 @@
  */
 import { buildErrorCard, buildInfoCard } from './cards.js';
 import { isWorkspaceAllowed } from './config.js';
+import { sniffImageMediaType } from './util.js';
 import { log } from './log.js';
 
 export class ChatRouter {
@@ -75,8 +76,15 @@ export class ChatRouter {
       return;
     }
 
-    // pending ask in this chat? plain text answers it
-    if (this.interactions.handleAskText(chatId, text)) {
+    // transport-level image failure → surface as a card, never reach the agent
+    if (msg.imageError) {
+      await this.transport.sendCard(chatId, buildErrorCard('图片接收失败', `${msg.imageError}\n\n若提示无权限，请到飞书开放平台为应用添加「im:resource」（获取消息中的资源文件）权限后重发。`));
+      return;
+    }
+
+    // pending ask in this chat? plain NON-EMPTY text answers it (image
+    // messages carry an empty caption and must not settle an ask silently)
+    if (text && this.interactions.handleAskText(chatId, text)) {
       log.info(`chat ${chatId}: text answered pending ask`);
       return;
     }
@@ -96,10 +104,92 @@ export class ChatRouter {
     const agent = await this.driver.ensure(binding);
     this.store.update(chatId, { sessionId: binding.sessionId, cwd: binding.cwd });
     if (this.renderer.chatOf(agent.id) !== chatId) this.renderer.attach(agent.id, chatId);
+
+    // image traffic → sniff → gate → durable commit → image blocks
+    if (msg.images?.length) {
+      await this.#submitImages(chatId, agent, msg);
+      return;
+    }
+
     const mode = this.driver.submit(agent, text);
     if (mode === 'steer') {
       this.renderer.setSteerNote(agent.id, text);
       log.info(`chat ${chatId}: steered running agent`);
+    }
+  }
+
+  /**
+   * Image message path: sniff media types, gate on the active model's declared
+   * image input, durably commit the batch, then submit with image blocks.
+   * Answers with an error card on every refusal.
+   */
+  async #submitImages(chatId, agent, msg) {
+    // 1) media types from magic bytes (Feishu carries no usable content-type)
+    const inputs = [];
+    for (const img of msg.images) {
+      const mediaType = sniffImageMediaType(img.data);
+      if (!mediaType) {
+        await this.transport.sendCard(chatId, buildErrorCard('不支持的图片格式', '仅支持 PNG / JPEG / WebP / GIF。'));
+        return;
+      }
+      inputs.push({ data: img.data, mediaType, name: img.name });
+    }
+
+    // 2) capability gate BEFORE anything durable — a text-only route would
+    //    fail mid-turn after the message is committed, leaving a turn that
+    //    cannot succeed. Fail-open when the route cannot be resolved.
+    const accepts = await this.driver.modelAcceptsImages(agent);
+    if (accepts === false) {
+      const current = this.driver.currentModel(agent);
+      const suggestions = (await this.driver.imageModels()).slice(0, 8);
+      const hint = suggestions.length
+        ? `\n\n可切换的识图模型：${suggestions.map((s) => `\`${s}\``).join('、')}\n切换命令：\`/model ${suggestions[0].split('/')[1]}\``
+        : '';
+      await this.transport.sendCard(chatId, buildErrorCard(
+        '当前模型不支持图片输入',
+        `当前模型 \`${current ? `${current.provider}/${current.model}` : '未知'}\` 只接受文本。先切换到识图模型再发图。${hint}`
+      ));
+      return;
+    }
+
+    // 3) durable commit (batch-validated: no partial writes on refusal)
+    let refs;
+    try {
+      refs = await this.driver.admitImages(inputs);
+    } catch (e) {
+      const reason = this.#imageAdmissionHint(e);
+      await this.transport.sendCard(chatId, buildErrorCard('图片未通过校验', `${reason}\n\n原始错误：${e.message}`));
+      return;
+    }
+
+    // 4) submit — images first, caption text rides behind
+    const mode = this.driver.submit(agent, msg.text || '', refs);
+    if (mode === 'steer') {
+      this.renderer.setSteerNote(agent.id, msg.text || '📷 图片');
+      log.info(`chat ${chatId}: steered running agent with image(s)`);
+    } else {
+      log.info(`chat ${chatId}: submitted ${refs.length} image(s)`);
+    }
+  }
+
+  /** Map attachment admission codes to actionable Chinese hints. */
+  #imageAdmissionHint(e) {
+    switch (e?.code) {
+      case 'IMAGE_TOO_LARGE':
+      case 'IMAGES_TOO_LARGE':
+        return '图片超过大小上限（10MB）。请压缩后重发。';
+      case 'IMAGE_DIMENSION_TOO_LARGE':
+        return '图片单边超过 8192px 上限。请缩小后重发。';
+      case 'IMAGE_TOO_MANY_PIXELS':
+        return '图片像素总数超过上限（1 亿像素）。请缩小后重发。';
+      case 'UNSUPPORTED_IMAGE_TYPE':
+        return '图片格式不受支持（仅 PNG / JPEG / WebP / GIF）。';
+      case 'IMAGE_TYPE_MISMATCH':
+        return '图片字节与声明格式不符，请转存为 PNG/JPEG 后重发。';
+      case 'TOO_MANY_IMAGES':
+        return '一条消息的图片数量超上限。';
+      default:
+        return '图片未能保存。';
     }
   }
 }

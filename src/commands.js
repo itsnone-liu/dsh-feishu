@@ -24,9 +24,10 @@ const HELP = [
   '**dsh-feishu 桥**',
   '',
   '- 直接发文字 = 和 agent 说话（运行中发送会作为下一步转向输入）',
+  '- **直接发图片 = 识图**：需先切换到识图模型（`/model` 列表中带 📷 的，如 `/model glm-4.5v`）',
   '- `/new [cwd]` 新会话 · `/stop` 停止本轮 · `/status` 状态',
   '- `/mode` 查看/切换权限模式（`/mode ro` 只读 · `/mode rw` 工作区可写 · `/mode full` 全权）',
-  '- `/model` 查看/切换模型（如 `/model glm-5.3`；跨厂商用 `厂商/模型` 全称）',
+  '- `/model` 查看/切换模型（如 `/model glm-5.3`；跨厂商用 `厂商/模型` 全称；📷 标记支持识图）',
   '- `/preset` 查看/切换预设（极简 minimal · 标准 standard · code · cordis；有历史的会话自动开新会话）',
   '- `/sessions` 列出本工作区会话 · `/resume <id前缀>` 接续旧会话',
   '- `/cwd <路径>` 设定下次新会话的工作区',
@@ -262,7 +263,13 @@ export class Commands {
             new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 2500)),
           ]);
         } catch {}
-        rows.push({ provider: id, models: (models ?? []).map((m) => m.id ?? m.name ?? String(m)) });
+        rows.push({
+          provider: id,
+          models: (models ?? []).map((m) => ({
+            id: m.id ?? m.name ?? String(m),
+            image: Boolean(m?.inputModalities?.includes('image')),
+          })),
+        });
       })
     );
     return rows;
@@ -289,10 +296,10 @@ export class Commands {
         if (row.models.length === 0) {
           lines.push(`- \`${row.provider}\`${mark}（未列举出模型）`);
         } else {
-          lines.push(`- \`${row.provider}\`${mark}：${row.models.map((m) => `\`${m}\``).join(' · ')}`);
+          lines.push(`- \`${row.provider}\`${mark}：${row.models.map((m) => `\`${m.id}\`${m.image ? '📷' : ''}`).join(' · ')}`);
         }
       }
-      lines.push('', '用法：`/model <模型>`（唯一时）或 `/model <厂商>/<模型>`');
+      lines.push('', '📷 = 支持图片输入（识图模型）。用法：`/model <模型>`（唯一时）或 `/model <厂商>/<模型>`');
       await this.transport.sendCard(chatId, buildInfoCard('模型', lines.join('\n')));
       return true;
     }
@@ -304,7 +311,7 @@ export class Commands {
       [provider, model] = arg.split('/').map((x) => x.trim());
     } else {
       const catalog = await this.#modelCatalog();
-      const hits = catalog.filter((r) => r.models.includes(arg));
+      const hits = catalog.filter((r) => r.models.some((m) => m.id === arg));
       if (hits.length === 1) {
         provider = hits[0].provider;
         model = arg;

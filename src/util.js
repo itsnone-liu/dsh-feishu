@@ -80,3 +80,23 @@ export function previewToolResult(contentBlocks) {
 
 /** Simple retrying delay helper. */
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Sniff an image's media type from magic bytes (Feishu downloads carry no
+ * usable content-type). Returns one of the four media types the attachment
+ * service accepts, or null when the bytes are none of them.
+ */
+export function sniffImageMediaType(bytes) {
+  if (!(bytes instanceof Uint8Array) || bytes.length < 12) return null;
+  const b = bytes;
+  // PNG: 89 50 4E 47 0D 0A 1A 0A
+  if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return 'image/png';
+  // JPEG: FF D8 FF
+  if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return 'image/jpeg';
+  // GIF: "GIF8"
+  if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x38) return 'image/gif';
+  // WEBP: "RIFF" .... "WEBP"
+  if (b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46
+    && b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return 'image/webp';
+  return null;
+}

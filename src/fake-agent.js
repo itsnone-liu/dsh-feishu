@@ -135,7 +135,10 @@ export class FakeAgent {
     while (inputs.length > 0) {
       if (this.#aborted) throw new DOMException('aborted', 'AbortError');
       const message = inputs.shift();
-      const text = message?.content?.[0]?.text ?? '';
+      const blocks = Array.isArray(message?.content) ? message.content : [];
+      // image-first content (bridge image path) puts the caption behind blocks
+      const text = blocks.filter((b) => b?.type === 'text').map((b) => b.text).join(' ');
+      const imageCount = blocks.filter((b) => b?.type === 'image').length;
       const slow = /SLOW/.test(text);
       const d = () => sleep(slow ? 160 : this.deltaMs);
 
@@ -143,7 +146,7 @@ export class FakeAgent {
       this.#openStep = { turn, step };
       s.append('step/start', { turn, step });
       s.append('user/message', {
-        content: message?.content ?? [{ type: 'text', text }],
+        content: blocks.length > 0 ? blocks : [{ type: 'text', text }],
         source: message?.source ?? { kind: 'user' },
         role: 'user',
         id: message?.id ?? `fake-${turn}-${Math.random().toString(36).slice(2, 10)}`,
@@ -157,15 +160,17 @@ export class FakeAgent {
       };
 
       // 1) stream reasoning
-      const reasoningText = `让我想想…用户说：${clamp(text, 60)}`;
+      const imageNote = imageCount > 0 ? `（附图 ${imageCount} 张）` : '';
+      const reasoningText = `让我想想…用户说：${clamp(text, 60)}${imageNote}`;
       chunk({ type: 'block-start', index: 0, blockType: 'reasoning' });
-      for (const piece of ['让我想想…', '用户说：', clamp(text, 60)]) {
+      for (const piece of ['让我想想…', '用户说：', clamp(text, 60), imageNote]) {
+        if (!piece) continue;
         chunk({ type: 'reasoning-delta', index: 0, text: piece });
         await d();
       }
 
       // 2) interactive seams before the final text
-      let finalText = `收到：${clamp(text, 200)}\n（mock agent 完成）`;
+      let finalText = `收到：${clamp(text, 200)}${imageNote}\n（mock agent 完成）`;
       if (text.startsWith('ASK:')) {
         chunk({ type: 'block-start', index: 1, blockType: 'text' });
         chunk({ type: 'text-delta', index: 1, text: '等待你的选择…' });

@@ -26,19 +26,39 @@ export class SdkTransport {
       'im.message.receive_v1': async (data) => {
         const message = data?.message ?? {};
         if (message.chat_type !== 'p2p' && !this.config.allowGroupChats) return;
-        if (message.message_type !== 'text') return;
+        const type = message.message_type;
+        if (type !== 'text' && type !== 'image') return;
         let text = '';
-        try {
-          text = JSON.parse(message.content ?? '{}').text ?? '';
-        } catch {}
+        let images = [];
+        let imageError = '';
+        if (type === 'text') {
+          try {
+            text = JSON.parse(message.content ?? '{}').text ?? '';
+          } catch {}
+        } else {
+          // image message: content is {"image_key": "img_v2_..."}
+          let imageKey = '';
+          try {
+            imageKey = JSON.parse(message.content ?? '{}').image_key ?? '';
+          } catch {}
+          if (imageKey) {
+            try {
+              images = [await this.downloadMessageImage(message.message_id, imageKey)];
+            } catch (e) {
+              imageError = `图片下载失败：${e.message}`;
+            }
+          }
+        }
         text = text.replace(/@_user_\d+/g, '').trim();
-        if (!text) return;
+        if (!text && images.length === 0 && !imageError) return;
         await handlers.onMessage({
           chatId: message.chat_id,
           openId: data?.sender?.sender_id?.open_id ?? '',
           messageId: message.message_id,
           chatType: message.chat_type,
           text,
+          images,
+          imageError,
         });
       },
       'card.action.trigger': async (data) => {
@@ -59,6 +79,22 @@ export class SdkTransport {
     });
     await this.wsClient.start({ eventDispatcher: dispatcher });
     log.info('sdk ws client started');
+  }
+
+  /**
+   * Download one image attached to a message (im/v1 message-resource API).
+   * @returns {Promise<{ data: Uint8Array, name: string }>} raw bytes + display name
+   */
+  async downloadMessageImage(messageId, fileKey) {
+    const res = await this.client.im.messageResource.get({
+      params: { type: 'image' },
+      path: { message_id: messageId, file_key: fileKey },
+    });
+    const stream = res?.getReadableStream?.();
+    if (!stream) throw new Error('响应中没有可读流（getReadableStream 缺失）');
+    const chunks = [];
+    for await (const chunk of stream) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    return { data: new Uint8Array(Buffer.concat(chunks)), name: fileKey };
   }
 
   async stop() {

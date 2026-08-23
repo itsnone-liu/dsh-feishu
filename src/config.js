@@ -74,7 +74,8 @@ export function loadConfig(configFile) {
   let raw = {};
   if (fs.existsSync(file)) {
     try {
-      raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+      // tolerate a UTF-8 BOM (Windows editors / PowerShell often add one)
+      raw = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
     } catch (e) {
       throw new Error(`config file unparsable: ${file}: ${e.message}`);
     }

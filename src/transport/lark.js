@@ -103,6 +103,36 @@ export class LarkTransport {
     return { messageId: res.data?.message_id };
   }
 
+  /**
+   * Download one image attached to a message (binary REST, no JSON wrap).
+   * @returns {Promise<{ data: Uint8Array, name: string }>} raw bytes + display name
+   */
+  async downloadMessageImage(messageId, fileKey) {
+    const path = `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`
+      + `/resources/${encodeURIComponent(fileKey)}`;
+    const headers = { 'Content-Type': 'application/json; charset=utf-8' };
+    headers.Authorization = `Bearer ${await this.#tenantToken()}`;
+    let res = await fetch(`${this.config.apiBase}${path}?type=image`, { headers });
+    if (res.status === 401) {
+      // token expired/invalid → refresh once and retry
+      this.token = null;
+      this.tokenExpireAt = 0;
+      headers.Authorization = `Bearer ${await this.#tenantToken()}`;
+      res = await fetch(`${this.config.apiBase}${path}?type=image`, { headers });
+    }
+    if (!res.ok) {
+      let detail = '';
+      try {
+        const body = await res.json();
+        detail = body?.msg ? ` ${body.msg}` : '';
+        if (body?.code) detail = ` (code ${body.code}) ${body.msg ?? ''}`;
+      } catch {}
+      throw new Error(`feishu http ${res.status} 资源下载${detail}`);
+    }
+    const buf = new Uint8Array(await res.arrayBuffer());
+    return { data: buf, name: fileKey };
+  }
+
   // -------------------------------------------------------------- WS part
 
   async start(handlers) {
@@ -215,7 +245,7 @@ export class LarkTransport {
     }, 25_000);
   }
 
-  #dispatchEvent(data) {
+  async #dispatchEvent(data) {
     const eventType = data?.header?.event_type;
     const event = data?.event ?? {};
     if (eventType === 'im.message.receive_v1') {
@@ -223,19 +253,39 @@ export class LarkTransport {
       const sender = event.sender ?? {};
       const chatType = message.chat_type;
       if (chatType !== 'p2p' && !this.config.allowGroupChats) return;
-      if (message.message_type !== 'text') return;
+      const type = message.message_type;
+      if (type !== 'text' && type !== 'image') return;
       let text = '';
-      try {
-        text = JSON.parse(message.content ?? '{}').text ?? '';
-      } catch {}
+      let images = [];
+      let imageError = '';
+      if (type === 'text') {
+        try {
+          text = JSON.parse(message.content ?? '{}').text ?? '';
+        } catch {}
+      } else {
+        // image message: content is {"image_key": "img_v2_..."}
+        let imageKey = '';
+        try {
+          imageKey = JSON.parse(message.content ?? '{}').image_key ?? '';
+        } catch {}
+        if (imageKey) {
+          try {
+            images = [await this.downloadMessageImage(message.message_id, imageKey)];
+          } catch (e) {
+            imageError = `图片下载失败：${e.message}`;
+          }
+        }
+      }
       text = text.replace(/@_user_\d+/g, '').trim();
-      if (!text) return;
+      if (!text && images.length === 0 && !imageError) return;
       this.handlers.onMessage({
         chatId: message.chat_id,
         openId: sender.sender_id?.open_id ?? '',
         messageId: message.message_id,
         chatType,
         text,
+        images,
+        imageError,
       });
       return;
     }

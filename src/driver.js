@@ -135,16 +135,78 @@ export class SessionDriver {
     return handle.agent;
   }
 
-  /** Submit user text: steer when running, followup when idle. Returns which. */
-  submit(agent, text) {
+  /**
+   * Submit user input: steer when running, followup when idle. Returns which.
+   * `images` are durable attachment refs (already committed by admitImages) —
+   * they ride the message as image blocks ahead of the optional caption text.
+   */
+  submit(agent, text, images = []) {
+    const content = [];
+    for (const attachment of images) content.push({ type: 'image', attachment });
+    if (text || content.length === 0) content.push({ type: 'text', text: text ?? '' });
     const message = createUserMessage({
-      content: [{ type: 'text', text }],
+      content,
       source: { kind: 'user' },
     });
     const running = agent.status === 'running';
     if (running) agent.steer(message);
     else agent.followup(message);
     return running ? 'steer' : 'followup';
+  }
+
+  /**
+   * Validate and durably commit one ordered image batch through the mounted
+   * attachment service. Throws AttachmentError-shaped errors (code field)
+   * on admission refusal.
+   * @param {Array<{ data: Uint8Array, mediaType: string, name?: string }>} inputs
+   */
+  admitImages(inputs) {
+    const attachments = this.ctx.get('attachments');
+    if (!attachments) throw new Error('附件服务未挂载（attachment-local 缺失）');
+    return attachments.saveImages(inputs);
+  }
+
+  /**
+   * Whether the agent's next model request declares image input. Returns
+   * `null` when it cannot be determined (mock agent / resolution failure) —
+   * callers fail open and let the turn fail loudly instead.
+   */
+  async modelAcceptsImages(agent) {
+    if (this.config.mockAgent) return null;
+    const sel = this.currentModel(agent);
+    if (!sel?.provider || !sel?.model) return null;
+    const llm = this.ctx.get('llm');
+    if (!llm) return null;
+    try {
+      const info = await llm.resolveModelInfo(sel.provider, sel.model);
+      if (!info || info.inputModalities === undefined) return null;
+      return info.inputModalities.includes('image');
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Every configured route/model that declares image input, for the hint card
+   * when the user sends an image while a text-only model is active.
+   * @returns {Promise<string[]>} "provider/model" strings
+   */
+  async imageModels() {
+    const llm = this.ctx.get('llm');
+    if (!llm?.listProviders) return [];
+    const out = [];
+    for (const provider of llm.listProviders()) {
+      try {
+        const models = await Promise.race([
+          llm.listModels(provider.id),
+          new Promise((resolve) => setTimeout(() => resolve([]), 2500)),
+        ]);
+        for (const m of models ?? []) {
+          if (m?.inputModalities?.includes('image')) out.push(`${provider.id}/${m.id}`);
+        }
+      } catch {}
+    }
+    return out;
   }
 
   /**

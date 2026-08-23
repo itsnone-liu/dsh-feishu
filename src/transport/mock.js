@@ -10,6 +10,7 @@
  *    driving the real bridge by hand without Feishu credentials.
  */
 import fs from 'node:fs';
+import path from 'node:path';
 import readline from 'node:readline';
 import { sleep } from '../util.js';
 import { log } from '../log.js';
@@ -33,7 +34,7 @@ export class MockTransport {
     this.handlers = handlers;
     const script = process.env.DSH_FEISHU_SCRIPT;
     if (script) {
-      const steps = JSON.parse(fs.readFileSync(script, 'utf8'));
+      const steps = JSON.parse(fs.readFileSync(script, 'utf8').replace(/^\uFEFF/, ''));
       // let the rest of the tree settle before firing user input
       setTimeout(() => this.#runScript(steps).catch((e) => this.#fail(e)), 300);
     } else {
@@ -75,6 +76,17 @@ export class MockTransport {
         await sleep(step.wait);
         continue;
       }
+      if (step.image !== undefined) {
+        // image message (check BEFORE text: an image step may carry a caption)
+        const data = new Uint8Array(fs.readFileSync(step.image));
+        await this.userMessage({
+          text: step.text ?? '',
+          images: [{ data, name: step.image }],
+          chatId: step.chatId,
+          openId: step.openId,
+        });
+        continue;
+      }
       if (step.text !== undefined) {
         await this.userMessage({ text: step.text, chatId: step.chatId, openId: step.openId });
         continue;
@@ -99,13 +111,14 @@ export class MockTransport {
     if (process.env.DSH_FEISHU_MOCK_EXIT !== '0') process.exit(0);
   }
 
-  async userMessage({ text, chatId, openId, messageId }) {
+  async userMessage({ text, images, chatId, openId, messageId }) {
     if (!this.handlers) throw new Error('mock: not started');
     const msg = {
       chatId: chatId ?? this.defaultChat,
       openId: openId ?? this.defaultOpen,
       messageId: messageId ?? nextId('in'),
       text,
+      images: images ?? [],
     };
     await this.handlers.onMessage(msg);
   }
@@ -153,7 +166,9 @@ export class MockTransport {
   #writeOut() {
     const out = process.env.DSH_FEISHU_OUT;
     if (!out) return;
-    fs.mkdirSync(new URL('.', `file://${out}`).pathname, { recursive: true });
+    // path.dirname handles Windows absolute paths; URL-based derivation
+    // mangled drive letters (D:\C:\Users\…)
+    fs.mkdirSync(path.dirname(out), { recursive: true });
     fs.writeFileSync(out, JSON.stringify(this.sent, null, 1));
   }
 
