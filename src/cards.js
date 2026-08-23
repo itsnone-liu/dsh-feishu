@@ -70,6 +70,9 @@ export function buildTurnCard(state, textLimit) {
   if (state.steerNote) {
     elements.push(mdDiv(`↩️ **转向输入**：${esc(state.steerNote)}`));
   }
+  if (state.outputNote) {
+    elements.push(mdDiv(state.outputNote));
+  }
   if (elements.length === 0) {
     elements.push(mdDiv('…'));
   }

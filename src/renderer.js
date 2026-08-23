@@ -13,6 +13,8 @@
 import { buildTurnCard, buildErrorCard } from './cards.js';
 import { hhmmss, fmtDuration, summarizeToolArguments, previewToolResult, clamp } from './util.js';
 import { log } from './log.js';
+import fs from 'node:fs';
+import path from 'node:path';
 
 const PHASE_BY_TURN_END = {
   completed: 'done',
@@ -22,9 +24,11 @@ const PHASE_BY_TURN_END = {
 };
 
 export class TurnRenderer {
-  constructor({ transport, config }) {
+  constructor({ transport, config, store }) {
     this.transport = transport;
     this.config = config;
+    /** BindingStore — to resolve the workspace for full-output dumps. */
+    this.store = store ?? null;
     /** sessionId → render state */
     this.states = new Map();
   }
@@ -112,6 +116,8 @@ export class TurnRenderer {
     st.turnNo = turnNo;
     st.blocks = [];
     st.steerNote = '';
+    st.outputNote = '';
+    st.outputDumped = false;
     st.usage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 };
     st.toolCount = 0;
     st.errorCount = 0;
@@ -249,6 +255,18 @@ export class TurnRenderer {
     st.sending = true;
     st.dirty = false;
     try {
+      // Final flush of an oversized turn → dump the FULL text to the
+      // workspace so the truncated card stays readable (R2 may later upgrade
+      // this to a real Feishu file upload).
+      if (st.final && !st.outputDumped) {
+        const texts = st.blocks.filter((b) => b.kind === 'text').map((b) => b.text);
+        const total = texts.reduce((n, t) => n + t.length, 0);
+        if (total > this.config.cardTextLimit) {
+          const dest = this.#dumpFullOutput(st, texts);
+          if (dest) st.outputNote = `📄 回复超长（${total} 字符），卡片已截断，完整内容：\`${dest}\``;
+        }
+        st.outputDumped = true;
+      }
       const card = buildTurnCard(
         { ...st, footer: this.#footer(st) },
         this.config.cardTextLimit
@@ -272,6 +290,23 @@ export class TurnRenderer {
       }
     } finally {
       st.sending = false;
+    }
+  }
+
+  /** Write the full text of an oversized turn under the workspace. */
+  #dumpFullOutput(st, texts) {
+    try {
+      const cwd = this.store?.get(st.chatId)?.cwd || this.config.defaultCwd;
+      if (!cwd) return null;
+      const dir = path.join(cwd, '.feishu-outputs');
+      fs.mkdirSync(dir, { recursive: true });
+      const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+      const dest = path.join(dir, `turn${st.turnNo}-${ts}.md`);
+      fs.writeFileSync(dest, texts.join('\n\n---\n\n'), 'utf8');
+      return dest;
+    } catch (e) {
+      log.warn(`full-output dump failed: ${e.message}`);
+      return null;
     }
   }
 }

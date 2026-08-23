@@ -60,6 +60,8 @@ const DEFAULTS = {
   /** TEST ONLY: force the image-capability gate in mock mode.
    *  '' (real fail-open) | 'text-only' (reject) | 'vision' (accept). */
   mockImageGate: '',
+  /** TEST ONLY: pad mock agent answers to ~N chars (long-output path). */
+  mockLongOutput: 0,
 };
 
 function coerce(raw) {

@@ -147,6 +147,22 @@ Run-Bridge 'D 群聊@门控' @{ groups = 'mention' } @(
   }
 }
 
+# ---------------------------------------------------------------- 场景 E
+Run-Bridge 'E 长输出转文件' @{ mockLongOutput = 9000 } @(
+  @{ text = '给我长答案' },
+  @{ wait = 3000 }
+) {
+  param($name, $cards, $allText, $homeDir)
+  foreach ($c in @('完整内容', '.feishu-outputs')) {
+    if ($allText.IndexOf($c) -ge 0) { Write-Host "PASS [$name] $c"; $script:pass++ }
+    else { Write-Host "FAIL [$name] 缺少：$c"; $script:fail++ }
+  }
+  $wsDir = Join-Path (Split-Path $homeDir -Parent) 'ws\.feishu-outputs'
+  $dump = @(Get-ChildItem $wsDir -File -ErrorAction SilentlyContinue)
+  if ($dump.Count -ge 1 -and $dump[0].Length -gt 8000) { Write-Host "PASS [$name] 全文落盘（$($dump[0].Length) B）"; $script:pass++ }
+  else { Write-Host "FAIL [$name] 全文落盘异常（$($dump.Count) 个文件）"; $script:fail++ }
+}
+
 Write-Host ''
 Write-Host "结果：$pass 通过 / $fail 失败"
 exit $(if ($fail -gt 0) { 1 } else { 0 })

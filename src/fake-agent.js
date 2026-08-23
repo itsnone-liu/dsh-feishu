@@ -39,6 +39,7 @@ export class FakeAgent {
   constructor(ctx, session, config) {
     this.ctx = ctx;
     this.session = session;
+    this.config = config ?? {};
     this.id = session.id;
     this.status = 'idle';
     this.inbox = INERT_INBOX;
@@ -192,6 +193,13 @@ export class FakeAgent {
       // 3) stream final text
       chunk({ type: 'block-start', index: 1, blockType: 'text' });
       chunk({ type: 'text-delta', index: 1, text: finalText });
+      // test hook: pad the answer to exercise the long-output path
+      const longPad = Number(this.config.mockLongOutput ?? 0);
+      if (longPad > 0) {
+        const pad = `长输出测试行。${'🧪'}`.repeat(Math.ceil(longPad / 8));
+        chunk({ type: 'text-delta', index: 1, text: `\n${pad}` });
+        finalText += `\n${pad}`;
+      }
       await d();
 
       // 4) optional tool-call stream

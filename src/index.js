@@ -42,7 +42,7 @@ function apply(ctx, config) {
   // Transport first — renderer and interactions need it.
   createTransport(cfg)
     .then(async (transport) => {
-      const renderer = new TurnRenderer({ transport, config: cfg });
+      const renderer = new TurnRenderer({ transport, config: cfg, store });
       const interactions = new InteractionManager({
         transport,
         config: cfg,
