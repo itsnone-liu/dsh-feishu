@@ -10,6 +10,8 @@ import { buildErrorCard, buildInfoCard, buildImageRejectCard } from './cards.js'
 import { isWorkspaceAllowed } from './config.js';
 import { sniffImageMediaType } from './util.js';
 import { log } from './log.js';
+import fs from 'node:fs';
+import path from 'node:path';
 
 export class ChatRouter {
   constructor({ config, store, driver, renderer, transport, interactions, commands }) {
@@ -120,6 +122,12 @@ export class ChatRouter {
       return;
     }
 
+    // transport-level file failure → surface as a card
+    if (msg.fileError) {
+      await this.transport.sendCard(chatId, buildErrorCard('文件接收失败', `${msg.fileError}\n\n若提示无权限，请到飞书开放平台核对「im:resource」（获取消息中的资源文件）权限后重发。`));
+      return;
+    }
+
     // pending ask in this chat? plain NON-EMPTY text answers it (image
     // messages carry an empty caption and must not settle an ask silently)
     if (text && this.interactions.handleAskText(chatId, text)) {
@@ -148,6 +156,15 @@ export class ChatRouter {
       }
       const agent = await this.#agentFor(chatId);
       await this.#submitImages(chatId, agent, msg);
+      return;
+    }
+
+    // file traffic → flush any pending image burst first (ordering), then
+    // persist under the workspace and hand the agent a path note
+    if (msg.files?.length) {
+      if (this.batches.get(chatId)) this.#flushImages(chatId);
+      const agent = await this.#agentFor(chatId);
+      await this.#submitFiles(chatId, agent, msg);
       return;
     }
 
@@ -272,9 +289,73 @@ export class ChatRouter {
     }
   }
 
+  // ------------------------------------------------------------- file path
+
+  /**
+   * File (non-image) messages: persist bytes under the workspace and submit a
+   * path note to the agent. Works with text-only models — the agent reads the
+   * file with its own tools.
+   */
+  async #submitFiles(chatId, agent, msg) {
+    const cwd = this.store.get(chatId)?.cwd ?? this.config.defaultCwd;
+    const dir = path.join(cwd, '.feishu-files');
+    const maxBytes = this.config.fileMaxBytes ?? 10485760;
+    const saved = [];
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      for (const f of msg.files) {
+        if (f.data?.byteLength > maxBytes) {
+          await this.transport.sendCard(chatId, buildErrorCard(
+            '文件过大',
+            `「${f.name}」 ${(f.data.byteLength / 1048576).toFixed(1)}MB 超过上限 ${Math.round(maxBytes / 1048576)}MB，未保存。`,
+          ));
+          continue;
+        }
+        const safe = String(f.name ?? 'file')
+          .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
+          .replace(/^\.+/, '_')
+          .slice(-80) || 'file';
+        const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+        const dest = path.join(dir, `${ts}-${safe}`);
+        fs.writeFileSync(dest, f.data);
+        saved.push({ name: safe, dest, bytes: f.data.byteLength });
+      }
+    } catch (e) {
+      await this.transport.sendCard(chatId, buildErrorCard('文件保存失败', e.message));
+      return;
+    }
+    if (saved.length === 0) return;
+
+    const lines = saved.map((s) => {
+      const ext = path.extname(s.name).toLowerCase();
+      const kind = /^\.(txt|md|csv|json|py|js|ts|mjs|cjs|html|css|xml|yml|yaml|log|ini|toml|sh|bat|ps1|java|c|cpp|h|go|rs|sql|env)$/.test(ext)
+        ? '文本，可直接读取'
+        : '二进制，请按扩展名选择工具处理';
+      return `- 「${s.name}」（${(s.bytes / 1024).toFixed(1)} KB，${kind}）：\n  ${s.dest}`;
+    });
+    const note = [
+      '[飞书文件] 收到以下文件，已保存到工作区：',
+      ...lines,
+      '',
+      '请按用户后续指示处理这些文件。',
+    ].join('\n');
+
+    const mode = this.driver.submit(agent, note);
+    if (mode === 'steer') {
+      this.renderer.setSteerNote(agent.id, `📎 文件 ×${saved.length}`);
+      log.info(`chat ${chatId}: steered running agent with ${saved.length} file(s)`);
+    } else {
+      log.info(`chat ${chatId}: submitted ${saved.length} file(s)`);
+    }
+    await this.transport.sendCard(chatId, buildInfoCard(
+      '📎 文件已接收',
+      `${lines.join('\n')}\n\n已转交 agent（可直接说「读一下刚才的文件」）。`,
+      { template: 'green' },
+    )).catch(() => {});
+  }
+
   /** Map attachment admission codes to actionable Chinese hints. */
-  #imageAdmissionHint(e) {
-    switch (e?.code) {
+  #imageAdmissionHint(e) {    switch (e?.code) {
       case 'IMAGE_TOO_LARGE':
       case 'IMAGES_TOO_LARGE':
         return '图片超过大小上限（10MB）。请压缩后重发。';

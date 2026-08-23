@@ -87,6 +87,18 @@ export class MockTransport {
         });
         continue;
       }
+      if (step.file !== undefined) {
+        // file message (non-image attachment)
+        const data = new Uint8Array(fs.readFileSync(step.file));
+        const name = step.name ?? path.basename(step.file);
+        await this.userMessage({
+          text: step.text ?? '',
+          files: [{ data, name }],
+          chatId: step.chatId,
+          openId: step.openId,
+        });
+        continue;
+      }
       if (step.text !== undefined) {
         await this.userMessage({ text: step.text, chatId: step.chatId, openId: step.openId });
         continue;
@@ -111,7 +123,7 @@ export class MockTransport {
     if (process.env.DSH_FEISHU_MOCK_EXIT !== '0') process.exit(0);
   }
 
-  async userMessage({ text, images, chatId, openId, messageId }) {
+  async userMessage({ text, images, files, chatId, openId, messageId }) {
     if (!this.handlers) throw new Error('mock: not started');
     const msg = {
       chatId: chatId ?? this.defaultChat,
@@ -119,6 +131,7 @@ export class MockTransport {
       messageId: messageId ?? nextId('in'),
       text,
       images: images ?? [],
+      files: files ?? [],
     };
     await this.handlers.onMessage(msg);
   }

@@ -104,21 +104,22 @@ export class LarkTransport {
   }
 
   /**
-   * Download one image attached to a message (binary REST, no JSON wrap).
+   * Download one resource attached to a message (binary REST, no JSON wrap).
+   * @param {'image'|'file'} type
    * @returns {Promise<{ data: Uint8Array, name: string }>} raw bytes + display name
    */
-  async downloadMessageImage(messageId, fileKey) {
+  async downloadMessageResource(messageId, fileKey, type = 'image', name = fileKey) {
     const path = `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`
       + `/resources/${encodeURIComponent(fileKey)}`;
     const headers = { 'Content-Type': 'application/json; charset=utf-8' };
     headers.Authorization = `Bearer ${await this.#tenantToken()}`;
-    let res = await fetch(`${this.config.apiBase}${path}?type=image`, { headers });
+    let res = await fetch(`${this.config.apiBase}${path}?type=${type}`, { headers });
     if (res.status === 401) {
       // token expired/invalid → refresh once and retry
       this.token = null;
       this.tokenExpireAt = 0;
       headers.Authorization = `Bearer ${await this.#tenantToken()}`;
-      res = await fetch(`${this.config.apiBase}${path}?type=image`, { headers });
+      res = await fetch(`${this.config.apiBase}${path}?type=${type}`, { headers });
     }
     if (!res.ok) {
       let detail = '';
@@ -130,7 +131,7 @@ export class LarkTransport {
       throw new Error(`feishu http ${res.status} 资源下载${detail}`);
     }
     const buf = new Uint8Array(await res.arrayBuffer());
-    return { data: buf, name: fileKey };
+    return { data: buf, name };
   }
 
   // -------------------------------------------------------------- WS part
@@ -254,15 +255,17 @@ export class LarkTransport {
       const chatType = message.chat_type;
       if (chatType !== 'p2p' && !this.config.allowGroupChats) return;
       const type = message.message_type;
-      if (type !== 'text' && type !== 'image') return;
+      if (type !== 'text' && type !== 'image' && type !== 'file') return;
       let text = '';
       let images = [];
       let imageError = '';
+      let files = [];
+      let fileError = '';
       if (type === 'text') {
         try {
           text = JSON.parse(message.content ?? '{}').text ?? '';
         } catch {}
-      } else {
+      } else if (type === 'image') {
         // image message: content is {"image_key": "img_v2_..."}
         let imageKey = '';
         try {
@@ -270,14 +273,30 @@ export class LarkTransport {
         } catch {}
         if (imageKey) {
           try {
-            images = [await this.downloadMessageImage(message.message_id, imageKey)];
+            images = [await this.downloadMessageResource(message.message_id, imageKey, 'image')];
           } catch (e) {
             imageError = `图片下载失败：${e.message}`;
           }
         }
+      } else {
+        // file message: content is {"file_key": "...", "file_name": "..."}
+        let fileKey = '';
+        let fileName = '';
+        try {
+          const c = JSON.parse(message.content ?? '{}');
+          fileKey = c.file_key ?? '';
+          fileName = c.file_name ?? '';
+        } catch {}
+        if (fileKey) {
+          try {
+            files = [await this.downloadMessageResource(message.message_id, fileKey, 'file', fileName || fileKey)];
+          } catch (e) {
+            fileError = `文件下载失败：${e.message}`;
+          }
+        }
       }
       text = text.replace(/@_user_\d+/g, '').trim();
-      if (!text && images.length === 0 && !imageError) return;
+      if (!text && images.length === 0 && files.length === 0 && !imageError && !fileError) return;
       this.handlers.onMessage({
         chatId: message.chat_id,
         openId: sender.sender_id?.open_id ?? '',
@@ -286,6 +305,8 @@ export class LarkTransport {
         text,
         images,
         imageError,
+        files,
+        fileError,
       });
       return;
     }

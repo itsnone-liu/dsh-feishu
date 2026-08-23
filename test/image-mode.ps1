@@ -31,8 +31,12 @@ function Run-Bridge([string]$name, [hashtable]$extraCfg, [array]$steps, [scriptb
   $img = Join-Path $ws 'test-image.png'
   Copy-Item 'C:\Users\pc\预览.png' $img
 
+  $pyFile = Join-Path $ws 'sample.py'
+  [IO.File]::WriteAllText($pyFile, "x = 1`nprint('hello from sample')", [Text.UTF8Encoding]::new($false))
+
   $imgJson = $img.Replace('\', '\\')
-  $scriptJson = ($steps | ConvertTo-Json -Depth 5).Replace('"IMG"', ('"' + $imgJson + '"'))
+  $fileJson = $pyFile.Replace('\', '\\')
+  $scriptJson = ($steps | ConvertTo-Json -Depth 5).Replace('"IMG"', ('"' + $imgJson + '"')).Replace('"FILE"', ('"' + $fileJson + '"'))
   $scriptPath = Join-Path $sandbox 'script.json'
   [IO.File]::WriteAllText($scriptPath, $scriptJson, [Text.UTF8Encoding]::new($false))
 
@@ -97,6 +101,22 @@ Run-Bridge 'B 拒绝卡+一键切换' @{ mockImageGate = 'text-only' } @(
 ) {
   param($name, $cards, $allText, $homeDir)
   foreach ($c in @('当前模型不支持图片输入', '切换 glm-4.5v', '模型已切换', 'glm_coding/glm-4.5v')) {
+    if ($allText.IndexOf($c) -ge 0) { Write-Host "PASS [$name] $c"; $script:pass++ }
+    else { Write-Host "FAIL [$name] 缺少：$c"; $script:fail++ }
+  }
+}
+
+# ---------------------------------------------------------------- 场景 C
+Run-Bridge 'C 文件消息' @{} @(
+  @{ text = '你好' },
+  @{ wait = 600 },
+  @{ file = 'FILE'; text = '帮我看下这个文件' },
+  @{ wait = 1500 },
+  @{ text = '读一下刚才的文件内容' },
+  @{ wait = 1500 }
+) {
+  param($name, $cards, $allText, $homeDir)
+  foreach ($c in @('文件已接收', 'sample.py', '[飞书文件]', '.feishu-files')) {
     if ($allText.IndexOf($c) -ge 0) { Write-Host "PASS [$name] $c"; $script:pass++ }
     else { Write-Host "FAIL [$name] 缺少：$c"; $script:fail++ }
   }

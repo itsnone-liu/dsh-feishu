@@ -48,6 +48,8 @@ const DEFAULTS = {
   imageBatchMs: 1500,
   /** Max images per coalesced batch; reaching it flushes immediately. */
   imageBatchMax: 9,
+  /** Max bytes for one received (non-image) file message. */
+  fileMaxBytes: 10485760,
   /** Hard cap on visible markdown per card before truncation. */
   cardTextLimit: 6000,
   /** ask_user_question timeout (ms); 0 = wait forever. */

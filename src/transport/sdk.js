@@ -27,15 +27,17 @@ export class SdkTransport {
         const message = data?.message ?? {};
         if (message.chat_type !== 'p2p' && !this.config.allowGroupChats) return;
         const type = message.message_type;
-        if (type !== 'text' && type !== 'image') return;
+        if (type !== 'text' && type !== 'image' && type !== 'file') return;
         let text = '';
         let images = [];
         let imageError = '';
+        let files = [];
+        let fileError = '';
         if (type === 'text') {
           try {
             text = JSON.parse(message.content ?? '{}').text ?? '';
           } catch {}
-        } else {
+        } else if (type === 'image') {
           // image message: content is {"image_key": "img_v2_..."}
           let imageKey = '';
           try {
@@ -43,14 +45,30 @@ export class SdkTransport {
           } catch {}
           if (imageKey) {
             try {
-              images = [await this.downloadMessageImage(message.message_id, imageKey)];
+              images = [await this.downloadMessageResource(message.message_id, imageKey, 'image')];
             } catch (e) {
               imageError = `图片下载失败：${e.message}`;
             }
           }
+        } else {
+          // file message: content is {"file_key": "...", "file_name": "..."}
+          let fileKey = '';
+          let fileName = '';
+          try {
+            const c = JSON.parse(message.content ?? '{}');
+            fileKey = c.file_key ?? '';
+            fileName = c.file_name ?? '';
+          } catch {}
+          if (fileKey) {
+            try {
+              files = [await this.downloadMessageResource(message.message_id, fileKey, 'file', fileName || fileKey)];
+            } catch (e) {
+              fileError = `文件下载失败：${e.message}`;
+            }
+          }
         }
         text = text.replace(/@_user_\d+/g, '').trim();
-        if (!text && images.length === 0 && !imageError) return;
+        if (!text && images.length === 0 && files.length === 0 && !imageError && !fileError) return;
         await handlers.onMessage({
           chatId: message.chat_id,
           openId: data?.sender?.sender_id?.open_id ?? '',
@@ -59,6 +77,8 @@ export class SdkTransport {
           text,
           images,
           imageError,
+          files,
+          fileError,
         });
       },
       'card.action.trigger': async (data) => {
@@ -82,19 +102,20 @@ export class SdkTransport {
   }
 
   /**
-   * Download one image attached to a message (im/v1 message-resource API).
+   * Download one resource attached to a message (im/v1 message-resource API).
+   * @param {'image'|'file'} type
    * @returns {Promise<{ data: Uint8Array, name: string }>} raw bytes + display name
    */
-  async downloadMessageImage(messageId, fileKey) {
+  async downloadMessageResource(messageId, fileKey, type = 'image', name = fileKey) {
     const res = await this.client.im.messageResource.get({
-      params: { type: 'image' },
+      params: { type },
       path: { message_id: messageId, file_key: fileKey },
     });
     const stream = res?.getReadableStream?.();
     if (!stream) throw new Error('响应中没有可读流（getReadableStream 缺失）');
     const chunks = [];
     for await (const chunk of stream) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-    return { data: new Uint8Array(Buffer.concat(chunks)), name: fileKey };
+    return { data: new Uint8Array(Buffer.concat(chunks)), name };
   }
 
   async stop() {
