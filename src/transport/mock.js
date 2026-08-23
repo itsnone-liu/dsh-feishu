@@ -123,20 +123,20 @@ export class MockTransport {
     await this.handlers.onMessage(msg);
   }
 
-  async #click({ bridge, label, decision, chatId }) {
+  async #click({ bridge, label, decision, model, chatId }) {
     // wait until a card carrying the wanted button value exists
     for (let i = 0; i < 200; i++) {
-      const value = this.#findActionValue({ bridge, label, decision, chatId });
+      const value = this.#findActionValue({ bridge, label, decision, model, chatId });
       if (value) {
         await this.handlers.onCardAction({ value, openId: this.defaultOpen });
         return;
       }
       await sleep(50);
     }
-    throw new Error(`mock: button not found: ${JSON.stringify({ bridge, label, decision })}`);
+    throw new Error(`mock: button not found: ${JSON.stringify({ bridge, label, decision, model })}`);
   }
 
-  #findActionValue({ bridge, label, decision, chatId }) {
+  #findActionValue({ bridge, label, decision, model, chatId }) {
     for (const item of this.sent) {
       if (item.kind !== 'card') continue;
       if (chatId && item.chatId !== chatId) continue;
@@ -146,6 +146,7 @@ export class MockTransport {
           if (v.bridge === bridge) {
             if (bridge === 'ask' && (label === undefined || v.label === label)) return v;
             if (bridge === 'approval' && (decision === undefined || v.decision === decision)) return v;
+            if (bridge === 'model' && (model === undefined || v.model === model)) return v;
           }
         }
       }

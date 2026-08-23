@@ -165,3 +165,34 @@ export function buildInfoCard(title, markdown, { template = 'blue' } = {}) {
 export function buildErrorCard(title, message) {
   return headerCard('red', `✗ ${title}`, [mdDiv(`\`\`\`\n${clamp(message, 1200)}\n\`\`\``)]);
 }
+
+/**
+ * Image-reject card: text-only model active. Carries one-tap switch buttons
+ * for the first ≤3 image-capable models (value.bridge === 'model').
+ */
+export function buildImageRejectCard({ current, suggestions, chatId }) {
+  const elements = [
+    mdDiv(`当前模型 \`${current ?? '未知'}\` 只接受文本，无法处理刚发送的图片。`),
+  ];
+  const buttons = suggestions.slice(0, 3).map((s, i) => {
+    const slash = s.indexOf('/');
+    const provider = s.slice(0, slash);
+    const model = s.slice(slash + 1);
+    return {
+      tag: 'button',
+      text: { tag: 'plain_text', content: `切换 ${model}` },
+      type: i === 0 ? 'primary' : 'default',
+      value: { bridge: 'model', provider, model, chatId },
+    };
+  });
+  if (buttons.length) {
+    elements.push({ tag: 'action', actions: buttons });
+    if (suggestions.length > 3) {
+      elements.push(mdDiv(`更多识图模型：${suggestions.slice(3).map((s) => `\`${s}\``).join('、')}（用 \`/model\` 切换）`));
+    }
+  } else {
+    elements.push(mdDiv('未发现任何声明图片输入的模型（检查 settings.yaml 的模型 `input` 声明）。'));
+  }
+  elements.push(note('点按钮或 /model 切换后，重发图片即可'));
+  return headerCard('red', '✗ 当前模型不支持图片输入', elements);
+}

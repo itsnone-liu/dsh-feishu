@@ -172,7 +172,12 @@ export class SessionDriver {
    * callers fail open and let the turn fail loudly instead.
    */
   async modelAcceptsImages(agent) {
-    if (this.config.mockAgent) return null;
+    if (this.config.mockAgent) {
+      // test hook: force the gate outcome for offline scenario tests
+      if (this.config.mockImageGate === 'text-only') return false;
+      if (this.config.mockImageGate === 'vision') return true;
+      return null;
+    }
     const sel = this.currentModel(agent);
     if (!sel?.provider || !sel?.model) return null;
     const llm = this.ctx.get('llm');

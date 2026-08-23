@@ -1,109 +1,107 @@
-﻿# dsh-feishu 识图模式离线端到端测试（Windows）
-# 真实启动 dsh --profile feishu（junction 到真实 profiles），mock 传输 + mock agent，
-# 脚本发一条图片消息 + /model，验证：
-#   1) 图片经嗅探→准入→持久化→image 块提交（卡片出现 "附图 1 张"）
-#   2) /model 列表出现带 📷 的 glm-4.5v
-#   3) sandbox attachments/v1 落盘
+﻿# dsh-feishu 离线端到端测试（Windows / PS5.1 兼容）
+# 双场景真实启动 dsh --profile feishu（junction 到真实 profiles，settings 复制）：
+#   A 正向：连发 2 图合并为单回合（附图 2 张）、/doctor、/model 📷 列表、附件落盘
+#   B 拒绝：文本模型下发图 → 拒绝卡带切换按钮 → 点击 → 模型已切换
+# 步骤里的 'IMG' 会在写入 script.json 前替换为沙箱内的真实测试图路径。
 $ErrorActionPreference = 'Stop'
 $node = 'D:\qjcNetDiskDownload\nodejs\node.exe'
 $bin = 'D:\dsh-install\node_modules\@deepseek-ai\dsh\lib\bin.js'
-
-$sandbox = Join-Path `C:\Users\pc\AppData\Local\Temp ("dsh-feishu-imgtest-" + [guid]::NewGuid().ToString('N').Substring(0,8))
-$homeDir = Join-Path $sandbox 'home'
-$ws = Join-Path $sandbox 'ws'
-New-Item -ItemType Directory -Force -Path $homeDir, $ws | Out-Null
-
-# profiles → 真实目录（junction，只读使用）
-New-Item -ItemType Junction -Path (Join-Path $homeDir 'profiles') -Target 'C:\Users\pc\.dsh\profiles' | Out-Null
-# settings.yaml 复制（含 glm-4.5v/4.6v 视觉模型声明）
-Copy-Item 'C:\Users\pc\.dsh\settings.yaml' (Join-Path $homeDir 'settings.yaml')
-
-# bridge 沙箱配置
-New-Item -ItemType Directory -Force -Path (Join-Path $homeDir 'feishu') | Out-Null
-@{
-  transport = 'mock'
-  mockAgent = $true
-  allowedOpenIds = @('ou_mock_me')
-  defaultCwd = $ws
-  allowedWorkspaces = @($ws)
-  agentPreset = 'minimal'
-  approval = 'cards'
-  throttleMs = 40
-  askTimeoutMs = 0
-} | ConvertTo-Json | ForEach-Object { [IO.File]::WriteAllText((Join-Path (Join-Path $homeDir 'feishu') 'config.json'), $_, [Text.UTF8Encoding]::new($false)) }
-
-# 测试图片（复制到工作区）
-$img = Join-Path $ws 'test-image.png'
-Copy-Item 'C:\Users\pc\预览.png' $img
-
-# mock 脚本
-$scriptPath = Join-Path $sandbox 'script.json'
-@(
-  @{ text = '你好，桥通了吗' },
-  @{ wait = 800 },
-  @{ image = $img; text = '这张图里是什么' },
-  @{ wait = 1800 },
-  @{ text = '/model' },
-  @{ wait = 1200 }
-) | ConvertTo-Json -Depth 4 | ForEach-Object { [IO.File]::WriteAllText($scriptPath, $_, [Text.UTF8Encoding]::new($false)) }
-
-$out = Join-Path $sandbox 'out.json'
-$stdoutFile = Join-Path $sandbox 'bridge.out.log'
-$stderrFile = Join-Path $sandbox 'bridge.err.log'
-$env2 = @{
-  DSH_HOME = $homeDir
-  DSH_FEISHU_SCRIPT = $scriptPath
-  DSH_FEISHU_OUT = $out
-  DSH_FEISHU_LOG = 'info'
-  GLM_API_KEY = 'test-key-not-used'
-  FEISHU_APP_ID = 'cli_test'
-  FEISHU_APP_SECRET = 'test'
-}
-$psi = New-Object System.Diagnostics.ProcessStartInfo
-$psi.FileName = $node
-$psi.Arguments = "`"$bin`" --profile feishu"
-$psi.WorkingDirectory = 'D:\dsh-install'
-$psi.UseShellExecute = $false
-$psi.RedirectStandardOutput = $false
-$psi.RedirectStandardError = $false
-foreach ($k in $env2.Keys) { $psi.EnvironmentVariables[$k] = $env2[$k] }
-# stdout/stderr → 文件（避免 ReadToEnd 死锁）
-$psi.EnvironmentVariables['DSH_TEST_STDOUT'] = '1'
-$p = [System.Diagnostics.Process]::Start($psi)
-Write-Host "PID=$($p.Id)"
-
-# 轮询 out.json（脚本完成时 mock 写出并自动退出）
-$deadline = (Get-Date).AddSeconds(90)
-while ((Get-Date) -lt $deadline -and -not (Test-Path $out)) {
-  Start-Sleep -Milliseconds 500
-  if ($p.HasExited) { break }
-}
-Start-Sleep -Seconds 1
-if (-not $p.HasExited) {
-  Write-Host '（进程未自动退出，终止之）'
-  try { $p.Kill() } catch {}
-}
-$stdout = ''
-$stderr = ''
-
 $pass = 0; $fail = 0
-if (-not (Test-Path $out)) { Write-Host 'FAIL: out.json 未生成'; exit 1 }
-$cards = [IO.File]::ReadAllText($out, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
-$allText = ($cards | ConvertTo-Json -Depth 20 -Compress)
 
-foreach ($check in @(
-  @{ name = '图片消息走完 agent 回合（附图 1 张）'; pat = '附图 1 张' },
-  @{ name = '/model 列表出现 glm-4.5v'; pat = 'glm-4\.5v' },
-  @{ name = '/model 列表带 📷 标记'; pat = '📷' }
-)) {
-  if ($allText -match $check.pat) { Write-Host "PASS: $($check.name)"; $pass++ }
-  else { Write-Host "FAIL: $($check.name)"; $fail++ }
+function Run-Bridge([string]$name, [hashtable]$extraCfg, [array]$steps, [scriptblock]$checks) {
+  $sandbox = Join-Path $env:TEMP ("dsh-feishu-e2e-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+  $homeDir = Join-Path $sandbox 'home'
+  $ws = Join-Path $sandbox 'ws'
+  New-Item -ItemType Directory -Force -Path $homeDir, $ws | Out-Null
+  New-Item -ItemType Junction -Path (Join-Path $homeDir 'profiles') -Target 'C:\Users\pc\.dsh\profiles' | Out-Null
+  Copy-Item 'C:\Users\pc\.dsh\settings.yaml' (Join-Path $homeDir 'settings.yaml')
+  New-Item -ItemType Directory -Force -Path (Join-Path $homeDir 'feishu') | Out-Null
+
+  $cfg = @{
+    transport = 'mock'; mockAgent = $true
+    allowedOpenIds = @('ou_mock_me'); defaultCwd = $ws
+    allowedWorkspaces = @($ws); agentPreset = 'minimal'
+    approval = 'cards'; throttleMs = 40; askTimeoutMs = 0
+  }
+  foreach ($k in $extraCfg.Keys) { $cfg[$k] = $extraCfg[$k] }
+  [IO.File]::WriteAllText(
+    (Join-Path (Join-Path $homeDir 'feishu') 'config.json'),
+    ($cfg | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($false))
+
+  $img = Join-Path $ws 'test-image.png'
+  Copy-Item 'C:\Users\pc\预览.png' $img
+
+  $imgJson = $img.Replace('\', '\\')
+  $scriptJson = ($steps | ConvertTo-Json -Depth 5).Replace('"IMG"', ('"' + $imgJson + '"'))
+  $scriptPath = Join-Path $sandbox 'script.json'
+  [IO.File]::WriteAllText($scriptPath, $scriptJson, [Text.UTF8Encoding]::new($false))
+
+  $out = Join-Path $sandbox 'out.json'
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = $node
+  $psi.Arguments = "`"$bin`" --profile feishu"
+  $psi.WorkingDirectory = 'D:\dsh-install'
+  $psi.UseShellExecute = $false
+  foreach ($kv in @{
+    DSH_HOME = $homeDir; DSH_FEISHU_SCRIPT = $scriptPath; DSH_FEISHU_OUT = $out
+    DSH_FEISHU_LOG = 'info'; GLM_API_KEY = 'unused'; FEISHU_APP_ID = 'cli_test'; FEISHU_APP_SECRET = 'test'
+  }.GetEnumerator()) { $psi.EnvironmentVariables[$kv.Key] = $kv.Value }
+  $p = [System.Diagnostics.Process]::Start($psi)
+  $deadline = (Get-Date).AddSeconds(90)
+  while ((Get-Date) -lt $deadline -and -not (Test-Path $out)) {
+    Start-Sleep -Milliseconds 500
+    if ($p.HasExited) { break }
+  }
+  Start-Sleep -Seconds 1
+  if (-not $p.HasExited) { try { $p.Kill() } catch {} }
+
+  if (-not (Test-Path $out)) {
+    Write-Host "FAIL [$name] out.json 未生成（沙箱 $sandbox）"; $script:fail++
+    return
+  }
+  $cards = [IO.File]::ReadAllText($out, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+  $allText = ($cards | ConvertTo-Json -Depth 20 -Compress)
+  & $checks $name $cards $allText $homeDir
 }
 
-$attDir = Get-ChildItem (Join-Path $homeDir 'attachments') -Recurse -File -ErrorAction SilentlyContinue
-if ($attDir) { Write-Host "PASS: 附件已持久化（$($attDir.Count) 个文件）"; $pass++ }
-else { Write-Host 'FAIL: attachments/v1 下没有文件'; $fail++ }
+# ---------------------------------------------------------------- 场景 A
+Run-Bridge 'A 正向（合并+doctor+列表）' @{} @(
+  @{ text = '你好' },
+  @{ wait = 600 },
+  @{ image = 'IMG'; text = '看看这两张' },
+  @{ image = 'IMG' },
+  @{ wait = 3000 },
+  @{ text = '/doctor' },
+  @{ wait = 2500 },
+  @{ text = '/model' },
+  @{ wait = 2000 }
+) {
+  param($name, $cards, $allText, $homeDir)
+  foreach ($c in @('附图 2 张', '诊断', '附件服务：可用', '📷', 'glm-4.5v')) {
+    if ($allText.IndexOf($c) -ge 0) { Write-Host "PASS [$name] $c"; $script:pass++ }
+    else { Write-Host "FAIL [$name] 缺少：$c"; $script:fail++ }
+  }
+  $att = @(Get-ChildItem (Join-Path $homeDir 'attachments') -Recurse -File -ErrorAction SilentlyContinue)
+  if ($att.Count -ge 2) { Write-Host "PASS [$name] 附件落盘（$($att.Count) 个）"; $script:pass++ }
+  else { Write-Host "FAIL [$name] 附件落盘不足（$($att.Count)）"; $script:fail++ }
+}
 
-Write-Host ""
-Write-Host "结果：$pass 通过 / $fail 失败  （沙箱：$sandbox）"
-exit ($(if ($fail -gt 0) { 1 } else { 0 }))
+# ---------------------------------------------------------------- 场景 B
+Run-Bridge 'B 拒绝卡+一键切换' @{ mockImageGate = 'text-only' } @(
+  @{ text = '你好' },
+  @{ wait = 600 },
+  @{ image = 'IMG' },
+  @{ wait = 3000 },
+  @{ click = @{ bridge = 'model'; model = 'glm-4.5v' } },
+  @{ wait = 1500 }
+) {
+  param($name, $cards, $allText, $homeDir)
+  foreach ($c in @('当前模型不支持图片输入', '切换 glm-4.5v', '模型已切换', 'glm_coding/glm-4.5v')) {
+    if ($allText.IndexOf($c) -ge 0) { Write-Host "PASS [$name] $c"; $script:pass++ }
+    else { Write-Host "FAIL [$name] 缺少：$c"; $script:fail++ }
+  }
+}
+
+Write-Host ''
+Write-Host "结果：$pass 通过 / $fail 失败"
+exit $(if ($fail -gt 0) { 1 } else { 0 })

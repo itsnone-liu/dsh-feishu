@@ -43,12 +43,20 @@ const DEFAULTS = {
   approval: 'cards',
   /** Card patch throttle window (ms) — also our Feishu rate-limit protection. */
   throttleMs: 900,
+  /** Burst window (ms) to coalesce consecutive image messages into ONE turn.
+   *  0 disables batching. Text during the window flushes as the caption. */
+  imageBatchMs: 1500,
+  /** Max images per coalesced batch; reaching it flushes immediately. */
+  imageBatchMax: 9,
   /** Hard cap on visible markdown per card before truncation. */
   cardTextLimit: 6000,
   /** ask_user_question timeout (ms); 0 = wait forever. */
   askTimeoutMs: 0,
   /** TEST ONLY: drive a scripted fake agent instead of a real model loop. */
   mockAgent: false,
+  /** TEST ONLY: force the image-capability gate in mock mode.
+   *  '' (real fail-open) | 'text-only' (reject) | 'vision' (accept). */
+  mockImageGate: '',
 };
 
 function coerce(raw) {

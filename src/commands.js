@@ -24,8 +24,8 @@ const HELP = [
   '**dsh-feishu 桥**',
   '',
   '- 直接发文字 = 和 agent 说话（运行中发送会作为下一步转向输入）',
-  '- **直接发图片 = 识图**：需先切换到识图模型（`/model` 列表中带 📷 的，如 `/model glm-4.5v`）',
-  '- `/new [cwd]` 新会话 · `/stop` 停止本轮 · `/status` 状态',
+  '- **直接发图片 = 识图**：需先切换到识图模型（`/model` 列表中带 📷 的，如 `/model glm-4.5v`；发错模型会收到一键切换按钮）。连发多张图会自动合并为一个回合（1.5 秒窗口）',
+  '- `/new [cwd]` 新会话 · `/stop` 停止本轮 · `/status` 状态 · `/doctor` 诊断（识图链路体检）',
   '- `/mode` 查看/切换权限模式（`/mode ro` 只读 · `/mode rw` 工作区可写 · `/mode full` 全权）',
   '- `/model` 查看/切换模型（如 `/model glm-5.3`；跨厂商用 `厂商/模型` 全称；📷 标记支持识图）',
   '- `/preset` 查看/切换预设（极简 minimal · 标准 standard · code · cordis；有历史的会话自动开新会话）',
@@ -96,6 +96,9 @@ export class Commands {
           return await this.cmdResume(chatId, arg);
         case 'cwd':
           return await this.cmdCwd(chatId, arg);
+        case 'doctor':
+        case 'diag':
+          return await this.cmdDoctor(chatId);
         default:
           await this.transport.sendCard(chatId, buildInfoCard('未知命令', `没有 \`${cmd}\`，试试 /help`, { template: 'grey' }));
           return true;
@@ -141,6 +144,62 @@ export class Commands {
     }
     this.driver.stop(agent);
     await this.transport.sendCard(chatId, buildInfoCard('已请求停止', '当前回合将被取消；排队中的输入保留。', { template: 'orange' }));
+    return true;
+  }
+
+  // ---------------------------------------------------------------- /doctor
+
+  /** 1×1 transparent PNG (67 bytes) — attachment-service probe payload. */
+  static PROBE_PNG = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
+    'base64',
+  );
+
+  async cmdDoctor(chatId) {
+    const rows = [];
+
+    // transport mode
+    const t = this.config.transport === 'auto'
+      ? (this.config.appId ? 'auto → sdk（长连接）' : 'auto → 未配置 FEISHU_APP_ID')
+      : this.config.transport;
+    rows.push(`${this.config.transport === 'mock' ? '⚠️' : '✅'} 传输模式：\`${t}\`${this.config.mockAgent ? '（mockAgent 测试模式）' : ''}`);
+
+    // current session model + image capability
+    const binding = this.store.get(chatId);
+    const entry = binding?.sessionId ? this.driver.live.get(binding.sessionId) : null;
+    if (entry) {
+      const cur = this.driver.currentModel(entry.agent);
+      const accepts = await this.driver.modelAcceptsImages(entry.agent);
+      const cap = accepts === false ? '❌ 仅文本（发图会收到带切换按钮的提示卡）'
+        : accepts === true ? '✅ 支持图片' : '❓ 无法判定（fail-open，交由服务端裁决）';
+      rows.push(`ℹ️ 当前会话模型：${cur ? `\`${cur.provider}/${cur.model}\`` : '—'}\n　　识图：${cap}`);
+    } else {
+      rows.push('ℹ️ 当前会话模型：本聊天暂无活动会话（新会话用默认模型）');
+    }
+
+    // vision-capable models
+    const vision = await this.driver.imageModels();
+    rows.push(vision.length
+      ? `✅ 识图模型：${vision.map((v) => `\`${v}\``).join('、')}`
+      : '❌ 识图模型：未发现（settings.yaml 中需为视觉模型声明 `input: [text, image]`）');
+
+    // attachment service probe (writes one 1×1 test image)
+    try {
+      await this.driver.admitImages([{
+        data: new Uint8Array(Commands.PROBE_PNG),
+        mediaType: 'image/png',
+        name: 'doctor-1x1.png',
+      }]);
+      rows.push('✅ 附件服务：可用（已写入 1×1 测试图）');
+    } catch (e) {
+      rows.push(`❌ 附件服务：不可用：${e.message}`);
+    }
+
+    rows.push('', '**需人工核对**（服务端探测不到）：');
+    rows.push('- ⚠️ 飞书开放平台 → 权限管理：`im:resource`（获取消息中的资源文件）——发图提示无权限时开启');
+    rows.push('- ℹ️ 卡片更新限速 / 文件上传参数：待 research（R2）结果接入后自动校准');
+
+    await this.transport.sendCard(chatId, buildInfoCard('🔍 诊断', rows.join('\n')));
     return true;
   }
 

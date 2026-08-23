@@ -6,7 +6,7 @@
  * serializes OUR bookkeeping; a submit itself returns immediately (the agent
  * loop runs on its own fibers), so steer-while-running works.
  */
-import { buildErrorCard, buildInfoCard } from './cards.js';
+import { buildErrorCard, buildInfoCard, buildImageRejectCard } from './cards.js';
 import { isWorkspaceAllowed } from './config.js';
 import { sniffImageMediaType } from './util.js';
 import { log } from './log.js';
@@ -26,6 +26,8 @@ export class ChatRouter {
     this.seen = new Set();
     this.seenOrder = [];
     this.warnedChats = new Set();
+    /** chatId → pending image burst { images[], text, timer } */
+    this.batches = new Map();
   }
 
   /** Transport entry point. Never throws. */
@@ -43,8 +45,44 @@ export class ChatRouter {
   }
 
   onCardAction(action) {
+    if (this.#handleModelAction(action)) return;
     const ok = this.interactions.onCardAction(action);
     if (!ok) log.debug(`unmatched card action: ${JSON.stringify(action.value).slice(0, 80)}`);
+  }
+
+  /**
+   * One-tap model switch from the image-reject card (value.bridge === 'model').
+   * Fail-closed on the whitelist; only acts on LIVE agents (never creates one).
+   */
+  #handleModelAction(action) {
+    const v = action?.value;
+    if (!v || v.bridge !== 'model' || !v.provider || !v.model || !v.chatId) return false;
+    if (!this.config.allowedOpenIds.includes(action.openId)) {
+      log.warn(`model action from unknown open_id ${action.openId || '(none)'} — dropped`);
+      return true; // consumed, not forwarded
+    }
+    const { chatId, provider, model } = v;
+    this.#enqueue(chatId, async () => {
+      try {
+        const binding = this.store.get(chatId);
+        const entry = binding?.sessionId ? this.driver.live.get(binding.sessionId) : null;
+        if (!entry) {
+          await this.transport.sendCard(chatId, buildErrorCard('无法切换', '当前聊天没有进行中的会话。发任意消息开始会话后，或直接用 `/model` 切换。'));
+          return;
+        }
+        this.driver.setModel(entry.agent, provider, model);
+        log.info(`chat ${chatId}: model switched via card button → ${provider}/${model}`);
+        await this.transport.sendCard(chatId, buildInfoCard(
+          '模型已切换',
+          `→ **${provider}/${model}**\n\n下一回合起生效。现在可以重发图片了（若仍有待合并图片，将自动按新模型提交）。`,
+          { template: 'green' },
+        ));
+      } catch (e) {
+        log.error(`chat ${chatId}: model action: ${e.stack ?? e}`);
+        await this.transport.sendCard(chatId, buildErrorCard('切换失败', e.message)).catch(() => {});
+      }
+    });
+    return true;
   }
 
   #enqueue(chatId, task) {
@@ -89,33 +127,97 @@ export class ChatRouter {
       return;
     }
 
+    // plain text while an image burst is pending = its caption → flush now.
+    // Commands (start with '/') run normally; the burst keeps waiting.
+    const burst = this.batches.get(chatId);
+    if (burst && text && !text.startsWith('/')) {
+      burst.text = burst.text ? `${burst.text}\n${text}` : text;
+      log.info(`chat ${chatId}: text flushed pending image burst (${burst.images.length} img)`);
+      this.#flushImages(chatId);
+      return;
+    }
+
     // commands
     if (await this.commands.handle(chatId, text)) return;
 
-    // normal traffic → agent
-    const binding = this.store.get(chatId) ?? { sessionId: null, cwd: null };
-    if (!binding.cwd) {
-      binding.cwd = this.config.defaultCwd;
-      if (!isWorkspaceAllowed(this.config, binding.cwd)) {
-        await this.transport.sendCard(chatId, buildErrorCard('defaultCwd 不在白名单', `defaultCwd=${this.config.defaultCwd}`));
+    // image traffic → (optional burst window) → sniff → gate → durable commit → image blocks
+    if (msg.images?.length) {
+      if ((this.config.imageBatchMs ?? 0) > 0) {
+        this.#stashImage(chatId, msg);
         return;
       }
-    }
-    const agent = await this.driver.ensure(binding);
-    this.store.update(chatId, { sessionId: binding.sessionId, cwd: binding.cwd });
-    if (this.renderer.chatOf(agent.id) !== chatId) this.renderer.attach(agent.id, chatId);
-
-    // image traffic → sniff → gate → durable commit → image blocks
-    if (msg.images?.length) {
+      const agent = await this.#agentFor(chatId);
       await this.#submitImages(chatId, agent, msg);
       return;
     }
 
+    // normal text traffic → agent
+    const agent = await this.#agentFor(chatId);
     const mode = this.driver.submit(agent, text);
     if (mode === 'steer') {
       this.renderer.setSteerNote(agent.id, text);
       log.info(`chat ${chatId}: steered running agent`);
     }
+  }
+
+  /** Resolve (and remember) the live agent bound to a chat. */
+  async #agentFor(chatId) {
+    const binding = this.store.get(chatId) ?? { sessionId: null, cwd: null };
+    if (!binding.cwd) {
+      binding.cwd = this.config.defaultCwd;
+      if (!isWorkspaceAllowed(this.config, binding.cwd)) {
+        throw new Error(`defaultCwd 不在白名单（defaultCwd=${this.config.defaultCwd}）`);
+      }
+    }
+    const agent = await this.driver.ensure(binding);
+    this.store.update(chatId, { sessionId: binding.sessionId, cwd: binding.cwd });
+    if (this.renderer.chatOf(agent.id) !== chatId) this.renderer.attach(agent.id, chatId);
+    return agent;
+  }
+
+  // ---------------------------------------------------------- image bursts
+
+  /** Queue one image message into the per-chat burst window. */
+  #stashImage(chatId, msg) {
+    let b = this.batches.get(chatId);
+    if (!b) {
+      b = { images: [], text: '', timer: null };
+      this.batches.set(chatId, b);
+    }
+    b.images.push(...msg.images);
+    if (msg.text) b.text = b.text ? `${b.text}\n${msg.text}` : msg.text;
+    const cap = Math.max(1, this.config.imageBatchMax ?? 9);
+    if (b.images.length >= cap) {
+      this.#flushImages(chatId);
+      return;
+    }
+    if (!b.timer) {
+      b.timer = setTimeout(() => this.#flushImages(chatId), this.config.imageBatchMs);
+    }
+  }
+
+  /** Empty the burst for a chat (timer-safe). Returns null when none pending. */
+  #takeBatch(chatId) {
+    const b = this.batches.get(chatId);
+    if (!b) return null;
+    if (b.timer) clearTimeout(b.timer);
+    this.batches.delete(chatId);
+    return { images: b.images, text: b.text };
+  }
+
+  /** Submit the pending burst (if any) through the serial queue. */
+  #flushImages(chatId) {
+    const batch = this.#takeBatch(chatId);
+    if (!batch) return;
+    this.#enqueue(chatId, async () => {
+      try {
+        const agent = await this.#agentFor(chatId);
+        await this.#submitImages(chatId, agent, batch);
+      } catch (e) {
+        log.error(`chat ${chatId}: image flush: ${e.stack ?? e}`);
+        await this.transport.sendCard(chatId, buildErrorCard('图片提交失败', e.message)).catch(() => {});
+      }
+    });
   }
 
   /**
@@ -142,13 +244,11 @@ export class ChatRouter {
     if (accepts === false) {
       const current = this.driver.currentModel(agent);
       const suggestions = (await this.driver.imageModels()).slice(0, 8);
-      const hint = suggestions.length
-        ? `\n\n可切换的识图模型：${suggestions.map((s) => `\`${s}\``).join('、')}\n切换命令：\`/model ${suggestions[0].split('/')[1]}\``
-        : '';
-      await this.transport.sendCard(chatId, buildErrorCard(
-        '当前模型不支持图片输入',
-        `当前模型 \`${current ? `${current.provider}/${current.model}` : '未知'}\` 只接受文本。先切换到识图模型再发图。${hint}`
-      ));
+      await this.transport.sendCard(chatId, buildImageRejectCard({
+        current: current ? `${current.provider}/${current.model}` : null,
+        suggestions,
+        chatId,
+      }));
       return;
     }
 
