@@ -16,6 +16,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
+import { execFile } from 'node:child_process';
 import { buildInfoCard, buildErrorCard } from './cards.js';
 import { isWorkspaceAllowed, dshHome } from './config.js';
 import { log } from './log.js';
@@ -31,6 +32,7 @@ const HELP = [
   '- `/preset` 查看/切换预设（极简 minimal · 标准 standard · code · cordis；有历史的会话自动开新会话）',
   '- `/sessions` 列出本工作区会话 · `/resume <id前缀>` 接续旧会话',
   '- `/cwd <路径>` 设定下次新会话的工作区',
+  '- `/restart` 安全重启桥（经计划任务在进程外执行；会话可接续）',
   '',
   'agent 提问或请求审批时会弹出按钮卡片；直接回复文字等于自由输入。',
 ].join('\n');
@@ -99,6 +101,8 @@ export class Commands {
         case 'doctor':
         case 'diag':
           return await this.cmdDoctor(chatId);
+        case 'restart':
+          return await this.cmdRestart(chatId);
         default:
           await this.transport.sendCard(chatId, buildInfoCard('未知命令', `没有 \`${cmd}\`，试试 /help`, { template: 'grey' }));
           return true;
@@ -613,6 +617,96 @@ export class Commands {
     }
     const binding = this.store.update(chatId, { cwd });
     await this.transport.sendCard(chatId, buildInfoCard('工作区已设定（对下一个 /new 生效）', `\`${cwd}\``, { template: 'green' }));
+    return true;
+  }
+
+  // ------------------------------------------------------------- /restart
+
+  /** Locate the launcher script for a fresh bridge process. */
+  #findLauncher() {
+    if (this.config.restartLauncher && fs.existsSync(this.config.restartLauncher)) {
+      return this.config.restartLauncher;
+    }
+    if (process.env.DSH_FEISHU_LAUNCHER && fs.existsSync(process.env.DSH_FEISHU_LAUNCHER)) {
+      return process.env.DSH_FEISHU_LAUNCHER;
+    }
+    // The harness runs with cwd = the directory that holds node_modules/@deepseek-ai/dsh
+    const candidates = [
+      path.join(process.cwd(), 'start_bridge.ps1'),
+      path.join(process.cwd(), 'start-dsh-feishu.ps1'),
+      path.join(process.cwd(), 'start-dsh-feishu.bat'),
+    ];
+    return candidates.find((c) => fs.existsSync(c)) ?? null;
+  }
+
+  /**
+   * Safe restart: the restart runs from OUTSIDE this process (a one-shot
+   * scheduled task), so killing the old bridge cannot also kill the restarter
+   * — the exact failure mode of the 2026-08-23 14:43 incident, where an agent
+   * Stop-Process'd its own host and the follow-up start never ran.
+   */
+  async cmdRestart(chatId) {
+    if (this.config.transport === 'mock') {
+      await this.transport.sendCard(chatId, buildInfoCard('mock 模式不支持 /restart'));
+      return true;
+    }
+    const launcher = this.#findLauncher();
+    if (!launcher) {
+      await this.transport.sendCard(chatId, buildErrorCard(
+        '找不到启动脚本',
+        '在 config.json 里设置 `restartLauncher` 指向启动脚本（如 `D:\\dsh-install\\start_bridge.ps1`）后重试。',
+      ));
+      return true;
+    }
+
+    const pid = process.pid;
+    const dir = this.config.dataDir;
+    const wrapper = path.join(dir, 'restart-now.ps1');
+    const logFile = path.join(dir, 'restart.log');
+    const stamp = new Date().toISOString();
+    // Self-contained restarter: wait for the old PID to exit, force-kill it if
+    // stuck, then launch the new bridge. Everything is logged for auditing.
+    const script = [
+      `$ErrorActionPreference = 'Continue'`,
+      `"restart requested ${stamp} oldPid=$pid launcher='$launcher'" | Add-Content -Path '${logFile.replace(/'/g, "''")}' -Encoding UTF8`,
+      `$deadline = (Get-Date).AddSeconds(15)`,
+      `while ((Get-Date) -lt $deadline) { $p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if (-not $p) { break }; Start-Sleep -Milliseconds 500 }`,
+      `$p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if ($p) { try { Stop-Process -Id ${pid} -Force } catch {} }`,
+      `Start-Sleep 1`,
+      `& '${launcher.replace(/'/g, "''")}' *>&1 | Add-Content -Path '${logFile.replace(/'/g, "''")}' -Encoding UTF8`,
+      `"restart finished $(Get-Date -Format o)" | Add-Content -Path '${logFile.replace(/'/g, "''")}' -Encoding UTF8`,
+    ].join('\n');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(wrapper, script, 'utf8');
+
+    const run = (args) => new Promise((resolve) => {
+      execFile('schtasks', args, { windowsHide: true }, (err, stdout, stderr) => {
+        resolve({ err, stdout: String(stdout ?? ''), stderr: String(stderr ?? '') });
+      });
+    });
+    const tn = 'dsh-feishu-restart';
+    const future = new Date(Date.now() + 5 * 60_000);
+    const hhmm = `${String(future.getHours()).padStart(2, '0')}:${String(future.getMinutes()).padStart(2, '0')}`;
+    const tr = `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${wrapper}"`;
+    const created = await run(['/Create', '/TN', tn, '/TR', tr, '/SC', 'ONCE', '/ST', hhmm, '/F']);
+    if (created.err) {
+      await this.transport.sendCard(chatId, buildErrorCard('重启任务创建失败', `${created.err.message}\n${created.stderr}`.slice(0, 900)));
+      return true;
+    }
+    const ran = await run(['/Run', '/TN', tn]);
+    if (ran.err) {
+      await this.transport.sendCard(chatId, buildErrorCard('重启任务启动失败', `${ran.err.message}\n${ran.stderr}`.slice(0, 900)));
+      return true;
+    }
+    log.warn(`/restart: scheduled task ${tn} running; this process (pid=${pid}) exits now`);
+    await this.transport.sendCard(chatId, buildInfoCard(
+      '🔄 桥正在重启',
+      `旧进程 \`${pid}\` 即将退出，新进程马上拉起（由计划任务在进程外执行）。\n\n本聊天绑定保持不变；约 5–10 秒后直接发消息即可接续（需要时用 \`/resume\`）。日志：\`${logFile}\``,
+      { template: 'blue' },
+    ));
+    // Give the card a moment to land, then exit; the scheduled task waits for
+    // this PID to disappear before starting the new bridge.
+    setTimeout(() => process.exit(0), 1500).unref?.();
     return true;
   }
 }

@@ -42,6 +42,7 @@ export class TurnRenderer {
     const st = this.states.get(sessionId);
     if (!st) return;
     if (st.timer) clearTimeout(st.timer);
+    if (st.retryTimer) clearTimeout(st.retryTimer);
     this.states.delete(sessionId);
   }
 
@@ -66,6 +67,9 @@ export class TurnRenderer {
       dirty: false,
       timer: null,
       sending: false,
+      /** Consecutive card-patch failures (backoff + fallback-new-card source). */
+      failCount: 0,
+      retryTimer: null,
     };
   }
 
@@ -125,6 +129,8 @@ export class TurnRenderer {
     st.startedAt = Date.now();
     st.endedAt = 0;
     st.messageId = null;
+    st.failCount = 0;
+    if (st.retryTimer) { clearTimeout(st.retryTimer); st.retryTimer = null; }
     this.#schedule(st, null, true);
   }
 
@@ -133,6 +139,9 @@ export class TurnRenderer {
     if (!c) return;
     if (c.type === 'block-start') {
       if (c.blockType === 'text' || c.blockType === 'reasoning') {
+        // A tool-call block earlier in the same step never lands here, so the
+        // array can hold holes at lower indices. Store a placeholder that all
+        // iteration sites must tolerate (see #blocks iter helpers in cards.js).
         st.blocks[c.index] = { kind: c.blockType, text: '' };
       }
       // tool-call blocks render from the durable tool/call event instead
@@ -152,7 +161,7 @@ export class TurnRenderer {
   #onAssistantMessage(st, d) {
     // Authoritative snapshot for the step: rebuild blocks, keep tool statuses.
     const prevTools = new Map();
-    for (const b of st.blocks) if (b.kind === 'tool' && b.tool?.callId) prevTools.set(b.tool.callId, b.tool);
+    for (const b of st.blocks) if (b?.kind === 'tool' && b.tool?.callId) prevTools.set(b.tool.callId, b.tool);
     const blocks = [];
     const content = d.message?.content ?? [];
     for (const part of content) {
@@ -184,7 +193,7 @@ export class TurnRenderer {
 
   #onToolCall(st, d) {
     st.toolCount++;
-    const existing = st.blocks.find((b) => b.kind === 'tool' && b.tool?.callId === d.callId);
+    const existing = st.blocks.find((b) => b?.kind === 'tool' && b.tool?.callId === d.callId);
     const tool = {
       callId: d.callId,
       name: d.name,
@@ -199,7 +208,7 @@ export class TurnRenderer {
 
   #onToolResult(st, d) {
     const callId = d.message?.source?.callId ?? d.message?.content?.[0]?.toolCallId;
-    const block = st.blocks.find((b) => b.kind === 'tool' && b.tool?.callId === callId);
+    const block = st.blocks.find((b) => b?.kind === 'tool' && b.tool?.callId === callId);
     const isError = Boolean(d.message?.content?.[0]?.isError);
     if (isError) st.errorCount++;
     if (block) {
@@ -259,7 +268,7 @@ export class TurnRenderer {
       // workspace so the truncated card stays readable (R2 may later upgrade
       // this to a real Feishu file upload).
       if (st.final && !st.outputDumped) {
-        const texts = st.blocks.filter((b) => b.kind === 'text').map((b) => b.text);
+        const texts = st.blocks.filter((b) => b?.kind === 'text').map((b) => b.text);
         const total = texts.reduce((n, t) => n + t.length, 0);
         if (total > this.config.cardTextLimit) {
           const dest = this.#dumpFullOutput(st, texts);
@@ -268,7 +277,7 @@ export class TurnRenderer {
         st.outputDumped = true;
       }
       const card = buildTurnCard(
-        { ...st, footer: this.#footer(st) },
+        { ...st, blocks: st.blocks.filter(Boolean), footer: this.#footer(st) },
         this.config.cardTextLimit
       );
       if (!st.messageId) {
@@ -279,10 +288,31 @@ export class TurnRenderer {
       }
       st.lastPatchAt = Date.now();
       if (st.final) st.final = false;
+      st.failCount = 0;
     } catch (e) {
       st.dirty = true; // retry on next schedule
-      log.warn(`card patch failed: ${e.message}`);
-      if (st.messageId == null) {
+      st.failCount += 1;
+      log.warn(`card patch failed (attempt ${st.failCount}): ${e.message}`);
+      // Bounded backoff retry — a failed update must not freeze the card
+      // forever, and repeated failures fall back to a FRESH card (the old
+      // message may be unpatchable, e.g. deleted or too large).
+      const base = Number(this.config.cardRetryBaseMs) > 0 ? Number(this.config.cardRetryBaseMs) : 1000;
+      const backoff = Math.min(15 * base, base * 2 ** (st.failCount - 1));
+      if (st.retryTimer) clearTimeout(st.retryTimer);
+      if (st.failCount >= 5) {
+        st.failCount = 0;
+        st.messageId = null; // next flush sends a new card instead of patching
+        st.retryTimer = setTimeout(() => {
+          st.retryTimer = null;
+          this.#flush(st).catch(() => {});
+        }, backoff);
+      } else {
+        st.retryTimer = setTimeout(() => {
+          st.retryTimer = null;
+          this.#flush(st).catch(() => {});
+        }, backoff);
+      }
+      if (st.messageId == null && st.failCount === 1) {
         // Card never landed — tell the chat instead of failing silently.
         try {
           await this.transport.sendCard(st.chatId, buildErrorCard('卡片更新失败', e.message));

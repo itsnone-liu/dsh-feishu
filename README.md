@@ -12,20 +12,30 @@
 **桥零记忆**：chat_id ↔ session 的绑定表是它唯一的路由状态；对话历史、compaction、
 resume 全部由 DSH session 层拥有。
 
-## 功能（V0.2，已实现）
+## 功能（V0.3，已实现）
 
 - 私聊文本 → agent；**运行中发消息 = steer**（下一步转向输入，"等等别改那个文件"）
-- **识图模式**：直接发图片 → 消息资源下载 → 魔数嗅探格式 → 附件服务持久化 → image 块提交。
-  需当前模型声明图片输入（`/model` 列表带 📷 的，如 `glm-4.5v`）；文本模型下发图会收到
-  **带一键切换按钮**的卡片。飞书侧需为应用添加「im:resource」（获取消息中的资源文件）权限。
-  入参上限随附件服务放宽为 8192px / 10MB（profile patch 覆盖）。
-  **连发多张图自动合并为一个回合**（`imageBatchMs` 窗口，默认 1.5s，紧随的文本=说明文字）。
+- **识图（两条路，推荐工具路）**：
+  - **`inspect_image` 工具路（V0.3 新增，默认启用）**：主模型保持 glm-5.3，agent 自动调
+    `inspect_image(file, question)` 外挂 coding 端点 glm-4.5v 识图，文字回答直接回上下文——
+    无需切模型、无需重发图（设计参考 dsh-tool-vision，见 `docs/VISION-PLAN.md`）；
+  - **原生模型路（V0.2 保留）**：发图 → 附件服务持久化 → image 块直达模型；文本模型下发图收到
+    带一键切换按钮的卡片（如 `glm-4.5v`）。飞书侧需「im:resource」权限；入参上限 8192px / 10MB。
+    **连发多张图自动合并为一个回合**（`imageBatchMs` 窗口，默认 1.5s，紧随的文本=说明文字）。
 - **文件消息**：非图片文件落盘 `<cwd>/.feishu-files/<时间戳>-<名>`（≤10MB，文件名清洗防穿越），
   agent 收到路径说明——文本模型即可用，与识图解耦
 - **群聊 @ 触发**：`groups` 三档 `off`（默认，仅私聊）/`mention`（群内 @机器人 的文本）/
   `all`（全部消息，白名单仍生效）；机器人身份经 `GET /bot/v3/info` 解析，失败 fail-closed
 - **长输出转文件**：回复超过 `cardTextLimit` 时全文落盘 `<cwd>/.feishu-outputs/`，卡片尾注给路径
 - **会话占用报错**：绑定的会话被另一端（WebUI 等）使用时给专属卡片，不再静默开新会话
+- **进程生存加固（V0.3）**：session/event 渲染异常隔离（dsh 的 append 同步调监听器，旧代码一处
+  抛错即进程死亡）；卡片更新失败有界退避重试 + 连续失败换发新卡；卡片元素上限折叠；
+  桥自身持久日志 `$DSH_HOME/feishu/bridge.log`（5MB 轮转）；进程异常钩子落盘。
+  详见 `docs/INCIDENT-2026-08-23.md`
+- **自杀式重启防护（V0.3）**：tools guard 拦截"杀掉本桥进程"的 shell 命令（2026-08-23 14:43 事故
+  根因——agent Stop-Process 自己的宿主，重启链随宿主死亡，桥停机 56 分钟）；新增 **`/restart`**
+  经 schtasks 计划任务在进程外安全重启，绑定与持久会话可接续；终端手动重启用
+  `scripts/restart-bridge.ps1`
 - **`/doctor` 诊断**：传输模式、群聊模式、当前模型识图能力、识图模型清单、附件服务探针（1×1 PNG 实测）
 - 一个 turn 一张**流式卡片**：思考摘要 / 正文 / 工具行（✅❌ + 结果预览）/ token 用量 / 耗时
 - `ask_user_question` → 按钮卡片（点按钮或直接回文字均可），回合取消自动失效
@@ -91,9 +101,15 @@ dsh --profile feishu
 | `throttleMs` | `900` | 卡片节流（也是频控保护） |
 | `askTimeoutMs` | `0` | 提问超时（0=永久等） |
 | `transport` | `auto` | `sdk`/`vendored`/`mock`；auto=有官方 SDK 用之 |
+| `vision` | `null`(=默认启用) | `inspect_image` 识图工具配置；`false` 关闭（见 `docs/VISION-PLAN.md`） |
+| `logFile` | `$DSH_HOME/feishu/bridge.log` | 桥自身持久日志（5MB 轮转）；`none` 关闭 |
+| `restartLauncher` | 自动探测 | `/restart` 使用的启动脚本绝对路径 |
+| `cardRetryBaseMs` | `1000` | 卡片更新失败退避基数（指数退避至 15×） |
 
 环境变量：`FEISHU_APP_ID` `FEISHU_APP_SECRET`（密钥只走环境）；
 `DSH_FEISHU_LOG=debug`；`FEISHU_API_BASE`（Lark 海外版 `https://open.larksuite.com`）。
+
+> ⚠️ 生产启动脚本（`start_bridge.ps1` / `.bat`）里如内联了密钥，注意文件权限；推荐改为只读环境。
 
 ## Transport 说明
 
@@ -106,9 +122,12 @@ dsh --profile feishu
 ## 测试
 
 ```sh
-node test/scenario.mjs        # 16 断言：mock agent 全链路（流式卡/ask/审批/steer/stop/命令/白名单/持久化）
-node test/scenario-real.mjs   # 6 断言：真实 agent（创建/失败回合/磁盘持久化/跨进程 resume）
-node test/dump-session-events.mjs   # session 事件录制/检查工具
+node test/scenario.mjs             # 16 断言：mock agent 全链路（流式卡/ask/审批/steer/stop/命令/白名单/持久化）
+node test/scenario-real.mjs        # 6 断言：真实 agent（创建/失败回合/磁盘持久化/跨进程 resume）
+node test/hardening.test.mjs       # 8 断言：稀疏块渲染/卡片失败退避/杀宿主拦截/inspect_image（mock fetch）
+node test/replay-render.mjs        # 真实会话日志全量回放（95,877 事件无异常）；REPLAY_FAIL_SEND=1 注入卡片失败
+node tools/decode-session.mjs <session.jsonl.zstd> [out.jsonl]   # 纯 Node 解码 DSH 会话日志（无 zstdcat 依赖）
+powershell -File test/image-mode.ps1  # e2e：21 断言，真实 dsh + mock transport（识图/拒图切换/文件/群聊/长输出）
 ```
 
 ## 安全模型
@@ -119,13 +138,15 @@ node test/dump-session-events.mjs   # session 事件录制/检查工具
 - 沙箱/权限沿用 dsh-base（`DSH_PERMISSION_MODE` 控制沙箱与审批默认）
 - 本进程是唯一 userQuestions provider——所以它必须是独立 profile，不能与 `dsh web` 同进程
 
-## 已知限制（V0.3 路线）
+## 已知限制（V0.4 候选）
 
 - WebUI 与飞书**同时**驱动同一 session 不支持（live driver 单进程单属）；被占用时会收到
-  专属提示卡。V0.3 计划加文件锁与占用提示优化。
+  专属提示卡。
 - 卡片更新限速参数与文件上传为保守实现（飞书文件上传待 research R2 接入后升级）。
 - 识图不支持表情包与合并转发消息内的图片（飞书资源接口限制）。
 - `vendored` WS 协议未经真实凭据验证（优先用 `sdk`）。
+- `inspect_image` 单图调用；多图对比（`files[]`）与像素预算 downscale 待需要时加。
+- `/restart` 依赖 schtasks（Windows）；跨平台需 systemd/launchd 等价物。
 
 ## 与 DSH Desktop 的关系
 

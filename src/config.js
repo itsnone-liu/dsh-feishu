@@ -53,6 +53,8 @@ const DEFAULTS = {
   fileMaxBytes: 10485760,
   /** Hard cap on visible markdown per card before truncation. */
   cardTextLimit: 6000,
+  /** Base delay (ms) for card-patch failure backoff; retries double up to 15×. */
+  cardRetryBaseMs: 1000,
   /** ask_user_question timeout (ms); 0 = wait forever. */
   askTimeoutMs: 0,
   /** TEST ONLY: drive a scripted fake agent instead of a real model loop. */
@@ -62,6 +64,14 @@ const DEFAULTS = {
   mockImageGate: '',
   /** TEST ONLY: pad mock agent answers to ~N chars (long-output path). */
   mockLongOutput: 0,
+  /** Durable log file for the bridge itself (crash/audit trail). Empty =
+   *  $DSH_HOME/feishu/bridge.log. Set to 'none' to disable file logging. */
+  logFile: '',
+  /** Restart launcher for /restart: a .ps1/.bat/.cmd absolute path. Empty =
+   *  auto-detect the canonical launcher next to the installed dsh package. */
+  restartLauncher: '',
+  /** inspect_image vision tool (see src/vision-tool.js). `false` disables. */
+  vision: null,
 };
 
 function coerce(raw) {
@@ -79,6 +89,7 @@ function coerce(raw) {
   if (raw?.allowGroupChats === true) cfg.groups = 'mention';
   if (!['off', 'mention', 'all'].includes(cfg.groups)) cfg.groups = 'off';
   if (!cfg.dataDir) cfg.dataDir = path.join(dshHome(), 'feishu');
+  if (!cfg.logFile) cfg.logFile = path.join(cfg.dataDir, 'bridge.log');
   cfg.appId = process.env.FEISHU_APP_ID || process.env.DSH_FEISHU_APP_ID || '';
   cfg.appSecret = process.env.FEISHU_APP_SECRET || process.env.DSH_FEISHU_APP_SECRET || '';
   return cfg;

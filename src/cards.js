@@ -46,11 +46,26 @@ function turnHeader(state) {
 /**
  * Build the streaming turn card from renderer state.
  * state.blocks: [{kind:'reasoning'|'text'|'tool', text, tool?:{name, args, status, preview}}]
+ * Sparse holes (undefined entries) are tolerated and skipped; the number of
+ * rendered elements is capped (Feishu rejects oversized cards outright, which
+ * would freeze streaming) with a fold marker for the middle.
  */
+const MAX_CARD_ELEMENTS = 28;
+
 export function buildTurnCard(state, textLimit) {
   const [template, title] = turnHeader(state);
+  const blocks = (state.blocks ?? []).filter(Boolean);
+  // Keep head and tail blocks; fold the middle when the turn is long.
+  let shown = blocks;
+  let folded = 0;
+  if (blocks.length > MAX_CARD_ELEMENTS) {
+    const head = Math.ceil(MAX_CARD_ELEMENTS * 0.6);
+    const tail = Math.floor(MAX_CARD_ELEMENTS * 0.3);
+    folded = blocks.length - head - tail;
+    shown = [...blocks.slice(0, head), { kind: 'text', text: `…（已折叠 ${folded} 个中间块，完整内容见落盘文件或继续等待）…` }, ...blocks.slice(-tail)];
+  }
   const elements = [];
-  for (const b of state.blocks) {
+  for (const b of shown) {
     if (b.kind === 'reasoning') {
       const body = clamp(b.text ?? '', 700);
       if (!body.trim()) continue;
