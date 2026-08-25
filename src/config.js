@@ -72,6 +72,20 @@ const DEFAULTS = {
   restartLauncher: '',
   /** inspect_image vision tool (see src/vision-tool.js). `false` disables. */
   vision: null,
+  /** 额度耗尽自动继续（see src/autocontinue.js）。`false` 关闭。 */
+  autoContinue: true,
+  /** 自动继续时补发的消息文本。 */
+  autoContinueMessage: '继续',
+  /** 额度错误未给出重置时间时的首次探测延迟（ms）。 */
+  autoContinueFirstMs: 60_000,
+  /** 之后的轮询间隔（ms）。 */
+  autoContinuePollMs: 10 * 60_000,
+  /** 自动等待总上限（ms），超过即放弃并通知。 */
+  autoContinueMaxMs: 6 * 3_600_000,
+  /** 瞬时限流（429/上游负载）的最大短退避重试次数。 */
+  autoContinueShortMax: 6,
+  /** 追加的额度错误匹配正则（字符串数组，不区分大小写）。 */
+  autoContinuePatterns: [],
 };
 
 function coerce(raw) {

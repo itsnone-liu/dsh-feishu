@@ -27,6 +27,7 @@ import { SessionDriver } from './driver.js';
 import { ChatRouter } from './router.js';
 import { Commands } from './commands.js';
 import { InteractionManager } from './ask.js';
+import { AutoContinue } from './autocontinue.js';
 import { createTransport } from './transport/index.js';
 import { installSelfGuard } from './selfguard.js';
 import { installVisionTool } from './vision-tool.js';
@@ -60,6 +61,7 @@ function apply(ctx, config) {
 
   // ---- global tools: host-kill guard + vision ------------------------------
   const disposers = [];
+  let visionReady = false;
   try {
     const d1 = installSelfGuard(ctx);
     if (d1) disposers.push(d1);
@@ -69,6 +71,7 @@ function apply(ctx, config) {
   try {
     const d2 = installVisionTool(ctx, cfg.vision);
     if (d2) disposers.push(d2);
+    visionReady = true;
   } catch (e) {
     log.warn(`vision tool not installed: ${e.message}`);
   }
@@ -85,8 +88,9 @@ function apply(ctx, config) {
         config: cfg,
         chatOfSession: (sessionId) => renderer.chatOf(sessionId),
       });
-      const commands = new Commands({ config: cfg, store, driver, renderer, transport, permissionPresets: ctx.permissionPresets, llm: ctx.llm, agentPresets: ctx.agentPresets });
-      const router = new ChatRouter({ config: cfg, store, driver, renderer, transport, interactions, commands });
+      const commands = new Commands({ config: cfg, store, driver, renderer, transport, permissionPresets: ctx.permissionPresets, llm: ctx.llm, agentPresets: ctx.agentPresets, visionReady });
+      const autoContinue = new AutoContinue({ config: cfg, driver, renderer, transport });
+      const router = new ChatRouter({ config: cfg, store, driver, renderer, transport, interactions, commands, visionReady, autoContinue });
 
       // ---- outbound seams ----
       ctx.userQuestions.registerProvider({
@@ -111,6 +115,11 @@ function apply(ctx, config) {
         } catch (e) {
           log.error(`render event ${event?.type} failed (contained): ${e?.stack ?? e}`);
         }
+        try {
+          autoContinue.onEvent(session, event);
+        } catch (e) {
+          log.error(`auto-continue event ${event?.type} failed (contained): ${e?.stack ?? e}`);
+        }
       });
 
       // ---- inbound transport ----
@@ -122,6 +131,7 @@ function apply(ctx, config) {
 
       const cleanup = () => {
         for (const d of disposers) { try { d(); } catch {} }
+        autoContinue.dispose();
         transport.stop().catch(() => {});
         driver.disposeAll().catch((e) => log.warn(`driver dispose: ${e.message}`));
       };

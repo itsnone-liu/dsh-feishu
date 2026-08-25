@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 export class ChatRouter {
-  constructor({ config, store, driver, renderer, transport, interactions, commands }) {
+  constructor({ config, store, driver, renderer, transport, interactions, commands, visionReady = false, autoContinue = null }) {
     this.config = config;
     this.store = store;
     this.driver = driver;
@@ -22,6 +22,9 @@ export class ChatRouter {
     this.transport = transport;
     this.interactions = interactions;
     this.commands = commands;
+    /** inspect_image registered → text-only models can still take images. */
+    this.visionReady = visionReady;
+    this.autoContinue = autoContinue;
     /** chatId → promise tail (serial handling) */
     this.queues = new Map();
     /** LRU-ish dedup of inbound message ids */
@@ -123,6 +126,9 @@ export class ChatRouter {
       }
       return;
     }
+
+    // any real user activity cancels pending quota auto-continue for this chat
+    this.autoContinue?.cancelForChat(chatId);
 
     // transport-level image failure → surface as a card, never reach the agent
     if (msg.imageError) {
@@ -272,7 +278,13 @@ export class ChatRouter {
     // 2) capability gate BEFORE anything durable — a text-only route would
     //    fail mid-turn after the message is committed, leaving a turn that
     //    cannot succeed. Fail-open when the route cannot be resolved.
+    //    NEW: with the external inspect_image tool registered, a text-only
+    //    model still works — the images ride as durable attachment refs in a
+    //    text note and the agent farms them out to the vision endpoint.
     const accepts = await this.driver.modelAcceptsImages(agent);
+    if (accepts === false && this.visionReady) {
+      return await this.#submitImagesViaVisionTool(chatId, agent, msg, inputs);
+    }
     if (accepts === false) {
       const current = this.driver.currentModel(agent);
       const suggestions = (await this.driver.imageModels()).slice(0, 8);
@@ -301,6 +313,40 @@ export class ChatRouter {
       log.info(`chat ${chatId}: steered running agent with image(s)`);
     } else {
       log.info(`chat ${chatId}: submitted ${refs.length} image(s)`);
+    }
+  }
+
+  /**
+   * Text-only model + external vision tool: durably commit the batch, then
+   * submit a TEXT note listing the attachment refs. The agent calls
+   * inspect_image(attachment=…) per image — no model switch, no 1210.
+   */
+  async #submitImagesViaVisionTool(chatId, agent, msg, inputs) {
+    let refs;
+    try {
+      refs = await this.driver.admitImages(inputs);
+    } catch (e) {
+      const reason = this.#imageAdmissionHint(e);
+      await this.transport.sendCard(chatId, buildErrorCard('图片未通过校验', `${reason}\n\n原始错误：${e.message}`));
+      return;
+    }
+    const lines = refs.map((ref, i) => {
+      const name = ref.name ? `「${ref.name}」` : `第 ${i + 1} 张`;
+      return `- ${name}（${ref.mediaType}，${ref.width ?? '?'}×${ref.height ?? '?'}）：\n  ${JSON.stringify(ref)}`;
+    });
+    const caption = msg.text ? `\n用户说：${msg.text}` : '';
+    const note = [
+      `[飞书图片] 收到 ${refs.length} 张图片，已保存为持久附件（当前主模型只接受文本）。`,
+      '请使用 inspect_image 工具逐张识别（attachment 参数原样传下面任一行的 JSON），然后回答用户关于图片的问题。',
+      ...lines,
+      caption,
+    ].join('\n');
+    const mode = this.driver.submit(agent, note);
+    if (mode === 'steer') {
+      this.renderer.setSteerNote(agent.id, msg.text || `📷 图片 ×${refs.length}（外挂识图）`);
+      log.info(`chat ${chatId}: steered running agent with ${refs.length} image(s) via vision tool`);
+    } else {
+      log.info(`chat ${chatId}: submitted ${refs.length} image(s) via vision tool path`);
     }
   }
 

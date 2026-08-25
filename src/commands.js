@@ -25,14 +25,15 @@ const HELP = [
   '**dsh-feishu 桥**',
   '',
   '- 直接发文字 = 和 agent 说话（运行中发送会作为下一步转向输入）',
-  '- **直接发图片 = 识图**：需先切换到识图模型（`/model` 列表中带 📷 的，如 `/model glm-4.5v`；发错模型会收到一键切换按钮）。连发多张图会自动合并为一个回合（1.5 秒窗口）',
+  '- **直接发图片 = 识图**：无需切模型 —— 文本模型会自动调用 `inspect_image` 外挂识图（Qwen-VL）；若当前模型本身支持视觉则原生识图。连发多张图会自动合并为一个回合（1.5 秒窗口）',
+  '- 订阅额度耗尽时桥会**自动等待恢复并继续**，期间发消息即可接管',
   '- `/new [cwd]` 新会话 · `/stop` 停止本轮 · `/status` 状态 · `/doctor` 诊断（识图链路体检）',
   '- `/mode` 查看/切换权限模式（`/mode ro` 只读 · `/mode rw` 工作区可写 · `/mode full` 全权）',
-  '- `/model` 查看/切换模型（如 `/model glm-5.3`；跨厂商用 `厂商/模型` 全称；📷 标记支持识图）',
+  '- `/model` 查看/切换模型（如 `/model glm-5.3`；跨厂商用 `厂商/模型` 全称；📷 标记原生支持识图）',
   '- `/preset` 查看/切换预设（极简 minimal · 标准 standard · code · cordis；有历史的会话自动开新会话）',
   '- `/sessions` 列出本工作区会话 · `/resume <id前缀>` 接续旧会话',
   '- `/cwd <路径>` 设定下次新会话的工作区',
-  '- `/restart` 安全重启桥（经计划任务在进程外执行；会话可接续）',
+  '- `/restart` 安全重启桥（在进程外拉起新进程；会话可接续）',
   '',
   'agent 提问或请求审批时会弹出按钮卡片；直接回复文字等于自由输入。',
 ].join('\n');
@@ -52,7 +53,7 @@ const MODE_ALIASES = {
 };
 
 export class Commands {
-  constructor({ config, store, driver, renderer, transport, permissionPresets, llm, agentPresets }) {
+  constructor({ config, store, driver, renderer, transport, permissionPresets, llm, agentPresets, visionReady = false }) {
     this.config = config;
     this.store = store;
     this.driver = driver;
@@ -61,6 +62,7 @@ export class Commands {
     this.permissionPresets = permissionPresets;
     this.llm = llm;
     this.agentPresets = agentPresets;
+    this.visionReady = visionReady;
   }
 
 
@@ -179,18 +181,35 @@ export class Commands {
     if (entry) {
       const cur = this.driver.currentModel(entry.agent);
       const accepts = await this.driver.modelAcceptsImages(entry.agent);
-      const cap = accepts === false ? '❌ 仅文本（发图会收到带切换按钮的提示卡）'
-        : accepts === true ? '✅ 支持图片' : '❓ 无法判定（fail-open，交由服务端裁决）';
+      const cap = accepts === true
+        ? '✅ 模型原生支持图片'
+        : this.visionReady
+          ? '✅ 仅文本，但已注册 inspect_image 外挂识图（发图自动走外挂，无需切模型）'
+          : accepts === false
+            ? '❌ 仅文本且无外挂识图（发图会收到切换模型提示卡）'
+            : '❓ 无法判定（fail-open，交由服务端裁决）';
       rows.push(`ℹ️ 当前会话模型：${cur ? `\`${cur.provider}/${cur.model}\`` : '—'}\n　　识图：${cap}`);
     } else {
       rows.push('ℹ️ 当前会话模型：本聊天暂无活动会话（新会话用默认模型）');
     }
 
+    // vision engine status (config + key presence; no network call here)
+    const v = this.config.vision;
+    if (v === false || v?.enabled === false) {
+      rows.push('⚠️ 外挂识图：config.json 已禁用（vision:false）');
+    } else {
+      const base = v?.baseURL ?? 'https://dashscope.aliyuncs.com/compatible-mode/v1';
+      const model = v?.model ?? 'qwen3-vl-plus';
+      const envName = v?.apiKeyEnv ?? 'DASHSCOPE_API_KEY';
+      const hasKey = Boolean(v?.apiKey || process.env[envName]);
+      rows.push(`${hasKey ? '✅' : '❌'} 外挂识图引擎：\`${model}\` @ \`${base}\`${hasKey ? '' : `（密钥缺失：config.json vision.apiKey 或环境变量 ${envName}）`}`);
+    }
+
     // vision-capable models
     const vision = await this.driver.imageModels();
     rows.push(vision.length
-      ? `✅ 识图模型：${vision.map((v) => `\`${v}\``).join('、')}`
-      : '❌ 识图模型：未发现（settings.yaml 中需为视觉模型声明 `input: [text, image]`）');
+      ? `ℹ️ 原生视觉模型（/model 可切）：${vision.map((x) => `\`${x}\``).join('、')}`
+      : 'ℹ️ 原生视觉模型：未发现（settings.yaml 中需为视觉模型声明 `input: [text, image]`）');
 
     // attachment service probe (writes one 1×1 test image)
     try {
@@ -650,6 +669,8 @@ export class Commands {
       await this.transport.sendCard(chatId, buildInfoCard('mock 模式不支持 /restart'));
       return true;
     }
+    if (process.platform !== 'win32') return await this.#restartUnix(chatId);
+
     const launcher = this.#findLauncher();
     if (!launcher) {
       await this.transport.sendCard(chatId, buildErrorCard(
@@ -706,6 +727,77 @@ export class Commands {
     ));
     // Give the card a moment to land, then exit; the scheduled task waits for
     // this PID to disappear before starting the new bridge.
+    setTimeout(() => process.exit(0), 1500).unref?.();
+    return true;
+  }
+
+  /**
+   * Unix restart: spawn a detached restarter that waits for this PID to die,
+   * then re-runs the exact same launcher command line (/proc/<pid>/cmdline of
+   * our parent, or our own). The restarter survives our exit (detached,
+   * stdio to the restart log) — same safety property as the Windows task.
+   */
+  async #restartUnix(chatId) {
+    const pid = process.pid;
+    const dir = this.config.dataDir;
+    const logFile = path.join(dir, 'restart.log');
+    fs.mkdirSync(dir, { recursive: true });
+
+    // Prefer our PARENT's command line (the launcher bash) when it still
+    // exists and looks like the bridge launcher; otherwise our own node dsh.
+    let argv = null;
+    try {
+      const parentCmdline = fs.readFileSync(`/proc/${process.ppid}/cmdline`, 'utf8');
+      const parentArgs = parentCmdline.split('\0').filter(Boolean);
+      if (parentArgs.some((a) => /profile[ -]feishu|dsh/.test(a)) && !parentArgs.some((a) => /hermes/.test(a))) {
+        argv = parentArgs;
+      }
+    } catch {}
+    if (!argv) {
+      argv = [process.execPath, ...process.argv.slice(1)];
+    }
+
+    const env = { ...process.env };
+    delete env.DSH_FEISHU_SCRIPT; // never replay a test script into prod
+    const envLines = Object.entries(env)
+      .filter(([k]) => /^(FEISHU_|DSH_|GLM_|DASHSCOPE_|PATH|HOME|LANG|LC_|NODE_|http_proxy|https_proxy|no_proxy)$/i.test(k))
+      .map(([k, v]) => `${JSON.stringify(k + '=' + v)}`)
+      .join(' ');
+    const argvQ = argv.map((a) => JSON.stringify(a)).join(' ');
+
+    // POSIX-sh restarter: wait for old pid → optional kill → relaunch
+    const script = [
+      '#!/bin/sh',
+      `# dsh-feishu restarter ${new Date().toISOString()} oldPid=${pid}`,
+      `echo "restart requested $(date -Is) oldPid=${pid}" >> ${JSON.stringify(logFile)}`,
+      `i=0; while [ $i -lt 30 ]; do kill -0 ${pid} 2>/dev/null || break; sleep 0.5; i=$((i+1)); done`,
+      `kill -9 ${pid} 2>/dev/null || true`,
+      'sleep 1',
+      `env ${envLines} ${argvQ} >> ${JSON.stringify(logFile)} 2>&1`,
+      `echo "restart finished $(date -Is)" >> ${JSON.stringify(logFile)}`,
+    ].join('\n');
+    const wrapper = path.join(dir, 'restart-now.sh');
+    fs.writeFileSync(wrapper, script, 'utf8');
+    fs.chmodSync(wrapper, 0o700);
+
+    const { spawn } = await import('node:child_process');
+    const child = spawn('sh', [wrapper], {
+      detached: true,
+      stdio: ['ignore', fs.openSync(logFile, 'a'), fs.openSync(logFile, 'a')],
+    });
+    child.unref();
+
+    log.warn(`/restart: unix restarter spawned (pid=${child.pid}); this process (pid=${pid}) exits now`);
+    await this.transport.sendCard(chatId, buildInfoCard(
+      '🔄 桥正在重启',
+      [
+        `旧进程 \`${pid}\` 即将退出，新进程马上由独立重启器拉起。`,
+        '',
+        '本聊天绑定保持不变；约 5–10 秒后直接发消息即可接续（需要时用 `/resume`）。',
+        `日志：\`${logFile}\``,
+      ].join('\n'),
+      { template: 'blue' },
+    ));
     setTimeout(() => process.exit(0), 1500).unref?.();
     return true;
   }

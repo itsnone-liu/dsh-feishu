@@ -52,6 +52,10 @@ fs.writeFileSync(
       approval: 'cards',
       throttleMs: 40,
       askTimeoutMs: 0,
+      autoContinueFirstMs: 300,
+      autoContinuePollMs: 600,
+      autoContinueMaxMs: 60_000,
+      mockImageGate: 'text-only',
     },
     null,
     1
@@ -122,10 +126,27 @@ const script = [
   { wait: 500 },   // bare re-read must show cordis (event-backed)
   { text: '/preset bogus' },
   { wait: 500 },
+  // quota auto-continue: turn fails with quota error → wait card → auto
+  // 「继续」 after 300ms → success card
+  { text: 'QUOTA: 假装额度耗尽' },
+  { wait: 1400 },
+  // text-only model + image → vision-tool path (attachment refs in a text
+  // note), never the model-reject card. mockImageGate=text-only in env.
+  { image: path.join(sandbox, 'red.png'), text: '这张图什么颜色' },
+  { wait: 1200 },
 ];
 const scriptFile = path.join(sandbox, 'script.json');
 fs.writeFileSync(scriptFile, JSON.stringify(script));
 const outFile = path.join(sandbox, 'out.json');
+
+// a real 1×1 PNG for the vision-tool image path (same probe as /doctor)
+fs.writeFileSync(
+  path.join(sandbox, 'red.png'),
+  Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
+    'base64',
+  ),
+);
 
 // ---------------------------------------------------------------- boot
 const run = spawnSync('node', [DSH_BIN, '--profile', 'feishu'], {
@@ -219,6 +240,15 @@ if (fs.existsSync(sessionsRoot)) {
   if (proj) persisted = fs.readdirSync(path.join(sessionsRoot, proj), { withFileTypes: true }).length;
 }
 check('sessions persisted to disk', persisted >= 2, `count=${persisted}`);
+
+// quota auto-continue: wait card → auto 继续 → recovery card; no manual input
+check('quota wait card', Boolean(anyCard('额度受限，自动等待恢复') || anyCard('⏳')));
+check('auto-continue recovered', Boolean(anyCard('已自动恢复')));
+check('auto-continue submitted 继续', Boolean(turnFinal('收到：继续')));
+
+// image via vision-tool path: attachment refs in a text note, no reject card
+check('image → vision-tool note turn', Boolean(turnFinal('[飞书图片]') && turnFinal('inspect_image')));
+check('image reject card NOT shown (vision tool handles it)', !cards.some((c) => /当前模型不支持图片输入/.test(md(c))));
 
 const failed = results.filter((r) => !r.ok);
 console.log(`\n${results.length - failed.length}/${results.length} assertions passed`);

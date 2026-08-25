@@ -259,7 +259,11 @@ export class FakeAgent {
     const firstText = firstMessage?.content?.[0]?.text ?? '';
     const reason = firstText.startsWith('ERR:')
       ? { kind: 'error', error: { code: 'MOCK_ERROR', message: 'mock 模型失败' } }
-      : { kind: 'completed' };
+      : firstText.startsWith('QUOTA:')
+        // quota-exhausted shape with NO parseable reset hint → auto-continue
+        // uses autoContinueFirstMs / autoContinuePollMs from the config
+        ? { kind: 'error', error: { code: '429', message: 'Prompts quota used up, please wait (额度已用完)' } }
+        : { kind: 'completed' };
     s.append('turn/end', { turn, reason });
   }
 

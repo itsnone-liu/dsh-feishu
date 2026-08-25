@@ -1,40 +1,52 @@
 /**
  * inspect_image — external vision tool for the Feishu bridge, modeled on the
- * approach of https://github.com/Scorp1o117/dsh-tool-vision (MIT): the main
- * model stays a text/coding model (glm-5.3), and images are farmed out to an
- * OpenAI-compatible vision endpoint (glm-4.5v on the GLM coding endpoint,
- * verified working 2026-08-23) through ONE tool call. No model switching, no
- * capability lies (declaring `input: [text, image]` on a text model makes
- * every image-bearing request fail with API code 1210), no whole-session
- * downgrade to a 64k vision model.
+ * approach of https://github.com/liustack/modlens (and Scorp1o117/dsh-tool-vision,
+ * MIT): the main model stays a text/coding model (glm-5.3), and images are
+ * farmed out to an OpenAI-compatible vision endpoint through ONE tool call.
+ * No model switching, no capability lies (declaring `input: [text, image]` on
+ * a text model makes every image-bearing request fail with API code 1210),
+ * no whole-session downgrade to a small-context vision model.
  *
- * Registered on the global tools layer, so every agent in the bridge process
- * (any preset) can call it. Configuration lives in the bridge config.json:
+ * 2026-08-26: default engine switched to Alibaba Cloud Qwen-VL via the
+ * DashScope OpenAI-compatible endpoint (verified working with qwen3-vl-plus).
+ * Configuration lives in the bridge config.json:
  *
  *   "vision": {
- *     "baseURL": "https://open.bigmodel.cn/api/coding/paas/v4",
- *     "apiKeyEnv": "GLM_API_KEY",
- *     "model": "glm-4.5v",
+ *     "baseURL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+ *     "apiKey": "sk-...",                      // inline key (file is 0600)
+ *     "apiKeyEnv": "DASHSCOPE_API_KEY",        // used when apiKey absent
+ *     "model": "qwen3-vl-plus",
  *     "maxTokens": 1024,
  *     "timeoutMs": 60000
  *   }
  *
- * Images reach the agent as attachment references (the router already
- * persists Feishu images through the attachment service), so the tool takes a
- * local file path; http(s) URLs are also accepted for pasted links.
+ * Images reach the agent as durable attachment references (the router
+ * persists Feishu images through the attachment service). Two ways to point
+ * the tool at one:
+ *   - `attachment`: the ImageAttachmentRef JSON (preferred — goes through the
+ *     attachment service's verified readImage);
+ *   - `file`: local absolute path or http(s) URL.
  */
 import fsp from 'node:fs/promises';
 import path from 'node:path';
+import { dshHome } from './config.js';
 import { log } from './log.js';
 
 const DEFAULTS = {
-  baseURL: 'https://open.bigmodel.cn/api/coding/paas/v4',
-  apiKeyEnv: 'GLM_API_KEY',
-  model: 'glm-4.5v',
+  baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+  /** Inline key wins over apiKeyEnv. NEVER logged. */
+  apiKey: '',
+  apiKeyEnv: 'DASHSCOPE_API_KEY',
+  model: 'qwen3-vl-plus',
   maxTokens: 1024,
   timeoutMs: 60000,
   maxImageBytes: 10 * 1024 * 1024,
 };
+
+/** Resolve the effective vision config (config.json `vision` over DEFAULTS). */
+export function resolveVisionConfig(visionCfg) {
+  return { ...DEFAULTS, ...(visionCfg ?? {}) };
+}
 
 const stringOutput = {
   schema: { type: 'string' },
@@ -71,10 +83,45 @@ async function localImageDataUrl(file, maxBytes) {
   return `data:${media};base64,${Buffer.from(buf).toString('base64')}`;
 }
 
+/** Content-addressed object path for a sha256 attachment id (local layout). */
+function attachmentObjectPath(attachmentId) {
+  const hex = String(attachmentId).replace(/^sha256:/, '');
+  if (!/^[a-f0-9]{64}$/.test(hex)) throw new Error(`非法附件标识：${attachmentId}`);
+  return path.join(dshHome(), 'attachments', 'v1', 'objects', hex.slice(0, 2), hex);
+}
+
+/**
+ * Resolve an attachment argument (ref JSON string / object / bare id) to a
+ * data URL. Preferred path: the attachment service's verified readImage.
+ * Fallback: direct object-path read + magic-byte sniff (bare ids carry no
+ * metadata to verify against). Exported for unit tests.
+ */
+export async function attachmentDataUrl(attachments, raw, maxBytes) {
+  let ref = raw;
+  if (typeof raw === 'string') {
+    try { ref = JSON.parse(raw); } catch { ref = { attachmentId: raw.trim() }; }
+  }
+  if (!ref || typeof ref !== 'object' || !ref.attachmentId) {
+    throw new Error('attachment 参数需要附件引用 JSON（含 attachmentId）');
+  }
+  if (attachments?.readImage && ref.mediaType && ref.bytes) {
+    try {
+      const { data } = await attachments.readImage(ref);
+      return `data:${ref.mediaType};base64,${Buffer.from(data).toString('base64')}`;
+    } catch (e) {
+      // fall through to the direct path unless it is a hard miss
+      if (String(e?.code) === 'ATTACHMENT_NOT_FOUND') throw new Error(`附件不存在：${ref.attachmentId}`);
+      log.debug(`readImage fell back to direct read: ${e.message}`);
+    }
+  }
+  const file = attachmentObjectPath(ref.attachmentId);
+  return localImageDataUrl(file, maxBytes);
+}
+
 /** One vision request against an OpenAI-compatible chat/completions endpoint. */
 export async function callVisionEndpoint(cfg, imageUrl, question, signal) {
-  const key = process.env[cfg.apiKeyEnv] ?? '';
-  if (!key) throw new Error(`环境变量 ${cfg.apiKeyEnv} 未设置，识图端点无密钥`);
+  const key = cfg.apiKey || process.env[cfg.apiKeyEnv] || '';
+  if (!key) throw new Error(`识图密钥未配置（config.json vision.apiKey 或环境变量 ${cfg.apiKeyEnv}）`);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), cfg.timeoutMs);
   const onOuterAbort = () => controller.abort();
@@ -126,45 +173,58 @@ export function installVisionTool(ctx, visionCfg) {
     log.warn('inspect_image not registered: tools service unavailable');
     return null;
   }
-  const cfg = { ...DEFAULTS, ...(visionCfg ?? {}) };
+  const cfg = resolveVisionConfig(visionCfg);
+  const attachments = ctx.get?.('attachments') ?? ctx.attachments ?? null;
 
   const def = {
     name: 'inspect_image',
     description:
-      '用外部视觉模型分析一张图片（本地文件路径或 http(s) 链接），返回文字描述或回答。' +
+      '用外部视觉模型分析一张图片，返回文字描述或回答。' +
       '当用户在飞书发送了图片、截图、照片并询问其内容时使用；不要为识图切换主模型。' +
+      '优先用 attachment 参数传入消息里的附件引用 JSON；也接受本地文件路径或 http(s) 链接（file 参数）。' +
       '若返回明确失败（鉴权/限流/超时），不要反复重试，向用户说明识图暂不可用。',
     parameters: {
       type: 'object',
       properties: {
+        attachment: {
+          type: 'string',
+          description: '附件引用的 JSON 字符串（飞书图片消息附带的 ImageAttachmentRef，含 attachmentId/mediaType/bytes/width/height 字段），原样传入',
+        },
         file: {
           type: 'string',
-          description: '图片的本地绝对路径，或 http(s) URL（飞书发来的图片会先落盘为本地文件）',
+          description: '图片的本地绝对路径，或 http(s) URL（与 attachment 二选一）',
         },
         question: {
           type: 'string',
           description: '想问视觉模型的问题（默认"详细描述图片内容"）',
         },
       },
-      required: ['file'],
       additionalProperties: false,
     },
     output: stringOutput,
     async execute(args, exec) {
+      const attachment = args.attachment ?? null;
       const file = String(args.file ?? '').trim();
       const question = String(args.question ?? '').trim();
-      if (!file) throw new Error('inspect_image: 缺少 file 参数');
-      let imageUrl = file;
-      if (!/^https?:\/\//i.test(file)) {
-        const abs = path.resolve(file);
-        imageUrl = await localImageDataUrl(abs, cfg.maxImageBytes);
+      if (!attachment && !file) throw new Error('inspect_image: 缺少 attachment 或 file 参数');
+      let imageUrl;
+      let label;
+      if (attachment) {
+        imageUrl = await attachmentDataUrl(attachments, attachment, cfg.maxImageBytes);
+        label = typeof attachment === 'string' ? attachment.slice(0, 60) : String(attachment?.attachmentId ?? 'attachment');
+      } else {
+        label = file.slice(0, 80);
+        imageUrl = /^https?:\/\//i.test(file)
+          ? file
+          : await localImageDataUrl(path.resolve(file), cfg.maxImageBytes);
       }
       const answer = await callVisionEndpoint(cfg, imageUrl, question, exec?.signal);
-      log.info(`inspect_image ok (${cfg.model}, ${file.slice(0, 80)})`);
+      log.info(`inspect_image ok (${cfg.model}, ${label})`);
       return `[inspect_image ${cfg.model}]\n${answer}`;
     },
   };
   const dispose = tools.register(def);
-  log.info(`inspect_image tool registered (vision=${cfg.model} @ ${cfg.baseURL})`);
+  const keySource = cfg.apiKey ? 'config' : (process.env[cfg.apiKeyEnv] ? cfg.apiKeyEnv : '未配置');
+  log.info(`inspect_image tool registered (vision=${cfg.model} @ ${cfg.baseURL}, key=${keySource})`);
   return typeof dispose === 'function' ? dispose : null;
 }
