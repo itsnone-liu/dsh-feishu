@@ -280,3 +280,14 @@ memory/ 目录按抽象度分五层（与"遗传/进化"直觉吻合：记忆是
 - GenericAgent / dsh-evolve / Mem0 / Letta / Zep / Cognee：子代理经 raw.githubusercontent.com + GitHub API 核实（2026-08-26 快照）
 - 交叉验证：Hermes 本地源码逐条证实子代理论断（冻结快照/超限报错/注入扫描/精确去重/§分隔）；OpenClaw↔Hermes 同源关系有本地迁移脚本实证
 - 第一轮（research-memory.md）：ai-memory / OpenViking / TencentDB-Agent-Memory；其中 OpenViking 在 Hermes provider 列表复现，互证生态位
+
+---
+
+## 附2：dsh-evolve 已安装（2026-08-26 09:20）
+
+- 版本：v0.4.2（tgz pin 安装，不追 main），feishu profile
+- 命令：`dsh plugin --profile feishu add ".../dsh-evolve-0.4.2.tgz"`
+- peer 依赖警告（react ^18.2）仅影响 web 设置界面，headless feishu 不受影响；核心 lib 无 react 加载验证通过（10 工具 + evolve-protocol systemPrompt 段）
+- 存储域：`~/.dsh/`（evolve-workspace，JSON 源 + Markdown 镜像 + node:sqlite FTS5）
+- 默认配置未改：autoConfirm=true、review 每 5 轮、Tier1 2200 字符、注入 ≤1200 字符 ×3 条、记忆预算 20000 字符
+- 首轮观察点：bridge.log 应出现 evolve 工具注册；记忆为空白出厂，需对话喂养
