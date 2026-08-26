@@ -285,6 +285,11 @@ memory/ 目录按抽象度分五层（与"遗传/进化"直觉吻合：记忆是
 
 ## 附2：dsh-evolve 已安装（2026-08-26 09:20）
 
+> **勘误（2026-08-26 11:00）**：本节所述 09:20 的安装实际**未落地**——feishu
+> profile 的 package.json/node_modules/cordis.patch.yml 均无痕迹，且 bundle 需要
+> 在 `dsh.profile.bundles` 显式登记（不会自动扫描 dependencies）。已于 2026-08-26
+> 上午真正完成安装与验证，详见 `INCIDENT-2026-08-26.md` 附录。
+
 - 版本：v0.4.2（tgz pin 安装，不追 main），feishu profile
 - 命令：`dsh plugin --profile feishu add ".../dsh-evolve-0.4.2.tgz"`
 - peer 依赖警告（react ^18.2）仅影响 web 设置界面，headless feishu 不受影响；核心 lib 无 react 加载验证通过（10 工具 + evolve-protocol systemPrompt 段）

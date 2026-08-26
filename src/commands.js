@@ -689,17 +689,35 @@ export class Commands {
     const wrapper = path.join(dir, 'restart-now.ps1');
     const logFile = path.join(dir, 'restart.log');
     const stamp = new Date().toISOString();
-    // Self-contained restarter: wait for the old PID to exit, force-kill it if
-    // stuck, then launch the new bridge. Everything is logged for auditing.
+    // The bridge must NOT be relaunched from inside this task's job object:
+    // when the task's powershell exits, Task Scheduler closes the job and kills
+    // every process in it — the relaunched bridge died silently this way on
+    // 2026-08-26 10:08 (pid 14524 created, then terminated with zero output;
+    // 14 min outage until a manual restart). The bridge now runs as the ROOT
+    // process of its own no-time-limit task `dsh-feishu-bridge`
+    // (powershell -File run_bridge.ps1, foreground node, next to the launcher);
+    // this restarter only waits for the old PID, sweeps leftovers, re-registers
+    // that task (idempotent) and /Run's it.
+    const bridgeTask = 'dsh-feishu-bridge';
+    const runBridge = path.join(path.dirname(launcher), 'run_bridge.ps1');
+    const q = (s) => `'${String(s).replace(/'/g, "''")}'`;
     const script = [
       `$ErrorActionPreference = 'Continue'`,
-      `"restart requested ${stamp} oldPid=$pid launcher='$launcher'" | Add-Content -Path '${logFile.replace(/'/g, "''")}' -Encoding UTF8`,
+      `"restart requested ${stamp} oldPid=$pid launcher='${launcher}'" | Add-Content -Path ${q(logFile)} -Encoding UTF8`,
       `$deadline = (Get-Date).AddSeconds(15)`,
       `while ((Get-Date) -lt $deadline) { $p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if (-not $p) { break }; Start-Sleep -Milliseconds 500 }`,
       `$p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if ($p) { try { Stop-Process -Id ${pid} -Force } catch {} }`,
+      `Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object { $_.CommandLine -match 'profile feishu' } | ForEach-Object { "stopping leftover bridge pid=$($_.ProcessId)" | Add-Content -Path ${q(logFile)} -Encoding UTF8; Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`,
+      `Get-CimInstance Win32_Process -Filter "Name='wscript.exe'" | Where-Object { $_.CommandLine -match 'profile feishu' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`,
       `Start-Sleep 1`,
-      `& '${launcher.replace(/'/g, "''")}' *>&1 | Add-Content -Path '${logFile.replace(/'/g, "''")}' -Encoding UTF8`,
-      `"restart finished $(Get-Date -Format o)" | Add-Content -Path '${logFile.replace(/'/g, "''")}' -Encoding UTF8`,
+      `if (Test-Path ${q(runBridge)}) {`,
+      `  Register-ScheduledTask -TaskName ${q(bridgeTask)} -Action (New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -File "' + ${q(runBridge)} + '"') -WorkingDirectory ${q(path.dirname(runBridge))}) -Settings (New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable) -Force | Out-Null`,
+      `  schtasks /Run /TN ${q(bridgeTask)} | Add-Content -Path ${q(logFile)} -Encoding UTF8`,
+      `} else {`,
+      `  "WARNING: ${runBridge} not found; falling back to direct in-job launch (job-kill risk, see 2026-08-26 incident)" | Add-Content -Path ${q(logFile)} -Encoding UTF8`,
+      `  & ${q(launcher)} *>&1 | Add-Content -Path ${q(logFile)} -Encoding UTF8`,
+      `}`,
+      `"restart finished $(Get-Date -Format o)" | Add-Content -Path ${q(logFile)} -Encoding UTF8`,
     ].join('\n');
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(wrapper, script, 'utf8');
@@ -726,7 +744,7 @@ export class Commands {
     log.warn(`/restart: scheduled task ${tn} running; this process (pid=${pid}) exits now`);
     await this.transport.sendCard(chatId, buildInfoCard(
       '🔄 桥正在重启',
-      `旧进程 \`${pid}\` 即将退出，新进程马上拉起（由计划任务在进程外执行）。\n\n本聊天绑定保持不变；约 5–10 秒后直接发消息即可接续（需要时用 \`/resume\`）。日志：\`${logFile}\``,
+      `旧进程 \`${pid}\` 即将退出，新进程由专用桥任务 \`${bridgeTask}\` 拉起（自有作业、无时限，不受重启任务生命周期影响）。\n\n本聊天绑定保持不变；约 5–10 秒后直接发消息即可接续（需要时用 \`/resume\`）。日志：\`${logFile}\``,
       { template: 'blue' },
     ));
     // Give the card a moment to land, then exit; the scheduled task waits for

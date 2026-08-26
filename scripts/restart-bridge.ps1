@@ -1,13 +1,26 @@
-# restart-bridge.ps1 — 手动安全重启 dsh-feishu 桥（在桥进程之外运行！）
+# restart-bridge.ps1 - manual safe restart of the dsh-feishu bridge (run OUTSIDE the bridge process!)
 #
-# 用法（系统终端）：
+# Usage (system terminal):
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\restart-bridge.ps1 [-Launcher <path>]
 #
-# 行为：等待旧的 `--profile feishu` node 进程退出（最多 15s，卡住则强杀），
-#       然后调用启动脚本拉起新进程。全过程写 restart 日志。
-# 注意：绝不要在桥进程内部（比如让 agent 跑这条命令）重启桥 ——
-#       2026-08-23 14:43 事故正是 agent Stop-Process 自己的宿主进程，
-#       后续启动命令随宿主一起死亡，桥停机 56 分钟。进程内请用飞书 /restart。
+# Behavior: waits for the old `--profile feishu` node process to exit (max 15s,
+# force-kills it if stuck), then starts the new bridge. Everything is logged.
+#
+# NEVER run this from inside the bridge process (e.g. have the agent run it):
+# the 2026-08-23 14:43 incident was exactly an agent Stop-Process'ing its own
+# host - the follow-up start died with the host and the bridge was down 56
+# minutes. In-process, use the feishu /restart command instead.
+#
+# 2026-08-26: the final launch no longer spawns the bridge from THIS process
+# tree. If this script happens to run inside a scheduled-task job, Task
+# Scheduler kills every process in the job when the task's root powershell
+# exits (10:08 incident: new bridge pid=14524 killed silently, 14 min outage).
+# We now start the dedicated bridge task `dsh-feishu-bridge` (the bridge is
+# its root process, no time limit) and only fall back to a direct launch when
+# run_bridge.ps1 is missing.
+#
+# NOTE: keep this file ASCII-only (Windows PowerShell 5.1 + BOM-less file =
+# system-codepage reads; non-ASCII comments get mangled, see .nobom.bak saga).
 param(
   [string]$Launcher = 'D:\dsh-install\start_bridge.ps1'
 )
@@ -23,6 +36,13 @@ foreach ($v in $victims) {
   Stop-Process -Id $v.ProcessId -Force -ErrorAction SilentlyContinue
 }
 Start-Sleep 2
-& $Launcher *>&1 | Add-Content -Path $log -Encoding UTF8
+$runBridge = Join-Path (Split-Path -Parent $Launcher) 'run_bridge.ps1'
+if (Test-Path $runBridge) {
+  Register-ScheduledTask -TaskName 'dsh-feishu-bridge' -Action (New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -File "' + $runBridge + '"') -WorkingDirectory (Split-Path -Parent $runBridge)) -Settings (New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable) -Force | Out-Null
+  schtasks /Run /TN dsh-feishu-bridge | Add-Content -Path $log -Encoding UTF8
+} else {
+  "WARNING: $runBridge not found; falling back to direct launch (job-kill risk if run inside a scheduled task)" | Add-Content -Path $log -Encoding UTF8
+  & $Launcher *>&1 | Add-Content -Path $log -Encoding UTF8
+}
 "manual restart finished $(Get-Date -Format o)" | Add-Content -Path $log -Encoding UTF8
 Get-Content $log -Tail 5
