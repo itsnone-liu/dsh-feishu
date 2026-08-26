@@ -194,7 +194,15 @@ export class SessionDriver {
     const llm = this.ctx.get('llm');
     if (!llm) return null;
     try {
-      const info = await llm.resolveModelInfo(sel.provider, sel.model);
+      // BOUNDED: this runs INSIDE the per-chat serial queue in the router —
+      // an unbounded await here (resolveModelInfo hitting a credential-less
+      // or unreachable route) deadlocks the queue, and every later message
+      // in that chat — commands included — then queues up silently with zero
+      // log output. Fail open on timeout (2026-08-26 /sessions incident).
+      const info = await Promise.race([
+        llm.resolveModelInfo(sel.provider, sel.model),
+        new Promise((resolve) => setTimeout(() => resolve(null), 2500)),
+      ]);
       if (!info || info.inputModalities === undefined) return null;
       return info.inputModalities.includes('image');
     } catch {

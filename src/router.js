@@ -37,6 +37,7 @@ export class ChatRouter {
 
   /** Transport entry point. Never throws. */
   onMessage(msg) {
+    log.debug(`msg in chat=${msg.chatId ?? '?'} ${msg.images?.length ? 'image' : msg.files?.length ? 'file' : 'text'} from=${(msg.openId ?? '?').slice(0, 10)} text="${(msg.text ?? '').slice(0, 40).replace(/\n/g, '⏎')}"`);
     this.#enqueue(msg.chatId, async () => {
       try {
         await this.#handle(msg);
@@ -109,6 +110,8 @@ export class ChatRouter {
 
   async #handle(msg) {
     const { chatId, openId, messageId, text } = msg;
+    // normalize: full-width slash (mobile IME) + stray whitespace
+    const norm = typeof text === 'string' ? text.replace(/^\s*／/, '/').trim() : text;
 
     // dedup (Feishu may redeliver)
     if (messageId) {
@@ -144,7 +147,7 @@ export class ChatRouter {
 
     // pending ask in this chat? plain NON-EMPTY text answers it (image
     // messages carry an empty caption and must not settle an ask silently)
-    if (text && this.interactions.handleAskText(chatId, text)) {
+    if (norm && this.interactions.handleAskText(chatId, norm)) {
       log.info(`chat ${chatId}: text answered pending ask`);
       return;
     }
@@ -152,15 +155,15 @@ export class ChatRouter {
     // plain text while an image burst is pending = its caption → flush now.
     // Commands (start with '/') run normally; the burst keeps waiting.
     const burst = this.batches.get(chatId);
-    if (burst && text && !text.startsWith('/')) {
-      burst.text = burst.text ? `${burst.text}\n${text}` : text;
+    if (burst && norm && !norm.startsWith('/')) {
+      burst.text = burst.text ? `${burst.text}\n${norm}` : norm;
       log.info(`chat ${chatId}: text flushed pending image burst (${burst.images.length} img)`);
       this.#flushImages(chatId);
       return;
     }
 
     // commands
-    if (await this.commands.handle(chatId, text)) return;
+    if (await this.commands.handle(chatId, norm)) return;
 
     // image traffic → (optional burst window) → sniff → gate → durable commit → image blocks
     if (msg.images?.length) {
@@ -184,9 +187,9 @@ export class ChatRouter {
 
     // normal text traffic → agent
     const agent = await this.#agentFor(chatId);
-    const mode = this.driver.submit(agent, text);
+    const mode = this.driver.submit(agent, norm);
     if (mode === 'steer') {
-      this.renderer.setSteerNote(agent.id, text);
+      this.renderer.setSteerNote(agent.id, norm);
       log.info(`chat ${chatId}: steered running agent`);
     }
   }

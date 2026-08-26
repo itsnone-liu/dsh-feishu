@@ -55,7 +55,12 @@ export class SdkTransport {
         // group gate (p2p always passes)
         if (chatType !== 'p2p') {
           const adm = groupAdmission(this.config, chatType, type, message.mentions ?? [], await this.#ensureBotOpenId());
-          if (!adm.ok) return;
+          if (!adm.ok) {
+            // never silent: a dropped message with zero log lines is
+            // indistinguishable from a dead bridge (2026-08-26 incident)
+            log.info(`group message dropped (chat=${message.chat_id?.slice(0, 12)}… reason=${adm.reason ?? 'group policy'})`);
+            return;
+          }
         }
         let text = '';
         let images = [];

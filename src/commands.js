@@ -69,8 +69,11 @@ export class Commands {
   /** Returns true when the text was a command (and has been answered). */
   async handle(chatId, text) {
     if (!text.startsWith('/')) return false;
-    const [cmd, ...rest] = text.slice(1).trim().split(/\s+/);
+    const [rawCmd, ...rest] = text.slice(1).trim().split(/\s+/);
     const arg = rest.join(' ');
+    // singular/plural + lowercase normalization so /session, /Models … all work
+    const cmd = rawCmd.toLowerCase();
+    log.debug(`command /${cmd} in chat ${chatId}`);
     try {
       switch (cmd) {
         case 'help':
@@ -93,6 +96,7 @@ export class Commands {
         case 'presets':
           return await this.cmdPreset(chatId, arg);
         case 'sessions':
+        case 'session':
         case 'ls':
           return await this.cmdSessions(chatId);
         case 'resume':

@@ -36,13 +36,13 @@ export function newSessionId() {
 export function groupAdmission(config, chatType, messageType, mentions = [], botOpenId = null) {
   if (chatType === 'p2p') return { ok: true };
   const mode = config.groups ?? 'off';
-  if (mode === 'off') return { ok: false };
+  if (mode === 'off') return { ok: false, reason: 'groups=off（仅私聊响应，config.json 可设 groups）' };
   if (mode === 'all') return { ok: true };
   // 'mention'
-  if (messageType !== 'text') return { ok: false };
-  if (!botOpenId) return { ok: false };
+  if (messageType !== 'text') return { ok: false, reason: 'groups=mention 只响应文本，非文本消息被丢弃' };
+  if (!botOpenId) return { ok: false, reason: 'bot open_id 未解析，群聊 @ 门控失效关闭' };
   const hit = (mentions ?? []).find((m) => m?.id?.open_id === botOpenId || m?.open_id === botOpenId);
-  return hit ? { ok: true, botMentionKey: hit.key } : { ok: false };
+  return hit ? { ok: true, botMentionKey: hit.key } : { ok: false, reason: 'groups=mention 需 @机器人，本消息未提及' };
 }
 
 /** Random interaction id (ask / approval cards). */
