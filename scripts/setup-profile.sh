@@ -6,6 +6,14 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# MSYS/Git-Bash: pwd yields /d/... which Windows node cannot resolve.
+# Use the drive-letter form (D:/...) and mount the plugin as a file:// URL,
+# matching the known-good production cordis.patch.yml on Windows.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    command -v cygpath >/dev/null 2>&1 && REPO="$(cygpath -m "$REPO")"
+    ;;
+esac
 HOME_DIR="${DSH_HOME:-$HOME/.dsh}"
 PROFILES="$HOME_DIR/profiles"
 PROFILE="$PROFILES/feishu"
@@ -40,13 +48,18 @@ cp "$REPO/profile/feishu/package.json" "$PROFILE/package.json"
 cp "$REPO/profile/feishu/cordis.yml" "$PROFILE/cordis.yml"
 cp "$REPO/profile/feishu/pnpm-workspace.yaml" "$PROFILE/pnpm-workspace.yaml"
 # user patch: relative plugin row is repo-path specific — regenerate it here
-ESCAPED_REPO="${REPO// /\\ }"
+# Drive-letter paths (Windows) must go through ESM import() as file:// URLs.
+case "$REPO" in
+  [A-Za-z]:/*) MOUNT="file:///$REPO/src/index.js" ;;
+  *)           MOUNT="$REPO/src/index.js" ;;
+esac
+ESCAPED_MOUNT="${MOUNT// /\\ }"
 cat > "$PROFILE/cordis.patch.yml" << EOP
 # Installed by dsh-feishu setup — bridge plugin mounted by relative path.
 # Replace with 'dsh-feishu' if you install the bundle as a real package.
 - insert:
     - id: feishu-bridge
-      name: $ESCAPED_REPO/src/index.js
+      name: $ESCAPED_MOUNT
       config:
         configFile: ''
 

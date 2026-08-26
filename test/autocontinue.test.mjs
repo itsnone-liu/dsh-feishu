@@ -48,6 +48,54 @@ await ok('classifyFailure: extra patterns honored', () => {
   assert.equal(classifyFailure('MYPLAN.EXPIRED today', ['myplan\\.expired']), 'long');
 });
 
+// ------- 2026-08-26 incident: GLM Coding Plan 5h window (HTTP 429, code 1308)
+// The body contains neither 额度 nor quota — it used to fall into the
+// transient bucket and hammer 30/60/120/240s retries with empty cards.
+const GLM_1308 = (resetIso) =>
+  `RATE_LIMIT: 429: {"code":"1308","message":"已达到 5 小时的使用上限。您的限额将在 ${resetIso} 重置。"}`;
+
+function fmtLocal(d) {
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+await ok('classifyFailure: GLM 1308 5h window → long (not transient)', () => {
+  assert.equal(classifyFailure(GLM_1308('2026-08-26 20:36:10')), 'long');
+  assert.equal(classifyFailure('429: {"code":"1308","message":"usage limit"}'), 'long');
+  // plain 429 without window wording stays transient
+  assert.equal(classifyFailure('429: too many requests'), 'short');
+});
+
+await ok('GLM 1308: schedule at the promised reset time, not 30s backoff', () => {
+  const { ac, cards, submitted, turnEnd } = harness({ autoContinueMaxMs: 10 * 60_000 });
+  const resetAt = new Date(Date.now() + 2 * 60_000); // 2 min out
+  turnEnd({ kind: 'error', error: { code: 'RATE_LIMIT', message: GLM_1308(fmtLocal(resetAt)) } });
+  const w = ac.watchers.get('session-test');
+  assert.ok(w, 'watcher armed');
+  assert.equal(w.kind, 'long');
+  // fires at resetAt + 30s grace (± a little scheduling slack), NOT within 10s
+  const inS = (w.nextAt.getTime() - Date.now()) / 1000;
+  assert.ok(inS > 60, `schedules ≥60s out (got ${inS.toFixed(0)}s)`);
+  assert.equal(submitted.length, 0, 'nothing fired immediately');
+  assert.match(cards[0].header.title.content, /自动等待/);
+  assert.match(JSON.stringify(cards[0]), /重置/, 'card mentions the reset plan');
+  ac.dispose();
+});
+
+await ok('GLM 1308 with a STALE reset time falls back to probing, not hammering', async () => {
+  const { ac, submitted, turnEnd } = harness();
+  const past = new Date(Date.now() - 30 * 60_000); // reset time already gone
+  turnEnd({ kind: 'error', error: { code: 'RATE_LIMIT', message: GLM_1308(fmtLocal(past)) } });
+  const w = ac.watchers.get('session-test');
+  assert.ok(w, 'watcher armed');
+  const inS = (w.nextAt.getTime() - Date.now()) / 1000;
+  // first probe at firstMs=150ms (no valid hint) — the 5s-floor hammer is gone
+  assert.ok(inS < 10, `stale hint must not hammer (fires in ${inS.toFixed(1)}s)`);
+  await sleep(400);
+  assert.equal(submitted.length, 1, 'one probe fired');
+  ac.dispose();
+});
+
 // ------------------------------------------------------------- 2 提示解析
 await ok('parseRetryHint: retry after duration', () => {
   assert.deepEqual(parseRetryHint('please try again in 30s'), { inMs: 30_000 });

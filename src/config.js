@@ -20,8 +20,8 @@ export function dshHome() {
 const DEFAULTS = {
   /** Feishu open-platform base URL (Lark uses https://open.larksuite.com). */
   apiBase: 'https://open.feishu.cn',
-  /** WS long-connection endpoint discovery path. */
-  endpointPath: '/open-apis/endpoint/v1',
+  /** WS long-connection endpoint discovery path (POST with AppID/AppSecret, per lark_oapi). */
+  endpointPath: '/callback/ws/endpoint',
   /** Transport: 'auto' | 'sdk' | 'vendored' | 'mock'. */
   transport: 'auto',
   /** Directory for bindings.json and runtime state. Default $DSH_HOME/feishu. */
@@ -55,6 +55,10 @@ const DEFAULTS = {
   cardTextLimit: 6000,
   /** Base delay (ms) for card-patch failure backoff; retries double up to 15×. */
   cardRetryBaseMs: 1000,
+  /** Feishu HTTP request timeout (ms) for the official-SDK axios client.
+   *  0 disables (NOT recommended — a zombie keep-alive socket then hangs the
+   *  card renderer forever; see 2026-08-26 empty-card lesson). */
+  httpTimeoutMs: 15_000,
   /** ask_user_question timeout (ms); 0 = wait forever. */
   askTimeoutMs: 0,
   /** TEST ONLY: drive a scripted fake agent instead of a real model loop. */

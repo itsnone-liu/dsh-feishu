@@ -177,10 +177,15 @@ export class LarkTransport {
   async #connectLoop() {
     let backoff = 1000;
     while (!this.closed) {
+      const startedAt = Date.now();
       try {
         await this.#connectOnce();
-        backoff = 1000; // reset only after a clean session ends
+        // Resolved = the live session genuinely ended. Reconnect right away,
+        // but only reset the backoff when the session lived a while (a
+        // flapping socket must not reset its own escape valve).
+        if (Date.now() - startedAt > 60_000) backoff = 1000;
       } catch (e) {
+        if (this.closed) return;
         log.warn(`ws: ${e.message}; reconnect in ${backoff}ms`);
         await sleep(backoff);
         backoff = Math.min(backoff * 2, 30_000);
@@ -189,27 +194,48 @@ export class LarkTransport {
   }
 
   async #endpoints() {
-    const res = await this.#rawRequest('GET', this.config.endpointPath, undefined, {
-      query: `?app_id=${encodeURIComponent(this.config.appId)}`,
+    // Feishu long-connection endpoint discovery (matching lark_oapi ws.Client):
+    //   POST {apiBase}/callback/ws/endpoint
+    //   body { AppID, AppSecret }   →   { code:0, data:{ URL:"wss://..." } }
+    // The old GET /open-apis/endpoint/v1 path returns 404 (no longer valid).
+    const res = await fetch(`${this.config.apiBase}${this.config.endpointPath}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      body: JSON.stringify({
+        AppID: this.config.appId,
+        AppSecret: this.config.appSecret,
+      }),
     });
-    const list = res?.data?.endpoints;
-    if (!Array.isArray(list) || list.length === 0) {
-      throw new Error(`no endpoints: ${JSON.stringify(res).slice(0, 120)}`);
-    }
-    return list;
+    if (!res.ok) throw new Error(`feishu http ${res.status} ${this.config.endpointPath}`);
+    const body = await res.json();
+    if (body.code !== 0) throw new Error(`feishu endpoint discovery error code=${body.code} msg=${body.msg}`);
+    const url = body?.data?.URL;
+    if (!url) throw new Error(`no ws endpoint: ${JSON.stringify(body).slice(0, 120)}`);
+    // DSL-style: #connectOnce picks a random element, so return the single URL as an array.
+    return [url];
   }
 
   async #connectOnce() {
     const endpoints = await this.#endpoints();
     const url = endpoints[Math.floor(Math.random() * endpoints.length)];
-    await new Promise((resolve, reject) => {
-      const ws = new WebSocket(url);
-      this.ws = ws;
-      let registered = false;
 
-      const fail = (e) => {
-        if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
-        reject(e);
+    // Phase 1: connect + register (bounded by a 15s timeout).
+    const ws = new WebSocket(url);
+    this.ws = ws;
+    let registered = false;
+    let serverDisconnect = false;
+    let registerTimer = null;
+
+    await new Promise((resolve, reject) => {
+      registerTimer = setTimeout(() => {
+        try { ws.close(); } catch {}
+        reject(new Error('register timeout'));
+      }, 15_000);
+
+      const failEarly = (what) => {
+        if (registered) return;
+        clearTimeout(registerTimer);
+        reject(new Error(what));
       };
 
       ws.addEventListener('open', () => {
@@ -229,6 +255,7 @@ export class LarkTransport {
         }
         if (frame.type === 'register') {
           registered = true;
+          clearTimeout(registerTimer);
           log.info('ws: registered');
           this.#startHeartbeat(ws);
           resolve();
@@ -240,25 +267,35 @@ export class LarkTransport {
           return;
         }
         if (frame.type === 'disconnect') {
+          // Server-side rebalance: it wants us on a different endpoint.
           log.warn('ws: server asked to reconnect');
-          fail(new Error('server disconnect'));
+          serverDisconnect = true;
+          try { ws.close(); } catch {}
           return;
         }
         log.debug(`ws: frame ${frame.type}`);
       });
 
-      ws.addEventListener('error', () => fail(new Error('websocket error')));
-      ws.addEventListener('close', () => {
-        if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
-        if (!registered) fail(new Error('closed before register'));
-        else reject(new Error('session closed'));
-      });
-
-      // register timeout
-      setTimeout(() => {
-        if (!registered) fail(new Error('register timeout'));
-      }, 15_000);
+      ws.addEventListener('error', () => failEarly('websocket error'));
+      ws.addEventListener('close', () => failEarly('closed before register'));
     });
+
+    // Phase 2: HOLD this connection until it actually ends. The old code
+    // resolved after register and the reconnect loop immediately opened a
+    // SECOND connection while the first kept heartbeating server-side —
+    // "ws: registered" storms until Feishu's connection limit (1000040350)
+    // rejected even endpoint discovery (2026-08-26). A connection must be
+    // either the only live one or explicitly closed.
+    await new Promise((resolve) => {
+      const done = () => { if (resolved) return; resolved = true; resolve(); };
+      let resolved = false;
+      ws.addEventListener('close', () => done());
+      ws.addEventListener('error', () => done()); // error is always followed by close
+    });
+    if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
+    if (serverDisconnect) log.warn('ws: session ended (server rebalance)');
+    // Resolve (not throw): the loop reconnects immediately — one connection
+    // at a time, the previous one is closed before the next dials.
   }
 
   #startHeartbeat(ws) {

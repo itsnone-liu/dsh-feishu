@@ -206,6 +206,19 @@ export class ChatRouter {
     const agent = await this.driver.ensure(binding);
     this.store.update(chatId, { sessionId: binding.sessionId, cwd: binding.cwd });
     if (this.renderer.chatOf(agent.id) !== chatId) this.renderer.attach(agent.id, chatId);
+    // A bound session that failed to resume was replaced by a NEW session —
+    // never let that happen silently (2026-08-26 context-loss incident).
+    for (const notice of this.driver.drainResumeFallbacks()) {
+      await this.transport.sendCard(chatId, buildInfoCard(
+        '⚠️ 旧会话无法恢复，已自动开启新会话',
+        [
+          `原会话 \`${String(notice.from ?? '').slice(0, 24)}\` 恢复失败：${String(notice.reason ?? '未知原因').slice(0, 160)}`,
+          '',
+          '本聊天已绑定**新会话**（上下文从零开始）。旧会话文件仍在磁盘上，可用 `/sessions` 查看后 `/resume <id前缀>` 手动接续。',
+        ].join('\n'),
+        { template: 'orange' },
+      )).catch(() => {});
+    }
     return agent;
   }
 

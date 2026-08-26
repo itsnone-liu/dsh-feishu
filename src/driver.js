@@ -23,6 +23,20 @@ export class SessionDriver {
     this.live = new Map();
     /** sessionId → mutable selection object wired through installModelSelection */
     this.selections = new Map();
+    /**
+     * Un-drained "resume failed → started a NEW session" notices. 2026-08-26
+     * incident: a session dir deleted externally made the chat silently fall
+     * back to a fresh session — zero feedback, context "lost". The router
+     * drains these into an info card.
+     */
+    this.resumeFallbacks = [];
+  }
+
+  /** Take and clear pending resume-fallback notices (router → info card). */
+  drainResumeFallbacks() {
+    const out = this.resumeFallbacks;
+    this.resumeFallbacks = [];
+    return out;
   }
 
   /** The model a persisted session last ran with (request/context fold), for resume. */
@@ -74,7 +88,9 @@ export class SessionDriver {
           e.occupied = true;
           throw e;
         }
-        // fall through: start a fresh session, keep the stale one on disk
+        // fall through: start a fresh session, keep the stale one on disk —
+        // but TELL the user (context was once silently lost, 2026-08-26).
+        this.resumeFallbacks.push({ from: binding.sessionId, reason: e.message });
       }
     }
     if (!allowCreate) throw new Error('no session bound');

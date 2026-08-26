@@ -29,6 +29,14 @@ const LONG_PATTERNS = [
   /exhausted/i,
   /用完|耗尽|用尽/,
   /insufficient\s+\w*balance/i,
+  // GLM Coding Plan 5h 窗口：HTTP 429 body {"code":"1308","message":"已达到 5 小时的使用上限。您的限额将在 … 重置。"}
+  // 2026-08-26 事故：该文案不含「额度/配额/quota」却被 \b429\b 抢先判成瞬时限流，
+  // 30/60/120/240s 连发 4 轮空卡。窗口类错误必须先于 429 判定。
+  /\b1308\b/,
+  /使用上限/,
+  /已达.{0,12}上限/,
+  /使用窗口/,
+  /限额.{0,12}重置/,
 ];
 
 /** 瞬时限流类错误（短退避重试）。 */
@@ -179,15 +187,18 @@ export class AutoContinue {
     } else if (hint?.inMs !== undefined) {
       delayMs = Math.max(5_000, Math.min(hint.inMs + 5_000, cfg.autoContinueMaxMs ?? 6 * 3_600_000));
       note = `服务端提示等待 ${Math.round(hint.inMs / 1000)}s，到点自动继续`;
-    } else if (hint?.at) {
-      delayMs = Math.max(5_000, hint.at.getTime() - Date.now() + 30_000);
+    } else if (hint?.at && hint.at.getTime() > Date.now() + 60_000) {
+      // 只信「还来得及」的重置时刻。窗口已过/1 分钟内的 stale 提示按无提示处理
+      // （否则 hint.at 在过去 → delay 被钳到 5s → 每隔几秒补发一轮，2026-08-26 教训）。
+      const cap = cfg.autoContinueMaxMs ?? 6 * 3_600_000;
+      delayMs = Math.min(hint.at.getTime() - Date.now() + 30_000, cap);
       note = `按提示的窗口重置时间 ${hint.at.toLocaleString('zh-CN', { hour12: false })} 自动继续`;
     } else {
       const first = !prev;
       delayMs = first
         ? (cfg.autoContinueFirstMs ?? 60_000)
         : (cfg.autoContinuePollMs ?? 10 * 60_000);
-      note = `未给出重置时间，每 ${Math.round(delayMs / 60_000)} 分钟探测一次`;
+      note = `未给出（有效的）重置时间，每 ${Math.round(delayMs / 60_000)} 分钟探测一次`;
     }
 
     const nextAt = new Date(Date.now() + delayMs);

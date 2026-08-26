@@ -21,7 +21,22 @@ const PHASE_BY_TURN_END = {
   error: 'error',
   cancelled: 'stopped',
   stopped: 'stopped',
+  aborted: 'stopped',
 };
+
+/**
+ * Quota/window errors (GLM 1308 …) get a friendly line instead of the raw
+ * JSON dump — the auto-continue module schedules the recovery and explains
+ * the plan in its own card, so the turn card only needs the essence.
+ */
+function friendlyTurnError(message) {
+  const text = String(message ?? '');
+  if (/\b1308\b|使用上限|额度|配额|quota|exhausted/i.test(text)) {
+    const hm = /(\d{1,2}:\d{2})/.exec(text);
+    return `⏳ 额度窗口用尽${hm ? `（提示重置于 ${hm[1]}）` : ''}，桥会按计划自动继续；期间你发消息即可接管。`;
+  }
+  return `⚠️ ${text}`;
+}
 
 export class TurnRenderer {
   constructor({ transport, config, store }) {
@@ -101,6 +116,15 @@ export class TurnRenderer {
       case 'assistant/message':
         this.#onAssistantMessage(st, d);
         return;
+      case 'llm/retry':
+        // 上游限流/网络抖动时 dsh 会静默重试 5 次（每次约 20s），期间没有任何
+        // assistant 输出 —— 卡片会空着「工作中」两三分钟（2026-08-26 空卡事故）。
+        // 把重试进度显式画进卡片，用户就知道桥没死。
+        if (d?.retry && d.retry <= (d.maxRetries ?? 5)) {
+          st.retryNote = `⏳ 模型请求自动重试 ${d.retry}/${d.maxRetries ?? '?'}（${d.provider ?? 'model'}，${Math.round((d.delayMs ?? 0) / 1000)}s 后）`;
+          this.#schedule(st, null, true);
+        }
+        return;
       case 'tool/call':
         this.#onToolCall(st, d);
         return;
@@ -120,6 +144,7 @@ export class TurnRenderer {
     st.turnNo = turnNo;
     st.blocks = [];
     st.steerNote = '';
+    st.retryNote = '';
     st.outputNote = '';
     st.outputDumped = false;
     st.usage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 };
@@ -184,6 +209,7 @@ export class TurnRenderer {
       }
     }
     st.blocks = blocks;
+    st.retryNote = ''; // the request went through — retry status is stale
     const u = d.usage ?? {};
     st.usage.inputTokens += u.inputTokens ?? 0;
     st.usage.outputTokens += u.outputTokens ?? 0;
@@ -221,8 +247,11 @@ export class TurnRenderer {
   #endTurn(st, d) {
     st.endedAt = Date.now();
     st.phase = PHASE_BY_TURN_END[d.reason?.kind] ?? 'done';
+    st.retryNote = '';
     if (st.phase === 'error' && d.reason?.error?.message) {
-      st.blocks.push({ kind: 'text', text: `⚠️ ${d.reason.error.code ?? 'ERROR'}: ${d.reason.error.message}` });
+      st.blocks.push({ kind: 'text', text: friendlyTurnError(
+        `${d.reason.error.code ?? 'ERROR'}: ${d.reason.error.message}`,
+      ) });
     }
     this.#schedule(st, null, true, true);
   }
@@ -260,7 +289,21 @@ export class TurnRenderer {
   }
 
   async #flush(st) {
-    if (!st.dirty || st.sending) return;
+    if (!st.dirty) return;
+    if (st.sending) {
+      // A previous flush is mid-flight (throttle vs turn/end racing). Just
+      // returning here would DROP this update — including final turn/end
+      // renders, which froze cards at "工作中" forever (2026-08-26). Re-arm a
+      // short retry instead: it fires after the in-flight patch lands.
+      if (!st.retryTimer) {
+        st.retryTimer = setTimeout(() => {
+          st.retryTimer = null;
+          this.#flush(st).catch(() => {});
+        }, 150);
+        st.retryTimer.unref?.();
+      }
+      return;
+    }
     st.sending = true;
     st.dirty = false;
     try {

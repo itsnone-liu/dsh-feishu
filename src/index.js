@@ -123,10 +123,20 @@ function apply(ctx, config) {
       });
 
       // ---- inbound transport ----
-      await transport.start({
-        onMessage: (msg) => router.onMessage(msg),
-        onCardAction: (action) => router.onCardAction(action),
-      });
+      try {
+        await transport.start({
+          onMessage: (msg) => router.onMessage(msg),
+          onCardAction: (action) => router.onCardAction(action),
+        });
+      } catch (e) {
+        // A bridge that cannot reach Feishu is useless but would otherwise
+        // keep running as a zombie (2026-08-26 03:00: boot failed, process
+        // lived on reconnecting to a 404 endpoint for an hour). Exit with a
+        // failure code so the host (task scheduler / Hermes) can restart us.
+        log.error(`transport start failed: ${e.stack ?? e}`);
+        setTimeout(() => process.exit(1), 300).unref?.();
+        throw e;
+      }
       log.info(`bridge up (pid=${process.pid})`);
 
       const cleanup = () => {
@@ -139,7 +149,11 @@ function apply(ctx, config) {
       else ctx.on('dispose', cleanup);
     })
     .catch((e) => {
+      // Boot failure: log durably, then DIE with a non-zero exit code. The
+      // old "log and throw" left a zombie process (ws reconnect loops with
+      // no working transport) that nothing ever restarted.
       log.error(`bridge failed to start: ${e.stack ?? e}`);
+      setTimeout(() => process.exit(1), 300).unref?.();
       throw e;
     });
 }

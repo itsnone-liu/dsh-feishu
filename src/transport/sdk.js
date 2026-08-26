@@ -20,8 +20,28 @@ export class SdkTransport {
       appType: sdk.AppType.SelfBuild,
       domain: config.apiBase,
     });
+    this.#installRequestTimeout();
     /** Cached bot open_id (null while unresolved). */
     this.botOpenId = undefined;
+  }
+
+  /**
+   * The SDK's shared axios instance has NO request timeout: after a network
+   * blip a keep-alive zombie socket can hang sendCard/updateCard forever —
+   * the renderer's st.sending latch then freezes the turn card mid-render
+   * (2026-08-26 empty-card lesson). Wrap httpInstance.request so every call
+   * carries an explicit timeout (axios per-request config wins over defaults).
+   */
+  #installRequestTimeout() {
+    const timeoutMs = Number(this.config.httpTimeoutMs) > 0 ? Number(this.config.httpTimeoutMs) : 15_000;
+    const inst = this.client?.httpInstance;
+    const orig = inst?.request?.bind(inst);
+    if (typeof orig !== 'function') {
+      log.warn(`sdk httpInstance not wrappable — request timeout NOT installed (hang risk)`);
+      return;
+    }
+    inst.request = (opts) => orig({ timeout: timeoutMs, ...(opts ?? {}) });
+    log.info(`sdk http request timeout installed: ${timeoutMs}ms`);
   }
   #botInfoAt = 0;
 
