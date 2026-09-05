@@ -30,6 +30,7 @@ const LONG_PATTERNS = [
   /额度|配额/,
   /exhausted/i,
   /用完|耗尽|用尽/,
+  /使用上限|usage\s*limit/,   // 百炼 1308「已达到5小时的使用上限」
   /insufficient\s+\w*balance/i,
 ];
 
@@ -72,6 +73,13 @@ export function parseRetryHint(message) {
   return null;
 }
 
+/** 从错误文本解析「额度窗口长度」（小时）。百炼1308: 已达到5小时的使用上限 → 5。
+ *  滚动窗口下, 恢复点 ≈ 最后一次成功调用 + 窗口长度(那时窗口内旧用量全部滑出)。 */
+export function parseWindowLength(message) {
+  const m = /(\d+)\s*(?:个)?\s*(?:小?时|hour)/i.exec(String(message ?? ''));
+  return m ? Number(m[1]) : null;
+}
+
 /** 分类一个回合错误。'long' | 'short' | null（与额度/限流无关）。 */
 export function classifyFailure(message, extraLongPatterns = []) {
   const text = String(message ?? '');
@@ -106,8 +114,9 @@ export class AutoContinue {
     const reason = event.data?.reason;
     if (reason?.kind !== 'error') {
       // 成功完成的回合：若有等待器，说明自动恢复成功
-      if (reason?.kind === 'completed' && this.watchers.has(sessionId)) {
-        this.#finish(sessionId, chatId);
+      if (reason?.kind === 'completed') {
+        this.lastOkAt = Date.now();   // 滚动窗口恢复点推算的锚
+        if (this.watchers.has(sessionId)) this.#finish(sessionId, chatId);
       }
       return;
     }
@@ -167,10 +176,15 @@ export class AutoContinue {
       // （2026-09-04 07:27 实测事故）。升级后按 pollMs 节奏探测，maxMs 封顶。
       kind = 'long';
       if (prev?.kind !== 'long') {
+        const wlenH = parseWindowLength(message);
+        const recoverAt = wlenH && this.lastOkAt ? this.lastOkAt + wlenH * 3_600_000 + 30_000 : null;
         this.#send(chatId, buildInfoCard('⏳ 疑似窗口打满，转入长等待', [
-          `瞬时限流连续重试 ${attempts - 1} 次未恢复，可能是订阅额度窗口（5 小时）用满。`,
-          '', `已自动转为每 ${Math.round((cfg.autoContinuePollMs ?? 10 * 60_000) / 60_000)} 分钟探测一次，最长等 ${Math.round((cfg.autoContinueMaxMs ?? 6 * 3_600_000) / 3_600_000)} 小时；窗口重置后会自动接续，期间你发消息即取消。`,
-          '', `\`\`\`\n${String(message).slice(0, 300)}\n\`\`\``,
+          `瞬时限流连续重试 ${attempts - 1} 次未恢复，可能是订阅额度窗口用满。`,
+          '', recoverAt
+            ? `按${wlenH}小时滚动窗口推算，${new Date(recoverAt).toLocaleString('zh-CN', { hour12: false })} 定点自动继续；届时仍受限则每 ${Math.round((cfg.autoContinuePollMs ?? 10 * 60_000) / 60_000)} 分钟再探。`
+            : `未给出重置时间，每 ${Math.round((cfg.autoContinuePollMs ?? 10 * 60_000) / 60_000)} 分钟探测一次，最长等 ${Math.round((cfg.autoContinueMaxMs ?? 6 * 3_600_000) / 3_600_000)} 小时。`,
+          '期间你发消息即取消。', '',
+          `\`\`\`\n${String(message).slice(0, 300)}\n\`\`\``,
         ].join('\n'), { template: 'grey' }));
         log.warn(`auto-continue escalated to long-watch for ${sessionId}: transient limit persisted`);
       }
@@ -190,11 +204,24 @@ export class AutoContinue {
       delayMs = Math.max(5_000, hint.at.getTime() - Date.now() + 30_000);
       note = `按提示的窗口重置时间 ${hint.at.toLocaleString('zh-CN', { hour12: false })} 自动继续`;
     } else {
-      const first = !prev;
-      delayMs = first
-        ? (cfg.autoContinueFirstMs ?? 60_000)
-        : (cfg.autoContinuePollMs ?? 10 * 60_000);
-      note = `未给出重置时间，每 ${Math.round(delayMs / 60_000)} 分钟探测一次`;
+      // 窗口长度推断：滚动窗口恢复点 = 最后一次成功调用 + 窗口长度
+      // （百炼1308「已达到5小时的使用上限」→ 到 lastOk+5h 旧用量全部滑出，
+      //  一次定点探测即可，无需按 pollMs 傻轮询；届时仍受限再转轮询）
+      const wlenH = parseWindowLength(message);
+      const recoverAt = wlenH && this.lastOkAt
+        ? this.lastOkAt + wlenH * 3_600_000 + 30_000
+        : null;
+      if (recoverAt) {
+        delayMs = Math.max(5_000, Math.min(
+          recoverAt - Date.now(), cfg.autoContinueMaxMs ?? 6 * 3_600_000));
+        note = `按${wlenH}小时滚动窗口推算恢复点 ${new Date(recoverAt).toLocaleString('zh-CN', { hour12: false })} 定点继续`;
+      } else {
+        const first = !prev;
+        delayMs = first
+          ? (cfg.autoContinueFirstMs ?? 60_000)
+          : (cfg.autoContinuePollMs ?? 10 * 60_000);
+        note = `未给出重置时间，每 ${Math.round(delayMs / 60_000)} 分钟探测一次`;
+      }
     }
 
     const nextAt = new Date(Date.now() + delayMs);
