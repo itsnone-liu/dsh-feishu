@@ -11,7 +11,9 @@
  *        「重置于 HH:MM / reset at … / retry after Ns」提示，解析不到
  *        就按 pollMs 轮询；到点自动补发一条「继续」（可配置）；
  *      · 瞬时限流类（429 / rate limit / 上游负载 / try again in Ns）
- *        → 短退避：30s 起指数退避重试，shortMax 次后放弃并通知；
+ *        → 短退避：30s 起指数退避重试，shortMax 次后**升级为长等待**
+ *          （按 pollMs 轮询至 maxMs）——5 小时订阅窗口打满常只报
+ *          429 而无额度字样，短退避等不到窗口重置，放弃即失去自动恢复；
  *  - 期间用户在本聊天发任何消息 → 立即取消（用户优先）；
  *  - 重试成功（turn/end completed）→ 发绿色卡片确认已自动恢复；
  *  - 超过 maxMs 仍失败 → 放弃并通知（保留最后一次错误）。
@@ -159,14 +161,19 @@ export class AutoContinue {
       return;
     }
     if (kind === 'short' && attempts > (cfg.autoContinueShortMax ?? 6)) {
-      this.watchers.delete(sessionId);
-      this.#send(chatId, buildInfoCard('⏹ 自动重试已放弃', [
-        `瞬时限流连续重试 ${attempts - 1} 次仍失败。`,
-        '', '可能是服务端持续过载，请稍后手动发一条消息接续。',
-        '', `\`\`\`\n${String(message).slice(0, 300)}\n\`\`\``,
-      ].join('\n'), { template: 'grey' }));
-      log.warn(`auto-continue gave up for ${sessionId}: transient limit persisted`);
-      return;
+      // 短退避用尽 → 升级为长等待而非放弃。
+      // 5 小时订阅窗口打满时，上游常只报 429/rate limit（无额度字样），
+      // 短退避约 26 分钟远够不到窗口重置，旧逻辑在此放弃 → 无法自动恢复
+      // （2026-09-04 07:27 实测事故）。升级后按 pollMs 节奏探测，maxMs 封顶。
+      kind = 'long';
+      if (prev?.kind !== 'long') {
+        this.#send(chatId, buildInfoCard('⏳ 疑似窗口打满，转入长等待', [
+          `瞬时限流连续重试 ${attempts - 1} 次未恢复，可能是订阅额度窗口（5 小时）用满。`,
+          '', `已自动转为每 ${Math.round((cfg.autoContinuePollMs ?? 10 * 60_000) / 60_000)} 分钟探测一次，最长等 ${Math.round((cfg.autoContinueMaxMs ?? 6 * 3_600_000) / 3_600_000)} 小时；窗口重置后会自动接续，期间你发消息即取消。`,
+          '', `\`\`\`\n${String(message).slice(0, 300)}\n\`\`\``,
+        ].join('\n'), { template: 'grey' }));
+        log.warn(`auto-continue escalated to long-watch for ${sessionId}: transient limit persisted`);
+      }
     }
 
     // —— 计算下一次尝试时间
