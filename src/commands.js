@@ -791,8 +791,13 @@ export class Commands {
 
     const env = { ...process.env };
     delete env.DSH_FEISHU_SCRIPT; // never replay a test script into prod
+    // NOTE: 前缀组（FEISHU_/DSH_/GLM_/…）必须写成 `PREFIX.*` —— 旧正则
+    // `/^(FEISHU_|…|PATH|…)$/` 要求整串完整命中，FEISHU_APP_ID 之类全部被
+    // 静默过滤掉，/restart 拉起的新进程没有飞书凭据 → ws 404 无限重连
+    // （2026-09-05 restart.log 实录）。CODEX_PROXY_API_KEY 同属必需（限额
+    // fallback 的备用模型 key，丢了重启后切不了 gpt）。
     const envLines = Object.entries(env)
-      .filter(([k]) => /^(FEISHU_|DSH_|GLM_|DASHSCOPE_|PATH|HOME|LANG|LC_|NODE_|http_proxy|https_proxy|no_proxy)$/i.test(k))
+      .filter(([k]) => /^(FEISHU_.*|DSH_.*|GLM_.*|DASHSCOPE_.*|CODEX_PROXY_.*|PATH|HOME|LANG|LC_.*|NODE_.*|http_proxy|https_proxy|no_proxy|OPENAI_API_KEY)$/i.test(k))
       .map(([k, v]) => `${JSON.stringify(k + '=' + v)}`)
       .join(' ');
     const argvQ = argv.map((a) => JSON.stringify(a)).join(' ');
