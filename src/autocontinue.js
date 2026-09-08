@@ -16,11 +16,20 @@
  *      ① 快照所有 live 会话当前模型；
  *      ② 全部切到备用模型（如 codex-gpt/gpt-5.6-luna）并设 driver.defaultOverride
  *         （fallback 期间新建/resume 的会话也走备用模型，不再踩已限额的主模型）；
- *      ③ 对被打断的会话立即补发「继续」—— 原任务无缝换脑续跑；
+ *      ③ 对被打断的会话立即补发「继续」—— 原任务无缝换脑续跑。注意
+ *         turn/end 是在 session.append() 里同步分发的，此刻 agent 的 phase
+ *         还停在 'running'（kick() 的 finally 稍后才置回 idle），所以这里
+ *         绝不能按 status==='idle' 判断（2026-09-08 两次「切了模型却没
+ *         自动继续」事故的根因）；driver.submit 对 running 走 steer（置
+ *         wakeRequested，驱动循环收尾时自动重开，下一回合走已切换的模型），
+ *         对 idle 走 followup，两条路都能接上。
  *      ④ watcher 保留，但到点的动作从「dsh 试跑」改为「curl 主模型探针」
  *         （会话在备用模型上干活，不能再靠它探主模型）；
- *      ⑤ 探针 200 → 还原快照/回主模型 + 绿卡；仍 429 → 按 pollMs 续探。
- *    备用模型自己出错/限额：只发一次诊断卡（两边都受限，等主模型恢复）。
+ *      ⑤ 探针 200 → 还原快照/回主模型，并且把额度中断过、还没在备用模型
+ *         上跑完的会话自动补发「继续」（切回 GLM 同样免人工）；
+ *         备用模型上已完成的任务不硬塞继续。
+ *    备用模型自己出错/限额：只发一次诊断卡（两边都受限，等主模型恢复），
+ *    出错的会话记入中断清单，探针探通切回时一并自动续跑。
  *  - **手动模式**：/gpt /glm 快切（调试用）。手动切换 = 抑制一切自动切换
  *    与探针，直到 /glm 或 /auto 恢复自动。
  *  - 期间用户在本聊天发任何消息 → 取消该会话的纯等待 watcher（fallback
@@ -126,6 +135,9 @@ export class AutoContinue {
     this.fallbackActive = false;
     /** 切换前各会话模型快照 sessionId → {provider,model}（恢复时还原）。 */
     this.snapshots = new Map();
+    /** 额度中断现场 sessionId → { chatId, doneOnBackup }：切回主模型时对
+     *  未完成的自动补发「继续」（doneOnBackup=true 的除外，别硬塞）。 */
+    this.interrupted = new Map();
     /** 备用模型侧出错只提示一次。 */
     this.backupErrorNotified = false;
     /** 探针注入点（离线测试用）：async () => boolean。 */
@@ -155,6 +167,9 @@ export class AutoContinue {
         if (!this.fallbackActive) {
           this.lastOkAt = Date.now();
           if (this.watchers.has(sessionId)) this.#finish(sessionId, chatId);
+        } else if (this.interrupted.has(sessionId)) {
+          // 备用模型把被打断的任务跑完了：切回主模型时不再补发「继续」。
+          this.interrupted.get(sessionId).doneOnBackup = true;
         }
       }
       return;
@@ -189,6 +204,11 @@ export class AutoContinue {
     // 只有错误确实出自备用模型上的会话才算「两边都受限」——fallback 刚切入
     // 时主模型上在途请求的尾巴错误不算。
     const fromBackup = backup && cur?.provider === backup.provider && cur?.model === backup.model;
+    // 备用模型上被限/出错的会话记入中断清单：探针探通、切回主模型时
+    // 一并自动补发「继续」（两边都受限期间任务挂起，不能就此丢下）。
+    if (fromBackup && classifyFailure(message) && !this.interrupted.has(sessionId)) {
+      this.interrupted.set(sessionId, { chatId, doneOnBackup: false });
+    }
     if (!this.backupErrorNotified) {
       this.backupErrorNotified = true;
       this.#send(chatId, buildInfoCard(fromBackup ? '⚠️ 备用模型也受限' : '⚠️ 备用模型侧出错', [
@@ -217,6 +237,7 @@ export class AutoContinue {
   dispose() {
     for (const sessionId of [...this.watchers.keys()]) this.#clearTimer(sessionId);
     this.watchers.clear();
+    this.interrupted.clear();
   }
 
   #clearTimer(sessionId) {
@@ -355,11 +376,24 @@ export class AutoContinue {
     const skipped = this.driver.applyModelToAll(backup.provider, backup.model);
     this.driver.defaultOverride = { ...backup };
 
-    // ③ 原任务在备用模型上立即续跑
+    // ③ 原任务在备用模型上立即续跑。
+    //    turn/end 在 session.append() 里同步分发，此刻 agent 的 phase 还停在
+    //    'running'（kick() 的 finally 稍后才置回 idle）——按 status==='idle'
+    //    判断永远不成立，导致「切了模型却没自动继续」（2026-09-08 两次实测
+    //    事故）。driver.submit：running→steer（置 wakeRequested，驱动循环
+    //    收尾时自动重开，下一回合走已切换的备用模型）；idle→followup。
+    //    两条路都能接上，故不再看 status。
+    let resumed = false;
     const entry = this.driver.live.get(sessionId);
-    const resumed = entry?.agent && entry.agent.status === 'idle'
-      ? (this.driver.submit(entry.agent, this.config.autoContinueMessage ?? '继续'), true)
-      : false;
+    if (entry?.agent) {
+      try {
+        this.driver.submit(entry.agent, this.config.autoContinueMessage ?? '继续');
+        resumed = true;
+      } catch (e) {
+        log.warn(`fallback resume submit failed for ${sessionId}: ${e.message}`);
+      }
+    }
+    this.interrupted.set(sessionId, { chatId, doneOnBackup: false });
 
     // ④ 橙卡告知
     this.#send(chatId, buildInfoCard('🔄 额度窗口打满，已切换备用模型', [
@@ -398,7 +432,8 @@ export class AutoContinue {
     }
   }
 
-  /** fallback 退出：还原快照（无快照的 live 会话回主模型）+ 绿卡。 */
+  /** fallback 退出：还原快照（无快照的 live 会话回主模型）+ 自动续跑中断
+   *  过且未在备用模型上跑完的任务 + 绿卡。 */
   #exitFallback(chatId) {
     const primary = this.#primary() ?? parsePair('glm-coding/glm-5.3');
     this.fallbackActive = false;
@@ -412,12 +447,30 @@ export class AutoContinue {
       } catch {}
     }
     this.snapshots.clear();
+    // 额度中断过、备用模型上没跑完的会话：模型已还原，自动补发「继续」。
+    let recontinued = 0;
+    const failed = [];
+    for (const [id, info] of this.interrupted) {
+      const entry = this.driver.live.get(id);
+      if (!entry?.agent) { failed.push(id); continue; }
+      if (info.doneOnBackup) continue;           // 备用上已完成，不硬塞继续
+      try {
+        if (entry.agent.status === 'running') continue; // 在跑的回合下个请求自然走主模型
+        this.driver.submit(entry.agent, this.config.autoContinueMessage ?? '继续');
+        recontinued++;
+      } catch { failed.push(id); }
+    }
+    this.interrupted.clear();
     this.#clearAllWatchers();
     this.#send(chatId, buildInfoCard('✅ 主模型已恢复，已自动切回', [
       `主模型额度窗口已重置：${restored} 个会话已切回原模型（快照还原）。`,
-      '', '继续正常使用即可；被打断过的任务如需接续，发「继续」。',
+      recontinued > 0
+        ? `被打断的任务已自动继续（${recontinued} 个），无需人工发「继续」。`
+        : '被打断的任务已在备用模型上跑完，无需接续。',
+      ...(failed.length ? ['', `以下会话自动续跑失败，可手动发「继续」：${failed.join('、')}`] : []),
     ].join('\n'), { template: 'green' }));
-    log.info('fallback exited: primary model recovered, sessions restored');
+    log.info(`fallback exited: primary recovered, sessions restored=${restored}, recontinued=${recontinued}`
+      + (failed.length ? `, failed=${failed.length}` : ''));
   }
 
   // ------------------------------------------------------------ manual ----
@@ -431,8 +484,9 @@ export class AutoContinue {
       if (!pair) {
         return { ok: false, text: `fallback${target === 'gpt' ? 'Backup' : 'Primary'} 未配置（config.json）` };
       }
-      // 停探针/等待，进手动模式
+      // 停探针/等待，进手动模式（用户接管：中断清单一并清空，切回时不再自动续跑）
       this.#clearAllWatchers();
+      this.interrupted.clear();
       if (this.snapshots.size === 0) {
         for (const [id, entry] of this.driver.live) {
           try {
@@ -459,6 +513,7 @@ export class AutoContinue {
     if (target === 'auto') {
       this.mode = 'auto';
       this.#clearAllWatchers();
+      this.interrupted.clear();
       return { ok: true, text: '已恢复自动切换（当前模型保持不变；下次限额事件会自动 fallback）。' };
     }
     return { ok: false, text: '用法：/gpt · /glm · /auto' };

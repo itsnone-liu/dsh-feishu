@@ -225,8 +225,8 @@ function fbHarness(cfgOver = {}) {
   const agent = {
     id: 'session-test',
     status: 'idle',
-    followup(m) { submitted.push(m); },
-    steer(m) { submitted.push(m); },
+    followup(m) { submitted.push({ how: 'followup', text: m.content?.[0]?.text ?? '' }); },
+    steer(m) { submitted.push({ how: 'steer', text: m.content?.[0]?.text ?? '' }); },
   };
   const driver = {
     live: new Map([['session-test', { agent }]]),
@@ -234,7 +234,13 @@ function fbHarness(cfgOver = {}) {
     currentModel: () => ({ provider: 'glm-coding', model: 'glm-5.3' }),
     setModel: (_a, provider, model) => { applied.push(`${provider}/${model}`); },
     applyModelToAll: (provider, model) => { applied.push(`ALL:${provider}/${model}`); return []; },
-    submit(a, text) { submitted.push({ text }); return 'followup'; },
+    // 与真实 SessionDriver.submit 同语义：running→steer，idle→followup。
+    submit(a, text) {
+      const msg = { content: [{ type: 'text', text }] };
+      const running = a.status === 'running';
+      if (running) a.steer(msg); else a.followup(msg);
+      return running ? 'steer' : 'followup';
+    },
   };
   const renderer = { chatOf: (id) => (id === 'session-test' ? 'chat-1' : null) };
   const transport = { async sendCard(_c, card) { cards.push(card); return { messageId: `m${cards.length}` }; } };
@@ -266,6 +272,68 @@ await ok('fallback: long quota error → switch to backup + resume + orange card
   assert.ok(submitted.some((s) => s.text === '继续'), 'interrupted task auto-resumed on backup');
   assert.ok(cards.some((c) => /切换备用模型/.test(c.header.title.content)), 'switch card');
   assert.equal(ac.watchers.size, 1, 'probe watcher armed');
+  ac.dispose();
+});
+
+await ok('fallback: resume works during the transient running window (2026-09-08 incident)', () => {
+  // turn/end 是在 session.append() 里同步分发的：此刻真实 agent 的 phase
+  // 还是 'running'（idle 要等 kick() 的 finally）。旧实现按 status==='idle'
+  // 判断 → 切了模型但从不自动继续，用户必须手发「继续」。修复后 running
+  // 走 steer 也能接上。
+  const { ac, cards, submitted, turnEnd, agent } = fbHarness();
+  agent.status = 'running';
+  turnEnd({ kind: 'error', error: { code: '1308', message: '已达到5小时的使用上限，额度耗尽' } });
+  assert.ok(ac.fallbackActive, 'fallback entered despite running status');
+  const resume = submitted.find((s) => s.text === '继续');
+  assert.ok(resume, 'auto-resume submitted in the running window');
+  assert.equal(resume.how, 'steer', 'running window resumes via steer');
+  assert.ok(cards.some((c) => /切换备用模型/.test(c.header.title.content)
+    && /已自动继续/.test(JSON.stringify(c))), 'card says task auto-continued');
+  ac.dispose();
+});
+
+await ok('fallback: exit auto-continues unfinished interrupted task', async () => {
+  const { ac, cards, submitted, turnEnd, agent } = fbHarness();
+  turnEnd({ kind: 'error', error: { code: '429', message: '额度耗尽 quota exhausted' } });
+  assert.equal(submitted.filter((s) => s.text === '继续').length, 1, 'resumed once on backup');
+  // 备用模型上没有跑完（比如直接空闲/又出错）→ 探针探通切回主模型时要自动续跑
+  agent.status = 'idle';
+  ac.probeFn = async () => true;
+  await sleep(150);
+  assert.ok(!ac.fallbackActive, 'fallback exited');
+  assert.equal(submitted.filter((s) => s.text === '继续').length, 2, 'auto-continued again after switch-back');
+  assert.ok(cards.some((c) => /已自动切回/.test(c.header.title.content)
+    && /自动继续/.test(JSON.stringify(c))), 'green card reports auto-continue');
+  assert.equal(ac.interrupted.size, 0, 'interrupted list cleared');
+  ac.dispose();
+});
+
+await ok('fallback: exit does NOT re-continue a task finished on backup', async () => {
+  const { ac, submitted, turnEnd, agent } = fbHarness();
+  turnEnd({ kind: 'error', error: { code: '429', message: '额度耗尽 quota exhausted' } });
+  turnEnd({ kind: 'completed' });   // 备用模型把任务跑完了
+  agent.status = 'idle';
+  ac.probeFn = async () => true;
+  await sleep(150);
+  assert.ok(!ac.fallbackActive, 'fallback exited');
+  assert.equal(submitted.filter((s) => s.text === '继续').length, 1,
+    'no extra 继续 after a backup-completed task');
+  ac.dispose();
+});
+
+await ok('fallback: backup-side quota error is tracked and continued on exit', async () => {
+  const { ac, submitted, turnEnd, agent, driver } = fbHarness();
+  turnEnd({ kind: 'error', error: { code: '429', message: '额度耗尽 quota exhausted' } });
+  // 备用模型上也限额（currentModel 现在报备用）→ 记入中断清单
+  driver.currentModel = () => ({ provider: 'codex-gpt', model: 'gpt-5.6-luna' });
+  turnEnd({ kind: 'error', error: { code: '429', message: 'usage limit reached (额度耗尽)' } });
+  assert.equal(ac.interrupted.size, 1, 'backup-side failure tracked');
+  agent.status = 'idle';
+  ac.probeFn = async () => true;
+  await sleep(150);
+  assert.ok(!ac.fallbackActive);
+  assert.equal(submitted.filter((s) => s.text === '继续').length, 2,
+    'both-limited task auto-continued after switch-back');
   ac.dispose();
 });
 
