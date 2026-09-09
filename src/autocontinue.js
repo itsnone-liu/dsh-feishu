@@ -379,25 +379,40 @@ export class AutoContinue {
     // ③ 原任务在备用模型上立即续跑。
     //    turn/end 在 session.append() 里同步分发，此刻 agent 的 phase 还停在
     //    'running'（kick() 的 finally 稍后才置回 idle）——按 status==='idle'
-    //    判断永远不成立，导致「切了模型却没自动继续」（2026-09-08 两次实测
-    //    事故）。driver.submit：running→steer（置 wakeRequested，驱动循环
-    //    收尾时自动重开，下一回合走已切换的备用模型）；idle→followup。
-    //    两条路都能接上，故不再看 status。
-    let resumed = false;
+    //    判断永远不成立，导致「切了模型却没自动继续」（2026-09-08 事故①）。
+    //    driver.submit：running→steer（置 wakeRequested，驱动循环收尾时自动
+    //    重开，下一回合走已切换的备用模型）；idle→followup。两条路都能接上，
+    //    故不再看 status。
+    //    但 steer/followup → inbox.splice 自身要 session.append('agent/inbox/
+    //    spliced')——外层 turn/end 的 append 尚未返回，dsh-session 的重入锁
+    //    直接抛 "cannot reenter"（2026-09-09 09:41 事故②：模型切了、resume
+    //    却失败，任务死等 3.5 分钟直到用户手工「继续」）。该锁随 append()
+    //    同步返回即释放 → 推迟一个宏任务提交即安全；再留几次短重试兜底，
+    //    全部失败则发灰卡明确告知手工接续（不再静默 warn）。
     const entry = this.driver.live.get(sessionId);
     if (entry?.agent) {
-      try {
-        this.driver.submit(entry.agent, this.config.autoContinueMessage ?? '继续');
-        resumed = true;
-      } catch (e) {
-        log.warn(`fallback resume submit failed for ${sessionId}: ${e.message}`);
-      }
+      const resumeText = this.config.autoContinueMessage ?? '继续';
+      const tryResume = (left) => {
+        if (!this.fallbackActive) return;   // 探针已切回/手动退出，别重复续跑
+        try {
+          this.driver.submit(entry.agent, resumeText);
+        } catch (e) {
+          if (left > 0) { setTimeout(() => tryResume(left - 1), 250); return; }
+          log.warn(`fallback resume submit failed for ${sessionId}: ${e.message}`);
+          this.#send(chatId, buildInfoCard('⚠️ 备用模型已切换，但自动续跑失败', [
+            `模型已切到 **${backup.provider}/${backup.model}**，但给被打断的任务补发「继续」未成功。`,
+            '', '请手动发一条「继续」接续任务。', '',
+            `\`\`\`\n${String(e.message).slice(0, 200)}\n\`\`\``,
+          ].join('\n'), { template: 'grey' }));
+        }
+      };
+      setTimeout(() => tryResume(8), 0);
     }
     this.interrupted.set(sessionId, { chatId, doneOnBackup: false });
 
-    // ④ 橙卡告知
+    // ④ 橙卡告知（续跑结果是异步的，成败由后续行为/灰卡体现，不在此预支）
     this.#send(chatId, buildInfoCard('🔄 额度窗口打满，已切换备用模型', [
-      `主模型额度窗口耗尽，已把会话切到 **${backup.provider}/${backup.model}** 接续干活${resumed ? '，被打断的任务已自动继续' : ''}。`,
+      `主模型额度窗口耗尽，已把会话切到 **${backup.provider}/${backup.model}** 接续干活，被打断的任务将自动继续。`,
       '',
       '桥同时开始探测主模型恢复，探通即自动切回（无需手动）。手动调试：`/gpt` `/glm` `/auto`。',
       '',
@@ -448,14 +463,20 @@ export class AutoContinue {
     }
     this.snapshots.clear();
     // 额度中断过、备用模型上没跑完的会话：模型已还原，自动补发「继续」。
+    // 三种结局分开播报——running 的会话跳过续跑（下个请求自然走主模型），
+    // 但必须如实告知「仍在进行中」，不能谎报「已在备用模型上跑完」
+    // （2026-09-09 12:07 事故③：绿卡说跑完了，任务其实在 job_output 轮询
+    //  里，用户两条「继续」又等不到回音，被迫重启桥）。
     let recontinued = 0;
+    let inFlight = 0;            // 仍在跑的回合：下个请求自动走已还原的主模型
+    let finishedOnBackup = 0;
     const failed = [];
     for (const [id, info] of this.interrupted) {
       const entry = this.driver.live.get(id);
       if (!entry?.agent) { failed.push(id); continue; }
-      if (info.doneOnBackup) continue;           // 备用上已完成，不硬塞继续
+      if (info.doneOnBackup) { finishedOnBackup++; continue; } // 备用上已完成，不硬塞继续
       try {
-        if (entry.agent.status === 'running') continue; // 在跑的回合下个请求自然走主模型
+        if (entry.agent.status === 'running') { inFlight++; continue; }
         this.driver.submit(entry.agent, this.config.autoContinueMessage ?? '继续');
         recontinued++;
       } catch { failed.push(id); }
@@ -464,12 +485,16 @@ export class AutoContinue {
     this.#clearAllWatchers();
     this.#send(chatId, buildInfoCard('✅ 主模型已恢复，已自动切回', [
       `主模型额度窗口已重置：${restored} 个会话已切回原模型（快照还原）。`,
-      recontinued > 0
-        ? `被打断的任务已自动继续（${recontinued} 个），无需人工发「继续」。`
-        : '被打断的任务已在备用模型上跑完，无需接续。',
+      ...[
+        recontinued > 0 ? `被打断的任务已自动继续（${recontinued} 个），无需人工发「继续」。` : '',
+        inFlight > 0 ? `${inFlight} 个会话的任务仍在进行中，其下一个请求自动走主模型（正在等的长工具调用可能还需 1-2 分钟）。` : '',
+        finishedOnBackup > 0 ? `${finishedOnBackup} 个任务已在备用模型上跑完。` : '',
+      ].filter(Boolean),
       ...(failed.length ? ['', `以下会话自动续跑失败，可手动发「继续」：${failed.join('、')}`] : []),
     ].join('\n'), { template: 'green' }));
     log.info(`fallback exited: primary recovered, sessions restored=${restored}, recontinued=${recontinued}`
+      + (inFlight ? `, inFlight=${inFlight}` : '')
+      + (finishedOnBackup ? `, finishedOnBackup=${finishedOnBackup}` : '')
       + (failed.length ? `, failed=${failed.length}` : ''));
   }
 

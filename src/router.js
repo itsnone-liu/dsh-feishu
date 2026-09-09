@@ -33,6 +33,8 @@ export class ChatRouter {
     this.warnedChats = new Set();
     /** chatId → pending image burst { images[], text, timer } */
     this.batches = new Map();
+    /** chatId → last steer-ack card time (ms) — throttled to one per 90s */
+    this.steerAckAt = new Map();
   }
 
   /** Transport entry point. Never throws. */
@@ -190,8 +192,25 @@ export class ChatRouter {
     const mode = this.driver.submit(agent, norm);
     if (mode === 'steer') {
       this.renderer.setSteerNote(agent.id, norm);
+      this.#steerAck(chatId);
       log.info(`chat ${chatId}: steered running agent`);
     }
+  }
+
+  /** Steer 到忙碌 agent 的即时回执（限频 90s/聊天）。
+   *  消息进了 next-step 队列后要等当前步骤结束才生效——若回合正卡在长
+   *  工具调用/后台作业轮询上（常见 1-2 分钟），用户毫无反馈，会以为
+   *  「继续」没反应而连发甚至重启桥（2026-09-09 12:07 事故④）。一张
+   *  轻量灰卡把「已收到、何时生效」说清楚。 */
+  #steerAck(chatId) {
+    const now = Date.now();
+    const last = this.steerAckAt.get(chatId) ?? 0;
+    if (now - last < 90_000) return;
+    this.steerAckAt.set(chatId, now);
+    this.transport.sendCard(chatId, buildInfoCard('⏳ 任务进行中，消息已注入', [
+      '当前回合还在跑（可能在等长工具调用或后台作业，常见 1-2 分钟）。',
+      '你的消息会在当前步骤结束后生效，无需重发。',
+    ].join('\n'), { template: 'grey' })).catch(() => {});
   }
 
   /** Resolve (and remember) the live agent bound to a chat. */
