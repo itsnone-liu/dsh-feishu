@@ -211,10 +211,15 @@ export class AutoContinue {
     }
     if (!this.backupErrorNotified) {
       this.backupErrorNotified = true;
-      this.#send(chatId, buildInfoCard(fromBackup ? '⚠️ 备用模型也受限' : '⚠️ 备用模型侧出错', [
-        fromBackup
-          ? '主模型额度窗口耗尽且备用模型也报错——两边订阅可能都在限额内，桥继续探测主模型恢复，探通即自动切回并继续。'
-          : 'fallback 期间备用模型回合出错，桥继续探测主模型恢复。',
+      const backupText = String(message);
+      const missingCredential = /MISSING_CREDENTIAL|no credential|API.?KEY.*not set|not configured/i.test(backupText);
+      const backupTitle = missingCredential ? '❌ GPT备用通道未配置凭据' : (fromBackup ? '⚠️ 备用模型也受限' : '⚠️ 备用模型侧出错');
+      this.#send(chatId, buildInfoCard(backupTitle, [
+        missingCredential
+          ? '主模型已切换到GPT备用通道，但备用通道凭据缺失或未注入；这不是GPT额度耗尽。已保留主模型恢复探测。'
+          : fromBackup
+            ? '主模型额度窗口耗尽且备用模型也报错——两边订阅可能都在限额内，桥继续探测主模型恢复，探通即自动切回并继续。'
+            : 'fallback 期间备用模型回合出错，桥继续探测主模型恢复。',
         '', '可用 /glm 手动切回主模型，或稍后再试。', '',
         `\`\`\`\n${String(message).slice(0, 300)}\n\`\`\``,
       ].join('\n'), { template: 'grey' }));
