@@ -90,8 +90,8 @@ const DEFAULTS = {
   autoContinueShortMax: 6,
   /** 追加的额度错误匹配正则（字符串数组，不区分大小写）。 */
   autoContinuePatterns: [],
-  /** 限额自动切换：主模型限额窗口打满时，把会话切到备用模型继续干活，
-   *  同时探测主模型恢复，探通后切回。'' 或 null = 关闭（纯等待老行为）。 */
+  /** 双向限额自动切换：当前模型窗口打满时切到配置对的另一侧继续干活，
+   *  同时探测耗尽模型恢复，探通后还原。'' 或 null = 关闭（纯等待）。 */
   fallbackPrimary: 'glm-coding/glm-5.3',
   /** 备用模型（须已在 dsh settings.yaml providers 里配好）。 */
   fallbackBackup: 'codex-gpt/gpt-5.6-luna',
@@ -100,6 +100,13 @@ const DEFAULTS = {
     url: 'https://open.bigmodel.cn/api/coding/paas/v4/chat/completions',
     apiKeyEnv: 'GLM_API_KEY',
     model: 'glm-5-turbo',
+  },
+  /** 备用侧本身（通常GPT）限额后的恢复探针。缺失时仍可切回主模型，
+   *  但不会错误复用主模型探针来判断GPT恢复。 */
+  fallbackBackupProbe: {
+    url: 'http://127.0.0.1:8080/v1/chat/completions',
+    apiKeyEnv: 'CODEX_PROXY_API_KEY',
+    model: 'gpt-5.6-luna',
   },
 };
 
@@ -118,6 +125,7 @@ function coerce(raw) {
   if (raw?.allowGroupChats === true) cfg.groups = 'mention';
   // 限额自动切换：嵌套探针配置按字段合并；false 显式关闭
   cfg.fallbackProbe = { ...DEFAULTS.fallbackProbe, ...(raw?.fallbackProbe ?? {}) };
+  cfg.fallbackBackupProbe = { ...DEFAULTS.fallbackBackupProbe, ...(raw?.fallbackBackupProbe ?? {}) };
   if (raw?.fallbackPrimary === false) cfg.fallbackPrimary = '';
   if (raw?.fallbackBackup === false) cfg.fallbackBackup = '';
   if (!['off', 'mention', 'all'].includes(cfg.groups)) cfg.groups = 'off';
