@@ -23,21 +23,24 @@ export class SessionDriver {
     this.live = new Map();
     /** sessionId → mutable selection object wired through installModelSelection */
     this.selections = new Map();
-    /**
-     * Un-drained "resume failed → started a NEW session" notices. 2026-08-26
-     * incident: a session dir deleted externally made the chat silently fall
-     * back to a fresh session — zero feedback, context "lost". The router
-     * drains these into an info card.
-     */
-    this.resumeFallbacks = [];
-  }
+        /**
+         * Un-drained "resume failed → started a NEW session" notices. 2026-08-26
+         * incident: a session dir deleted externally made the chat silently fall
+         * back to a fresh session — zero feedback, context "lost". The router
+         * drains these into an info card.
+         */
+        this.resumeFallbacks = [];
+        /** 全局默认模型覆盖（限额 fallback / 手动快切用）：#create 与 #resume
+         *  都尊重它，fallback 期间新会话/恢复会话不再落回已限额的模型。 */
+        this.defaultOverride = null; // { provider, model } | null
+      }
 
-  /** Take and clear pending resume-fallback notices (router → info card). */
-  drainResumeFallbacks() {
-    const out = this.resumeFallbacks;
-    this.resumeFallbacks = [];
-    return out;
-  }
+      /** Take and clear pending resume-fallback notices (router → info card). */
+      drainResumeFallbacks() {
+        const out = this.resumeFallbacks;
+        this.resumeFallbacks = [];
+        return out;
+      }
 
   /** The model a persisted session last ran with (request/context fold), for resume. */
   static lastModelOf(session) {
@@ -51,6 +54,9 @@ export class SessionDriver {
   }
 
   #selection() {
+    if (this.defaultOverride) {
+      return { provider: this.defaultOverride.provider, model: this.defaultOverride.model };
+    }
     if (this.config.provider && this.config.model) {
       return { provider: this.config.provider, model: this.config.model };
     }
@@ -155,7 +161,10 @@ export class SessionDriver {
       },
     });
     const persisted = SessionDriver.lastModelOf(handle.agent.session);
-    if (persisted) sel.current = { ...persisted };
+    // 限额 fallback 期间 resume：覆盖优先于会话上次模型，否则恢复的会话
+    // 会落回已限额的 provider。
+    if (this.defaultOverride) sel.current = { ...this.defaultOverride };
+    else if (persisted) sel.current = { ...persisted };
     this.live.set(handle.agent.id, { handle, agent: handle.agent });
     this.selections.set(handle.agent.id, sel);
     log.info(`agent resumed ${handle.agent.id} (${sel.current.provider}/${sel.current.model})`);
@@ -274,6 +283,20 @@ export class SessionDriver {
     if (sel?.current) return { ...sel.current };
     if (agent?.options?.provider) return { provider: agent.options.provider, model: agent.options.model };
     return null;
+  }
+
+  /** 把一个模型应用到所有 live 会话（setModel 写 durable request/context）。
+   *  返回被跳过的会话 id（极少：agent 已不 live）。 */
+  applyModelToAll(provider, model) {
+    const skipped = [];
+    for (const [id, entry] of this.live) {
+      try {
+        this.setModel(entry.agent, provider, model);
+      } catch {
+        skipped.push(id);
+      }
+    }
+    return skipped;
   }
 
   /** Hard-stop the active turn, keep queued work. */

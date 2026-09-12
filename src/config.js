@@ -90,6 +90,17 @@ const DEFAULTS = {
   autoContinueShortMax: 6,
   /** 追加的额度错误匹配正则（字符串数组，不区分大小写）。 */
   autoContinuePatterns: [],
+  /** 限额自动切换：主模型限额窗口打满时，把会话切到备用模型继续干活，
+   *  同时探测主模型恢复，探通后切回。'' 或 null = 关闭（纯等待老行为）。 */
+  fallbackPrimary: 'glm-coding/glm-5.3',
+  /** 备用模型（须已在 dsh settings.yaml providers 里配好）。 */
+  fallbackBackup: 'codex-gpt/gpt-5.6-luna',
+  /** 探测主模型恢复用的最小请求（同 key 同窗口，1 token 消耗可忽略）。 */
+  fallbackProbe: {
+    url: 'https://open.bigmodel.cn/api/coding/paas/v4/chat/completions',
+    apiKeyEnv: 'GLM_API_KEY',
+    model: 'glm-5-turbo',
+  },
 };
 
 function coerce(raw) {
@@ -105,6 +116,10 @@ function coerce(raw) {
   if (process.env.DSH_FEISHU_MOCK_AGENT === '1') cfg.mockAgent = true;
   // legacy boolean → groups enum
   if (raw?.allowGroupChats === true) cfg.groups = 'mention';
+  // 限额自动切换：嵌套探针配置按字段合并；false 显式关闭
+  cfg.fallbackProbe = { ...DEFAULTS.fallbackProbe, ...(raw?.fallbackProbe ?? {}) };
+  if (raw?.fallbackPrimary === false) cfg.fallbackPrimary = '';
+  if (raw?.fallbackBackup === false) cfg.fallbackBackup = '';
   if (!['off', 'mention', 'all'].includes(cfg.groups)) cfg.groups = 'off';
   if (!cfg.dataDir) cfg.dataDir = path.join(dshHome(), 'feishu');
   if (!cfg.logFile) cfg.logFile = path.join(cfg.dataDir, 'bridge.log');

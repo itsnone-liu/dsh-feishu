@@ -88,8 +88,9 @@ function apply(ctx, config) {
         config: cfg,
         chatOfSession: (sessionId) => renderer.chatOf(sessionId),
       });
-      const commands = new Commands({ config: cfg, store, driver, renderer, transport, permissionPresets: ctx.permissionPresets, llm: ctx.llm, agentPresets: ctx.agentPresets, visionReady });
+      const commands = new Commands({ config: cfg, store, driver, renderer, transport, permissionPresets: ctx.permissionPresets, llm: ctx.llm, agentPresets: ctx.agentPresets, visionReady, autoContinue: null });
       const autoContinue = new AutoContinue({ config: cfg, driver, renderer, transport });
+      commands.autoContinue = autoContinue; // 注入（构造顺序：Commands 先建，AutoContinue 需要 transport 就绪）
       const router = new ChatRouter({ config: cfg, store, driver, renderer, transport, interactions, commands, visionReady, autoContinue });
 
       // ---- outbound seams ----

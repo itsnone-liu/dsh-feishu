@@ -26,7 +26,8 @@ const HELP = [
   '',
   '- 直接发文字 = 和 agent 说话（运行中发送会作为下一步转向输入）',
   '- **直接发图片 = 识图**：无需切模型 —— 文本模型会自动调用 `inspect_image` 外挂识图（Qwen-VL）；若当前模型本身支持视觉则原生识图。连发多张图会自动合并为一个回合（1.5 秒窗口）',
-  '- 订阅额度耗尽时桥会**自动等待恢复并继续**，期间发消息即可接管',
+  '- 订阅额度耗尽时桥会**自动等待恢复并继续**；配置了备用模型时会**自动切换**（主模型限额→备用模型接管续跑，探针探到恢复自动切回）',
+  '- `/gpt` `/glm` `/auto` 手动快切模型（调试用）：gpt=切备用并暂停自动 · glm=切回主模型 · auto=恢复自动切换',
   '- `/new [cwd]` 新会话 · `/stop` 停止本轮 · `/status` 状态 · `/doctor` 诊断（识图链路体检）',
   '- `/mode` 查看/切换权限模式（`/mode ro` 只读 · `/mode rw` 工作区可写 · `/mode full` 全权）',
   '- `/model` 查看/切换模型（如 `/model glm-5.3`；跨厂商用 `厂商/模型` 全称；📷 标记原生支持识图）',
@@ -53,7 +54,7 @@ const MODE_ALIASES = {
 };
 
 export class Commands {
-  constructor({ config, store, driver, renderer, transport, permissionPresets, llm, agentPresets, visionReady = false }) {
+  constructor({ config, store, driver, renderer, transport, permissionPresets, llm, agentPresets, visionReady = false, autoContinue = null }) {
     this.config = config;
     this.store = store;
     this.driver = driver;
@@ -63,6 +64,7 @@ export class Commands {
     this.llm = llm;
     this.agentPresets = agentPresets;
     this.visionReady = visionReady;
+    this.autoContinue = autoContinue;
   }
 
 
@@ -92,6 +94,12 @@ export class Commands {
         case 'model':
         case 'models':
           return await this.cmdModel(chatId, arg);
+        case 'gpt':
+          return await this.cmdQuickSwitch(chatId, 'gpt');
+        case 'glm':
+          return await this.cmdQuickSwitch(chatId, 'glm');
+        case 'auto':
+          return await this.cmdQuickSwitch(chatId, 'auto');
         case 'preset':
         case 'presets':
           return await this.cmdPreset(chatId, arg);
@@ -235,6 +243,21 @@ export class Commands {
     return true;
   }
 
+  /** /gpt /glm /auto — 限额自动切换的手动快切（调试利器）。
+   *  /gpt = 切备用模型并暂停自动切换；/glm = 切回主模型并恢复自动；
+   *  /auto = 仅恢复自动（模型不动）。 */
+  async cmdQuickSwitch(chatId, target) {
+    if (!this.autoContinue?.manualSwitch) {
+      await this.transport.sendCard(chatId, buildErrorCard('切换服务不可用', '桥未加载 auto-continue 模块。'));
+      return true;
+    }
+    const res = this.autoContinue.manualSwitch(target);
+    await this.transport.sendCard(chatId, res.ok
+      ? buildInfoCard('模型快切', res.text, { template: 'green' })
+      : buildErrorCard('切换失败', res.text));
+    return true;
+  }
+
   async cmdStatus(chatId) {
     const binding = this.store.get(chatId);
     const lines = [`chat：\`${chatId}\``];
@@ -250,6 +273,7 @@ export class Commands {
       }
     }
     lines.push(`审批模式：\`${this.config.approval}\``);
+    if (this.autoContinue?.statusLine) lines.push(this.autoContinue.statusLine());
     await this.transport.sendCard(chatId, buildInfoCard('桥状态', lines.join('\n')));
     return true;
   }
@@ -398,6 +422,10 @@ export class Commands {
     // resolve the target
     let provider;
     let model;
+    if (arg === 'gpt' || arg === 'glm') {
+      // 快捷别名 → 手动快切（保证 fallback 状态机同步，不能裸 setModel）
+      return await this.cmdQuickSwitch(chatId, arg);
+    }
     if (arg.includes('/')) {
       [provider, model] = arg.split('/').map((x) => x.trim());
     } else {
@@ -781,8 +809,13 @@ export class Commands {
 
     const env = { ...process.env };
     delete env.DSH_FEISHU_SCRIPT; // never replay a test script into prod
+    // NOTE: 前缀组（FEISHU_/DSH_/GLM_/…）必须写成 `PREFIX.*` —— 旧正则
+    // `/^(FEISHU_|…|PATH|…)$/` 要求整串完整命中，FEISHU_APP_ID 之类全部被
+    // 静默过滤掉，/restart 拉起的新进程没有飞书凭据 → ws 404 无限重连
+    // （2026-09-05 restart.log 实录）。CODEX_PROXY_API_KEY 同属必需（限额
+    // fallback 的备用模型 key，丢了重启后切不了 gpt）。
     const envLines = Object.entries(env)
-      .filter(([k]) => /^(FEISHU_|DSH_|GLM_|DASHSCOPE_|PATH|HOME|LANG|LC_|NODE_|http_proxy|https_proxy|no_proxy)$/i.test(k))
+      .filter(([k]) => /^(FEISHU_.*|DSH_.*|GLM_.*|DASHSCOPE_.*|CODEX_PROXY_.*|PATH|HOME|LANG|LC_.*|NODE_.*|http_proxy|https_proxy|no_proxy|OPENAI_API_KEY)$/i.test(k))
       .map(([k, v]) => `${JSON.stringify(k + '=' + v)}`)
       .join(' ');
     const argvQ = argv.map((a) => JSON.stringify(a)).join(' ');

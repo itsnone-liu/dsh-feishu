@@ -189,12 +189,12 @@ await ok('non-quota error while waiting → gives up', async () => {
   ac.dispose();
 });
 
-await ok('transient limit: backoff then give up after shortMax', async () => {
-  const { ac, cards, turnEnd } = harness();
+await ok('transient limit: backoff then escalate to long-watch after shortMax', async () => {
+  const { ac, cards, turnEnd } = harness({ fallbackPrimary: '', fallbackBackup: '' });
   const transient = () => turnEnd({ kind: 'error', error: { code: '429', message: 'rate limit reached' } });
   transient(); // attempt 1 scheduled (30s away) — compress by simulating fire
   assert.equal(cards.length, 1, 'wait card for transient too');
-  // force-fire attempt 1 → its turn errors again transient → attempt 2 → again → give up
+  // force-fire attempt 1 → its turn errors again transient → attempt 2 → again → escalate
   const w = ac.watchers.get('session-test');
   assert.ok(w, 'watcher armed');
   clearTimeout(w.timer); w.timer = null;
@@ -204,8 +204,8 @@ await ok('transient limit: backoff then give up after shortMax', async () => {
   assert.equal(w2.attempts, 2);
   clearTimeout(w2.timer); w2.timer = null;
   ac.onEvent({ id: 'session-test' }, { type: 'turn/end', data: { reason: { kind: 'error', error: { code: '429', message: 'rate limit reached' } } } });
-  assert.equal(ac.watchers.size, 0, 'gave up after shortMax=2 retries');
-  assert.ok(cards.some((c) => /自动重试已放弃/.test(c.header.title.content)));
+  assert.equal(ac.watchers.size, 1, 'escalated to long-watch (NOT given up) — 2026-09-04 incident fix');
+  assert.ok(cards.some((c) => /窗口打满|长等待/.test(c.header.title.content)), 'escalation card');
   ac.dispose();
 });
 
@@ -264,5 +264,292 @@ await ok('resolveVisionConfig: defaults + inline key override', () => {
   assert.equal(c.model, 'qwen-vl-max');
 });
 
-console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
-process.exit(fail ? 1 : 0);
+// ------------------------------------------------- 8 限额自动换模型(fallback)
+/** fallback harness：driver mock 带模型切换三件套 + 可注入探针。
+ *  时序复刻（2026-09-09 事故教训）：turn/end 在 session.append() 里同步
+ *  分发——分发栈内的 driver.submit（steer/followup → inbox.splice →
+ *  session.append）会被 dsh-session 重入锁拒绝（"cannot reenter"）。
+ *  inDispatch 标记同步窗口，submit mock 在窗口内抛锁错，与真实时序一致。 */
+function fbHarness(cfgOver = {}) {
+  const cards = [];
+  const submitted = [];
+  const applied = [];
+  let inDispatch = false;
+  let alwaysLocked = false;   // true = submit 永远抛锁错（测重试用尽）
+  let failFirstN = 0;          // 额外前 N 次调用也抛错（测重试成功路径）
+  let submitCalls = 0;
+  const agent = {
+    id: 'session-test',
+    status: 'idle',
+    followup(m) { submitted.push({ how: 'followup', text: m.content?.[0]?.text ?? '' }); },
+    steer(m) { submitted.push({ how: 'steer', text: m.content?.[0]?.text ?? '' }); },
+  };
+  const driver = {
+    live: new Map([['session-test', { agent }]]),
+    defaultOverride: null,
+    currentModel: () => ({ provider: 'glm-coding', model: 'glm-5.3' }),
+    setModel: (_a, provider, model) => { applied.push(`${provider}/${model}`); },
+    applyModelToAll: (provider, model) => { applied.push(`ALL:${provider}/${model}`); return []; },
+    // 与真实 SessionDriver.submit 同语义：running→steer，idle→followup；
+    // 且复刻 dsh-session 重入锁——同步分发窗口内的 append 必被拒。
+    submit(a, text) {
+      submitCalls++;
+      if (alwaysLocked || (inDispatch) || submitCalls <= failFirstN) {
+        throw new Error('session append cannot reenter while another append is being published');
+      }
+      const msg = { content: [{ type: 'text', text }] };
+      const running = a.status === 'running';
+      if (running) a.steer(msg); else a.followup(msg);
+      return running ? 'steer' : 'followup';
+    },
+  };
+  const renderer = { chatOf: (id) => (id === 'session-test' ? 'chat-1' : null) };
+  const transport = { async sendCard(_c, card) { cards.push(card); return { messageId: `m${cards.length}` }; } };
+  const cfg = {
+    autoContinue: true,
+    autoContinueMessage: '继续',
+    autoContinueFirstMs: 80,
+    autoContinuePollMs: 120,
+    autoContinueMaxMs: 5_000,
+    autoContinueShortMax: 2,
+    autoContinuePatterns: [],
+    fallbackPrimary: 'glm-coding/glm-5.3',
+    fallbackBackup: 'codex-gpt/gpt-5.6-luna',
+    fallbackProbe: { url: 'http://probe/none', apiKeyEnv: 'PROBE_KEY', model: 'glm-5-turbo' },
+    ...cfgOver,
+  };
+  process.env.PROBE_KEY = 'test-key';
+  const ac = new AutoContinue({ config: cfg, driver, renderer, transport });
+  const turnEnd = (reason) => {
+    inDispatch = true;
+    try { ac.onEvent({ id: 'session-test' }, { type: 'turn/end', data: { reason } }); }
+    finally { inDispatch = false; }
+  };
+  return { ac, cards, submitted, applied, driver, turnEnd, agent,
+    mocks: { lockAlways(v) { alwaysLocked = v; }, failFirst(v) { failFirstN = v; }, calls: () => submitCalls } };
+}
+
+await ok('fallback: long quota error → switch to backup + resume + orange card', async () => {
+  const { ac, cards, submitted, applied, driver, turnEnd } = fbHarness();
+  turnEnd({ kind: 'error', error: { code: '429', message: '已达到5小时的使用上限，额度耗尽' } });
+  assert.ok(ac.fallbackActive, 'fallback active');
+  assert.ok(applied.some((x) => x === 'ALL:codex-gpt/gpt-5.6-luna'), 'all sessions switched to backup');
+  assert.deepEqual(driver.defaultOverride, { provider: 'codex-gpt', model: 'gpt-5.6-luna' }, 'default override set');
+  await sleep(30);   // resume 已异步化：等宏任务越过重入锁窗口
+  assert.ok(submitted.some((s) => s.text === '继续'), 'interrupted task auto-resumed on backup');
+  assert.ok(cards.some((c) => /切换备用模型/.test(c.header.title.content)), 'switch card');
+  assert.equal(ac.watchers.size, 1, 'probe watcher armed');
+  ac.dispose();
+});
+
+await ok('fallback: resume survives the append reenter lock (2026-09-09 incident)', async () => {
+  // 真实时序：turn/end 在 session.append() 同步分发栈内 → 此刻 submit 的
+  // inbox.splice 又要 session.append → dsh-session 重入锁直接抛 "cannot
+  // reenter"。harness 的 submit mock 在同步窗口内抛同款错误。修复 = 推迟
+  // 一个宏任务提交 + 短重试兜底。
+  const { ac, cards, submitted, turnEnd } = fbHarness();
+  turnEnd({ kind: 'error', error: { code: '429', message: '已达到5小时的使用上限，额度耗尽' } });
+  assert.equal(submitted.length, 0, 'no synchronous submit inside the dispatch window');
+  await sleep(30);
+  assert.ok(submitted.some((s) => s.text === '继续'), 'resume lands after the lock window closes');
+  assert.ok(!cards.some((c) => /自动续跑失败/.test(JSON.stringify(c))), 'no failure card on success');
+  ac.dispose();
+});
+
+await ok('fallback: resume retries transient lock errors then succeeds', async () => {
+  const { ac, submitted, turnEnd, mocks } = fbHarness();
+  mocks.failFirst(3);   // 前 3 次调用抛锁错（模拟极慢的持久化回调）
+  turnEnd({ kind: 'error', error: { code: '429', message: '已达到5小时的使用上限，额度耗尽' } });
+  await sleep(900);     // 250ms × 3 次重试窗口
+  assert.ok(submitted.some((s) => s.text === '继续'), 'retry chain eventually lands the resume');
+  ac.dispose();
+});
+
+await ok('fallback: resume exhausts retries → grey card tells the user to continue manually', async () => {
+  const { ac, cards, turnEnd, mocks } = fbHarness();
+  mocks.lockAlways(true);   // submit 永远抛锁错
+  turnEnd({ kind: 'error', error: { code: '429', message: '已达到5小时的使用上限，额度耗尽' } });
+  await sleep(2_900);       // setTimeout(0) + 8 × 250ms 全部用尽
+  assert.equal(cards.filter((c) => /自动续跑失败/.test(JSON.stringify(c))).length, 1,
+    'exactly one manual-continue hint card');
+  assert.ok(cards.some((c) => /请手动发一条「继续」/.test(JSON.stringify(c))), 'card says how to recover');
+  ac.dispose();
+});
+
+await ok('fallback: resume works during the transient running window (2026-09-08 incident)', async () => {
+  // turn/end 是在 session.append() 里同步分发的：此刻真实 agent 的 phase
+  // 还是 'running'（idle 要等 kick() 的 finally）。旧实现按 status==='idle'
+  // 判断 → 切了模型但从不自动继续，用户必须手发「继续」。修复后 running
+  // 走 steer 也能接上。
+  const { ac, cards, submitted, turnEnd, agent } = fbHarness();
+  agent.status = 'running';
+  turnEnd({ kind: 'error', error: { code: '1308', message: '已达到5小时的使用上限，额度耗尽' } });
+  assert.ok(ac.fallbackActive, 'fallback entered despite running status');
+  await sleep(30);
+  const resume = submitted.find((s) => s.text === '继续');
+  assert.ok(resume, 'auto-resume submitted in the running window');
+  assert.equal(resume.how, 'steer', 'running window resumes via steer');
+  assert.ok(cards.some((c) => /切换备用模型/.test(c.header.title.content)
+    && /将自动继续/.test(JSON.stringify(c))), 'card says task will auto-continue');
+  ac.dispose();
+});
+
+await ok('fallback: exit auto-continues unfinished interrupted task', async () => {
+  const { ac, cards, submitted, turnEnd, agent } = fbHarness();
+  turnEnd({ kind: 'error', error: { code: '429', message: '额度耗尽 quota exhausted' } });
+  await sleep(30);
+  assert.equal(submitted.filter((s) => s.text === '继续').length, 1, 'resumed once on backup');
+  // 备用模型上没有跑完（比如直接空闲/又出错）→ 探针探通切回主模型时要自动续跑
+  agent.status = 'idle';
+  ac.probeFn = async () => true;
+  await sleep(150);
+  assert.ok(!ac.fallbackActive, 'fallback exited');
+  assert.equal(submitted.filter((s) => s.text === '继续').length, 2, 'auto-continued again after switch-back');
+  assert.ok(cards.some((c) => /已自动切回/.test(c.header.title.content)
+    && /自动继续/.test(JSON.stringify(c))), 'green card reports auto-continue');
+  assert.equal(ac.interrupted.size, 0, 'interrupted list cleared');
+  ac.dispose();
+});
+
+await ok('fallback: exit reports running session as in-flight, NOT "finished on backup" (2026-09-09 incident)', async () => {
+  // 切回主模型时任务仍在跑（例如卡在 job_output 轮询）：跳过补发是对的
+  // （下个请求自然走主模型），但旧绿卡文案谎称「已在备用模型上跑完」，
+  // 用户两条「继续」又等不到回音 → 以为手工继续也坏了，重启桥。
+  const { ac, cards, submitted, turnEnd, agent } = fbHarness();
+  turnEnd({ kind: 'error', error: { code: '429', message: '额度耗尽 quota exhausted' } });
+  await sleep(30);
+  agent.status = 'running';   // 切回时任务仍在进行中
+  ac.probeFn = async () => true;
+  await sleep(150);
+  assert.ok(!ac.fallbackActive, 'fallback exited');
+  assert.equal(submitted.filter((s) => s.text === '继续').length, 1, 'no extra 继续 injected into a running turn');
+  const green = cards.find((c) => /已自动切回/.test(c.header.title.content));
+  assert.ok(green, 'green card present');
+  assert.match(JSON.stringify(green), /仍在进行中/, 'green card says the task is still running');
+  assert.doesNotMatch(JSON.stringify(green), /已在备用模型上跑完，无需接续/, 'must not claim it finished on backup');
+  ac.dispose();
+});
+
+await ok('fallback: exit does NOT re-continue a task finished on backup', async () => {
+  const { ac, submitted, turnEnd, agent } = fbHarness();
+  turnEnd({ kind: 'error', error: { code: '429', message: '额度耗尽 quota exhausted' } });
+  await sleep(30);
+  turnEnd({ kind: 'completed' });   // 备用模型把任务跑完了
+  agent.status = 'idle';
+  ac.probeFn = async () => true;
+  await sleep(150);
+  assert.ok(!ac.fallbackActive, 'fallback exited');
+  assert.equal(submitted.filter((s) => s.text === '继续').length, 1,
+    'no extra 继续 after a backup-completed task');
+  ac.dispose();
+});
+
+await ok('fallback: backup-side quota error is tracked and continued on exit', async () => {
+  const { ac, submitted, turnEnd, agent, driver } = fbHarness();
+  turnEnd({ kind: 'error', error: { code: '429', message: '额度耗尽 quota exhausted' } });
+  // 备用模型上也限额（currentModel 现在报备用）→ 记入中断清单
+  driver.currentModel = () => ({ provider: 'codex-gpt', model: 'gpt-5.6-luna' });
+  turnEnd({ kind: 'error', error: { code: '429', message: 'usage limit reached (额度耗尽)' } });
+  assert.equal(ac.interrupted.size, 1, 'backup-side failure tracked');
+  agent.status = 'idle';
+  ac.probeFn = async () => true;
+  await sleep(150);
+  assert.ok(!ac.fallbackActive);
+  assert.equal(submitted.filter((s) => s.text === '继续').length, 2,
+    'both-limited task auto-continued after switch-back');
+  ac.dispose();
+});
+
+await ok('fallback: short 429 does NOT switch; only escalated long does', () => {
+  const { ac, applied, turnEnd } = fbHarness();
+  turnEnd({ kind: 'error', error: { code: '429', message: 'rate limit reached' } });
+  assert.ok(!ac.fallbackActive, 'transient limit must not switch model');
+  assert.equal(applied.length, 0);
+  ac.dispose();
+});
+
+await ok('fallback: probe success → restore snapshot + green card', async () => {
+  const { ac, cards, applied, turnEnd } = fbHarness();
+  turnEnd({ kind: 'error', error: { code: '429', message: '额度耗尽 quota exhausted' } });
+  ac.probeFn = async () => true;
+  await sleep(150); // firstMs fires the probe
+  assert.ok(!ac.fallbackActive, 'fallback exited');
+  assert.ok(applied.some((x) => x === 'glm-coding/glm-5.3'), 'sessions restored to primary');
+  assert.ok(cards.some((c) => /已自动切回/.test(c.header.title.content)), 'recovery card');
+  assert.equal(ac.watchers.size, 0, 'watcher cleared');
+  ac.dispose();
+});
+
+await ok('fallback: probe still-limited → re-arm, no premature exit', async () => {
+  const { ac, turnEnd } = fbHarness();
+  turnEnd({ kind: 'error', error: { code: '429', message: '额度耗尽 quota exhausted' } });
+  ac.probeFn = async () => false;
+  await sleep(250); // first probe + one re-arm cycle
+  assert.ok(ac.fallbackActive, 'still in fallback');
+  assert.ok(ac.watchers.size === 1, 'probe watcher re-armed');
+  ac.probeFn = async () => true;
+  await sleep(200);
+  assert.ok(!ac.fallbackActive, 'recovered on later probe');
+  ac.dispose();
+});
+
+await ok('fallback: completed turn on backup is NOT a recovery signal', async () => {
+  const { ac, cards, turnEnd } = fbHarness();
+  turnEnd({ kind: 'error', error: { code: '429', message: '额度耗尽 quota exhausted' } });
+  const before = ac.lastOkAt;
+  turnEnd({ kind: 'completed' });
+  assert.ok(ac.fallbackActive, 'fallback continues');
+  assert.notEqual(ac.lastOkAt, Date.now(), 'lastOkAt anchor not polluted by backup success');
+  assert.ok(!cards.some((c) => /已自动恢复/.test(c.header.title.content)), 'no premature success card');
+  ac.dispose();
+});
+
+await ok('fallback: user message does NOT cancel the probe watcher', () => {
+  const { ac, turnEnd } = fbHarness();
+  turnEnd({ kind: 'error', error: { code: '429', message: '额度耗尽 quota exhausted' } });
+  ac.cancelForChat('chat-1');
+  assert.equal(ac.watchers.size, 1, 'probe watcher survives user messages');
+  ac.dispose();
+});
+
+await ok('fallback: backup-side error → one diagnostic card, no re-scheduling', () => {
+  const { ac, cards, turnEnd } = fbHarness();
+  turnEnd({ kind: 'error', error: { code: '429', message: '额度耗尽 quota exhausted' } });
+  const watchersBefore = ac.watchers.size;
+  // 备用模型上的会话报错（currentModel mock 返回 backup → fromBackup=true）
+  const { driver } = { driver: null };
+  turnEnd({ kind: 'error', error: { code: '429', message: 'usage limit reached' } });
+  turnEnd({ kind: 'error', error: { code: '429', message: 'usage limit reached' } });
+  assert.equal(ac.watchers.size, watchersBefore, 'no new watchers for backup-side errors');
+  const diag = cards.filter((c) => /备用模型也受限|备用模型侧出错/.test(c.header.title.content));
+  assert.equal(diag.length, 1, 'diagnostic card exactly once');
+  ac.dispose();
+});
+
+await ok('manual: /gpt switches + suppresses automation; /glm restores auto', () => {
+  const { ac, applied, turnEnd } = fbHarness();
+  const r1 = ac.manualSwitch('gpt');
+  assert.ok(r1.ok);
+  assert.equal(ac.mode, 'manual');
+  assert.ok(applied.some((x) => x === 'ALL:codex-gpt/gpt-5.6-luna'));
+  // manual 下 quota 错误完全静默
+  turnEnd({ kind: 'error', error: { code: '429', message: '额度耗尽 quota exhausted' } });
+  assert.equal(ac.watchers.size, 0, 'no auto behavior in manual mode');
+  assert.ok(!ac.fallbackActive);
+  const r2 = ac.manualSwitch('glm');
+  assert.ok(r2.ok);
+  assert.equal(ac.mode, 'auto');
+  assert.ok(applied.some((x) => x === 'ALL:glm-coding/glm-5.3'));
+  ac.dispose();
+});
+
+await ok('manual: /auto only re-enables, keeps current model', () => {
+  const { ac, applied } = fbHarness();
+  ac.manualSwitch('gpt');
+  applied.length = 0;
+  const r = ac.manualSwitch('auto');
+  assert.ok(r.ok);
+  assert.equal(ac.mode, 'auto');
+  assert.equal(applied.length, 0, '/auto must not touch models');
+  ac.dispose();
+});
