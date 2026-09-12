@@ -58,6 +58,14 @@ const LONG_PATTERNS = [
   /已达.{0,12}上限/,
   /使用窗口/,
   /限额.{0,12}重置/,
+  // codex-proxy（GPT 备用通道）额度耗尽时的实测表象不是 quota 文案，而是
+  // AUTH:401 {"message":"Not authenticated. Please login first at /","code":"invalid_api_key"}
+  // —— 2026-09-12 用户报告：该 401 被 classifyFailure 判为"非额度错误"直接放弃，
+  // GPT 侧永远不触发 fallback，只剩一张 API 错误卡。凭据/登录类中断必须按
+  // 窗口类处理：切到另一侧继续干活 + 探针探测该侧恢复（代理重新登录后探通）。
+  /not authenticated/i,
+  /please login first/i,
+  /invalid_api_key/,
 ];
 
 /** 瞬时限流类错误（短退避重试）。 */
@@ -238,13 +246,18 @@ export class AutoContinue {
       this.backupErrorNotified = true;
       const backupText = String(message);
       const missingCredential = /MISSING_CREDENTIAL|no credential|API.?KEY.*not set|not configured/i.test(backupText);
-      const backupTitle = missingCredential ? '❌ GPT备用通道未配置凭据' : (fromBackup ? '⚠️ 备用模型也受限' : '⚠️ 备用模型侧出错');
+      const proxyLoggedOut = /not authenticated|please login first|invalid_api_key/i.test(backupText);
+      const backupTitle = missingCredential ? '❌ GPT备用通道未配置凭据'
+        : proxyLoggedOut ? '⚠️ GPT备用通道未登录'
+        : (fromBackup ? '⚠️ 备用模型也受限' : '⚠️ 备用模型侧出错');
       this.#send(chatId, buildInfoCard(backupTitle, [
         missingCredential
           ? '主模型已切换到GPT备用通道，但备用通道凭据缺失或未注入；这不是GPT额度耗尽。已保留主模型恢复探测。'
-          : fromBackup
-            ? '主模型额度窗口耗尽且备用模型也报错——两边订阅可能都在限额内，桥继续探测主模型恢复，探通即自动切回并继续。'
-            : 'fallback 期间备用模型回合出错，桥继续探测主模型恢复。',
+          : proxyLoggedOut
+            ? 'GPT备用通道的 codex-proxy 会话未登录（Not authenticated / 请先登录）——多为GPT额度窗口耗尽或代理登录过期，不是桥的配置问题。请在 codex-proxy 首页重新登录；桥保持探测，探通即自动切换/还原。'
+            : fromBackup
+              ? '主模型额度窗口耗尽且备用模型也报错——两边订阅可能都在限额内，桥继续探测主模型恢复，探通即自动切回并继续。'
+              : 'fallback 期间备用模型回合出错，桥继续探测主模型恢复。',
         '', '可用 /glm 手动切回主模型，或稍后再试。', '',
         `\`\`\`\n${String(message).slice(0, 300)}\n\`\`\``,
       ].join('\n'), { template: 'grey' }));

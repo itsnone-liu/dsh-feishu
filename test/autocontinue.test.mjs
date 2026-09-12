@@ -346,6 +346,21 @@ await ok('fallback: GPT quota error → reverse switch to GLM + resume', async (
   h.ac.dispose();
 });
 
+await ok('fallback: codex-proxy AUTH 401 (GPT quota symptom) → long → reverse switch to GLM', async () => {
+  // 2026-09-12 用户报告原文：GPT 5h 额度到点时 codex-proxy 返回的不是 quota 文案，
+  // 而是 AUTH:401 Not authenticated / invalid_api_key。旧分类把它当"非额度错误"
+  // 直接放弃 → 永不 fallback，只报 API 错误。必须按窗口类处理并切到 GLM。
+  const h = fbHarness();
+  h.driver.currentModel = () => ({ provider: 'codex-gpt', model: 'gpt-5.6-luna' });
+  h.turnEnd({ kind: 'error', error: { code: 'AUTH', message: 'AUTH: 401: {"message":"Not authenticated. Please login first at /","type":"invalid_request_error","param":null,"code":"invalid_api_key"}' } });
+  assert.ok(h.ac.fallbackActive, '401 proxy-logout symptom triggers fallback');
+  assert.ok(h.applied.includes('ALL:glm-coding/glm-5.3'), 'switched to GLM');
+  assert.equal(h.ac.recoveryProbe.apiKeyEnv, 'BACKUP_PROBE_KEY', 'probing the logged-out GPT side for recovery');
+  await sleep(30);
+  assert.ok(h.submitted.some((s) => s.text === '继续'), 'interrupted task resumes on GLM');
+  h.ac.dispose();
+});
+
 await ok('fallback: GPT recovery probe restores pre-failure GPT snapshot', async () => {
   const h = fbHarness();
   h.driver.currentModel = () => ({ provider: 'codex-gpt', model: 'gpt-5.6-luna' });
