@@ -315,12 +315,8 @@ function fbHarness(cfgOver = {}) {
     autoContinuePatterns: [],
     fallbackPrimary: 'glm-coding/glm-5.3',
     fallbackBackup: 'codex-gpt/gpt-5.6-luna',
-    fallbackProbe: { url: 'http://probe/none', apiKeyEnv: 'PROBE_KEY', model: 'glm-5-turbo' },
-    fallbackBackupProbe: { url: 'http://probe/gpt', apiKeyEnv: 'BACKUP_PROBE_KEY', model: 'gpt-5.6-luna' },
     ...cfgOver,
   };
-  process.env.PROBE_KEY = 'test-key';
-  process.env.BACKUP_PROBE_KEY = 'test-key';
   const ac = new AutoContinue({ config: cfg, driver, renderer, transport });
   const turnEnd = (reason) => {
     inDispatch = true;
@@ -339,7 +335,6 @@ await ok('fallback: GPT quota error → reverse switch to GLM + resume', async (
   assert.ok(h.applied.includes('ALL:glm-coding/glm-5.3'), 'GPT exhaustion switches all sessions to GLM');
   assert.deepEqual(h.driver.defaultOverride, { provider: 'glm-coding', model: 'glm-5.3' });
   assert.deepEqual(h.ac.limitedModel, { provider: 'codex-gpt', model: 'gpt-5.6-luna' });
-  assert.equal(h.ac.recoveryProbe.apiKeyEnv, 'BACKUP_PROBE_KEY', 'probe tracks exhausted GPT, not GLM');
   await sleep(30);
   assert.ok(h.submitted.some((s) => s.text === '继续'), 'interrupted GPT task resumes on GLM');
   assert.ok(h.cards.some((c) => /已切换可用模型/.test(c.header.title.content) && /glm-coding/.test(JSON.stringify(c))));
@@ -355,35 +350,33 @@ await ok('fallback: codex-proxy AUTH 401 (GPT quota symptom) → long → revers
   h.turnEnd({ kind: 'error', error: { code: 'AUTH', message: 'AUTH: 401: {"message":"Not authenticated. Please login first at /","type":"invalid_request_error","param":null,"code":"invalid_api_key"}' } });
   assert.ok(h.ac.fallbackActive, '401 proxy-logout symptom triggers fallback');
   assert.ok(h.applied.includes('ALL:glm-coding/glm-5.3'), 'switched to GLM');
-  assert.equal(h.ac.recoveryProbe.apiKeyEnv, 'BACKUP_PROBE_KEY', 'probing the logged-out GPT side for recovery');
   await sleep(30);
   assert.ok(h.submitted.some((s) => s.text === '继续'), 'interrupted task resumes on GLM');
   h.ac.dispose();
 });
 
-await ok('fallback: GPT recovery probe restores pre-failure GPT snapshot', async () => {
+await ok('fallback: 不自动切回 — 接管侧正常干活时不还原（2026-09-13 定调）', async () => {
   const h = fbHarness();
-  h.driver.currentModel = () => ({ provider: 'codex-gpt', model: 'gpt-5.6-luna' });
-  h.turnEnd({ kind: 'error', error: { code: 'usage_limit_reached', message: 'usage limit reached; quota exhausted' } });
-  h.ac.probeFn = async () => true;
-  await sleep(150);
-  assert.ok(!h.ac.fallbackActive, 'reverse fallback exited');
-  assert.ok(h.applied.includes('codex-gpt/gpt-5.6-luna'), 'recovered GPT snapshot restored');
-  assert.equal(h.ac.limitedModel, null, 'direction state cleared');
-  assert.equal(h.ac.watchers.size, 0);
+  h.turnEnd({ kind: 'error', error: { code: '429', message: '已达到5小时的使用上限，额度耗尽' } }); // GLM→GPT
+  assert.ok(h.applied.includes('ALL:codex-gpt/gpt-5.6-luna'));
+  await sleep(250);   // 足够 firstMs/pollMs 触发多次 —— 什么都不该再发生
+  assert.ok(h.ac.fallbackActive, 'stays on takeover side (no recovery exit)');
+  assert.ok(!h.applied.includes('glm-coding/glm-5.3'), 'no restore without exhaustion');
+  assert.equal(h.ac.watchers.size, 0, 'no probe/wait watcher armed');
   h.ac.dispose();
 });
 
-await ok('fallback: long quota error → switch to backup + resume + orange card', async () => {
+await ok('fallback: long quota error → switch to other side + resume + orange card', async () => {
   const { ac, cards, submitted, applied, driver, turnEnd } = fbHarness();
   turnEnd({ kind: 'error', error: { code: '429', message: '已达到5小时的使用上限，额度耗尽' } });
   assert.ok(ac.fallbackActive, 'fallback active');
-  assert.ok(applied.some((x) => x === 'ALL:codex-gpt/gpt-5.6-luna'), 'all sessions switched to backup');
+  assert.ok(applied.some((x) => x === 'ALL:codex-gpt/gpt-5.6-luna'), 'all sessions switched');
   assert.deepEqual(driver.defaultOverride, { provider: 'codex-gpt', model: 'gpt-5.6-luna' }, 'default override set');
   await sleep(30);   // resume 已异步化：等宏任务越过重入锁窗口
-  assert.ok(submitted.some((s) => s.text === '继续'), 'interrupted task auto-resumed on backup');
+  assert.ok(submitted.some((s) => s.text === '继续'), 'interrupted task auto-resumed');
   assert.ok(cards.some((c) => /切换可用模型/.test(c.header.title.content)), 'switch card');
-  assert.equal(ac.watchers.size, 1, 'probe watcher armed');
+  assert.ok(cards.some((c) => /不会自动切回/.test(JSON.stringify(c))), 'card states the no-switch-back policy');
+  assert.equal(ac.watchers.size, 0, 'no wait/probe watcher after switching');
   ac.dispose();
 });
 
@@ -439,69 +432,60 @@ await ok('fallback: resume works during the transient running window (2026-09-08
   ac.dispose();
 });
 
-await ok('fallback: exit auto-continues unfinished interrupted task', async () => {
-  const { ac, cards, submitted, turnEnd, agent } = fbHarness();
-  turnEnd({ kind: 'error', error: { code: '429', message: '额度耗尽 quota exhausted' } });
-  await sleep(30);
-  assert.equal(submitted.filter((s) => s.text === '继续').length, 1, 'resumed once on backup');
-  // 备用模型上没有跑完（比如直接空闲/又出错）→ 探针探通切回主模型时要自动续跑
-  agent.status = 'idle';
-  ac.probeFn = async () => true;
-  await sleep(150);
-  assert.ok(!ac.fallbackActive, 'fallback exited');
-  assert.equal(submitted.filter((s) => s.text === '继续').length, 2, 'auto-continued again after switch-back');
-  assert.ok(cards.some((c) => /已自动切回/.test(c.header.title.content)
-    && /自动继续/.test(JSON.stringify(c))), 'green card reports auto-continue');
-  assert.equal(ac.interrupted.size, 0, 'interrupted list cleared');
-  ac.dispose();
+await ok('fallback: 两侧都满 → 只提示一次，不再互切（2026-09-13 定调）', async () => {
+  const h = fbHarness();
+  h.turnEnd({ kind: 'error', error: { code: '429', message: '已达到5小时的使用上限，额度耗尽' } }); // GLM→GPT
+  const appliedAfterFirst = h.applied.length;
+  // GPT 也满：报错来自接管侧（mock 更新为接管模型，与真实 driver 行为一致）
+  h.driver.currentModel = () => ({ provider: 'codex-gpt', model: 'gpt-5.6-luna' });
+  h.turnEnd({ kind: 'error', error: { code: '429', message: 'You have 0 weighted tokens left; usage limit reached' } });
+  assert.equal(h.applied.length, appliedAfterFirst, 'no ping-pong switch');
+  assert.ok(h.ac.fallbackActive, 'fallback state kept — further errors stay suppressed');
+  const both = h.cards.filter((c) => /两侧额度都在限额内/.test(c.header.title.content));
+  assert.equal(both.length, 1, 'notify exactly once');
+  h.turnEnd({ kind: 'error', error: { code: '429', message: 'usage limit reached again' } });
+  assert.equal(h.cards.filter((c) => /两侧额度都在限额内/.test(c.header.title.content)).length, 1, 'no duplicate cards');
+  assert.equal(h.ac.watchers.size, 0, 'no auto-retry scheduled while both limited');
+  h.ac.dispose();
 });
 
-await ok('fallback: exit reports running session as in-flight, NOT "finished on backup" (2026-09-09 incident)', async () => {
-  // 切回主模型时任务仍在跑（例如卡在 job_output 轮询）：跳过补发是对的
-  // （下个请求自然走主模型），但旧绿卡文案谎称「已在备用模型上跑完」，
-  // 用户两条「继续」又等不到回音 → 以为手工继续也坏了，重启桥。
-  const { ac, cards, submitted, turnEnd, agent } = fbHarness();
-  turnEnd({ kind: 'error', error: { code: '429', message: '额度耗尽 quota exhausted' } });
-  await sleep(30);
-  agent.status = 'running';   // 切回时任务仍在进行中
-  ac.probeFn = async () => true;
-  await sleep(150);
-  assert.ok(!ac.fallbackActive, 'fallback exited');
-  assert.equal(submitted.filter((s) => s.text === '继续').length, 1, 'no extra 继续 injected into a running turn');
-  const green = cards.find((c) => /已自动切回/.test(c.header.title.content));
-  assert.ok(green, 'green card present');
-  assert.match(JSON.stringify(green), /仍在进行中/, 'green card says the task is still running');
-  assert.doesNotMatch(JSON.stringify(green), /已在备用模型上跑完，无需接续/, 'must not claim it finished on backup');
-  ac.dispose();
+await ok('fallback: 接管侧成功回合后再次限额 → 换文案再提示（另一侧状态未知）', async () => {
+  const h = fbHarness();
+  h.turnEnd({ kind: 'error', error: { code: '429', message: '额度耗尽 quota exhausted' } }); // GLM→GPT
+  h.driver.currentModel = () => ({ provider: 'codex-gpt', model: 'gpt-5.6-luna' });
+  h.turnEnd({ kind: 'error', error: { code: '429', message: 'usage limit reached (额度耗尽)' } }); // 两侧都满 #1
+  h.turnEnd({ kind: 'completed' });   // GPT 窗口重置，任务跑通
+  h.turnEnd({ kind: 'error', error: { code: '429', message: 'usage limit reached (额度耗尽)' } }); // GPT 又满
+  assert.ok(h.cards.some((c) => /接管侧额度又耗尽/.test(c.header.title.content)), 're-notified with the again-variant');
+  assert.equal(h.applied.filter((x) => x.startsWith('ALL:')).length, 1, 'still no auto switch-back');
+  h.ac.dispose();
 });
 
-await ok('fallback: exit does NOT re-continue a task finished on backup', async () => {
-  const { ac, submitted, turnEnd, agent } = fbHarness();
-  turnEnd({ kind: 'error', error: { code: '429', message: '额度耗尽 quota exhausted' } });
+await ok('fallback: 用户经 /model 切回受限侧再报额度错 → 按新耗尽事件重新处理', async () => {
+  const h = fbHarness();
+  h.turnEnd({ kind: 'error', error: { code: '429', message: '已达到5小时的使用上限，额度耗尽' } }); // GLM→GPT
+  assert.ok(h.ac.fallbackActive);
+  // 用户经 /model 卡片（绕过 /glm）把会话切回 GLM，GLM 又报额度错：
+  // 旧 fallback 状态作废，按「当前模型耗尽→切另一侧」重新进一次——
+  // 这是一次新的耗尽切换，不是来回切的死循环（GPT 若也满会走两侧都满提示）。
+  h.driver.currentModel = () => ({ provider: 'glm-coding', model: 'glm-5.3' });
+  h.turnEnd({ kind: 'error', error: { code: '429', message: '已达到5小时的使用上限' } });
+  assert.ok(h.ac.fallbackActive, 're-entered by the NEW exhaustion event');
+  assert.equal(h.applied.filter((x) => x === 'ALL:codex-gpt/gpt-5.6-luna').length, 2, 'switched again (fresh exhaustion)');
+  assert.deepEqual(h.ac.limitedModel, { provider: 'glm-coding', model: 'glm-5.3' }, 'direction tracks the new failing side');
   await sleep(30);
-  turnEnd({ kind: 'completed' });   // 备用模型把任务跑完了
-  agent.status = 'idle';
-  ac.probeFn = async () => true;
-  await sleep(150);
-  assert.ok(!ac.fallbackActive, 'fallback exited');
-  assert.equal(submitted.filter((s) => s.text === '继续').length, 1,
-    'no extra 继续 after a backup-completed task');
-  ac.dispose();
+  assert.ok(h.submitted.filter((s) => s.text === '继续').length >= 1, 'task resumed');
+  h.ac.dispose();
 });
 
-await ok('fallback: backup-side quota error is tracked and continued on exit', async () => {
-  const { ac, submitted, turnEnd, agent, driver } = fbHarness();
+await ok('fallback: completed turn on takeover does not trigger anything', async () => {
+  const { ac, cards, turnEnd } = fbHarness();
   turnEnd({ kind: 'error', error: { code: '429', message: '额度耗尽 quota exhausted' } });
-  // 备用模型上也限额（currentModel 现在报备用）→ 记入中断清单
-  driver.currentModel = () => ({ provider: 'codex-gpt', model: 'gpt-5.6-luna' });
-  turnEnd({ kind: 'error', error: { code: '429', message: 'usage limit reached (额度耗尽)' } });
-  assert.equal(ac.interrupted.size, 1, 'backup-side failure tracked');
-  agent.status = 'idle';
-  ac.probeFn = async () => true;
-  await sleep(150);
-  assert.ok(!ac.fallbackActive);
-  assert.equal(submitted.filter((s) => s.text === '继续').length, 2,
-    'both-limited task auto-continued after switch-back');
+  const before = ac.lastOkAt;
+  turnEnd({ kind: 'completed' });
+  assert.ok(ac.fallbackActive, 'no auto switch-back exists to trigger');
+  assert.notEqual(ac.lastOkAt, Date.now(), 'lastOkAt anchor not polluted by takeover success');
+  assert.ok(!cards.some((c) => /已自动恢复/.test(c.header.title.content)), 'no premature success card');
   ac.dispose();
 });
 
@@ -514,60 +498,15 @@ await ok('fallback: short 429 does NOT switch; only escalated long does', () => 
 });
 
 await ok('fallback: probe success → restore snapshot + green card', async () => {
+  // 2026-09-13 起「恢复探针/自动切回」整组行为已删除：探针不存在，
+  // 恢复只能手动。此测试改为守护"没有自动还原"这条策略本身。
   const { ac, cards, applied, turnEnd } = fbHarness();
   turnEnd({ kind: 'error', error: { code: '429', message: '额度耗尽 quota exhausted' } });
-  ac.probeFn = async () => true;
-  await sleep(150); // firstMs fires the probe
-  assert.ok(!ac.fallbackActive, 'fallback exited');
-  assert.ok(applied.some((x) => x === 'glm-coding/glm-5.3'), 'sessions restored to primary');
-  assert.ok(cards.some((c) => /已自动切回/.test(c.header.title.content)), 'recovery card');
+  await sleep(150); // firstMs 早已过期，什么探针都不存在
+  assert.ok(ac.fallbackActive, 'fallback stays (no probe, no exit)');
+  assert.ok(!applied.some((x) => x === 'glm-coding/glm-5.3'), 'sessions NOT restored automatically');
+  assert.ok(!cards.some((c) => /已自动切回/.test(c.header.title.content)), 'no recovery card');
   assert.equal(ac.watchers.size, 0, 'watcher cleared');
-  ac.dispose();
-});
-
-await ok('fallback: probe still-limited → re-arm, no premature exit', async () => {
-  const { ac, turnEnd } = fbHarness();
-  turnEnd({ kind: 'error', error: { code: '429', message: '额度耗尽 quota exhausted' } });
-  ac.probeFn = async () => false;
-  await sleep(250); // first probe + one re-arm cycle
-  assert.ok(ac.fallbackActive, 'still in fallback');
-  assert.ok(ac.watchers.size === 1, 'probe watcher re-armed');
-  ac.probeFn = async () => true;
-  await sleep(200);
-  assert.ok(!ac.fallbackActive, 'recovered on later probe');
-  ac.dispose();
-});
-
-await ok('fallback: completed turn on backup is NOT a recovery signal', async () => {
-  const { ac, cards, turnEnd } = fbHarness();
-  turnEnd({ kind: 'error', error: { code: '429', message: '额度耗尽 quota exhausted' } });
-  const before = ac.lastOkAt;
-  turnEnd({ kind: 'completed' });
-  assert.ok(ac.fallbackActive, 'fallback continues');
-  assert.notEqual(ac.lastOkAt, Date.now(), 'lastOkAt anchor not polluted by backup success');
-  assert.ok(!cards.some((c) => /已自动恢复/.test(c.header.title.content)), 'no premature success card');
-  ac.dispose();
-});
-
-await ok('fallback: user message does NOT cancel the probe watcher', () => {
-  const { ac, turnEnd } = fbHarness();
-  turnEnd({ kind: 'error', error: { code: '429', message: '额度耗尽 quota exhausted' } });
-  ac.cancelForChat('chat-1');
-  assert.equal(ac.watchers.size, 1, 'probe watcher survives user messages');
-  ac.dispose();
-});
-
-await ok('fallback: backup-side error → one diagnostic card, no re-scheduling', () => {
-  const { ac, cards, turnEnd } = fbHarness();
-  turnEnd({ kind: 'error', error: { code: '429', message: '额度耗尽 quota exhausted' } });
-  const watchersBefore = ac.watchers.size;
-  // 备用模型上的会话报错（currentModel mock 返回 backup → fromBackup=true）
-  const { driver } = { driver: null };
-  turnEnd({ kind: 'error', error: { code: '429', message: 'usage limit reached' } });
-  turnEnd({ kind: 'error', error: { code: '429', message: 'usage limit reached' } });
-  assert.equal(ac.watchers.size, watchersBefore, 'no new watchers for backup-side errors');
-  const diag = cards.filter((c) => /备用模型也受限|备用模型侧出错/.test(c.header.title.content));
-  assert.equal(diag.length, 1, 'diagnostic card exactly once');
   ac.dispose();
 });
 

@@ -11,30 +11,29 @@
  *        就按 pollMs 轮询；到点自动补发一条「继续」（可配置）；
  *      · 瞬时限流类（429 / rate limit / 上游负载 / try again in Ns）
  *        → 短退避：30s 起指数退避重试，shortMax 次后**升级为长等待**；
- *  - **限额自动换模型（fallback）**：配置了 fallbackBackup 且处于自动模式时，
- *    判定窗口打满（首次 long）不再傻等 ——
- *      ① 快照所有 live 会话当前模型；
- *      ② 全部切到备用模型（如 codex-gpt/gpt-5.6-luna）并设 driver.defaultOverride
- *         （fallback 期间新建/resume 的会话也走备用模型，不再踩已限额的主模型）；
- *      ③ 对被打断的会话立即补发「继续」—— 原任务无缝换脑续跑。注意
+ *  - **限额自动换模型（fallback，双向·不回切）**：配置了 fallbackPrimary +
+ *    fallbackBackup 时，判定窗口打满（首次 long）不再傻等 —— 方向由
+ *    **实际报错的模型**决定（GPT 满 → 切 GLM；GLM 满 → 切 GPT）：
+ *      ① 全部 live 会话切到另一侧，并设 driver.defaultOverride（fallback
+ *         期间新建/resume 的会话也走接管模型，不再踩已限额的一侧）；
+ *      ② 对被打断的会话立即补发「继续」—— 原任务无缝换脑续跑。注意
  *         turn/end 是在 session.append() 里同步分发的，此刻 agent 的 phase
  *         还停在 'running'（kick() 的 finally 稍后才置回 idle），所以这里
  *         绝不能按 status==='idle' 判断（2026-09-08 两次「切了模型却没
  *         自动继续」事故的根因）；driver.submit 对 running 走 steer（置
  *         wakeRequested，驱动循环收尾时自动重开，下一回合走已切换的模型），
  *         对 idle 走 followup，两条路都能接上。
- *      ④ watcher 保留，但到点的动作从「dsh 试跑」改为「curl 主模型探针」
- *         （会话在备用模型上干活，不能再靠它探主模型）；
- *      ⑤ 探针 200 → 还原快照/回主模型，并且把额度中断过、还没在备用模型
- *         上跑完的会话自动补发「继续」（切回 GLM 同样免人工）；
- *         备用模型上已完成的任务不硬塞继续。
- *    备用模型自己出错/限额：只发一次诊断卡（两边都受限，等主模型恢复），
- *    出错的会话记入中断清单，探针探通切回时一并自动续跑。
- *  - **手动偏好模式**：/gpt /glm 快切（调试用）。手动选择决定常态模型，
- *    但不关闭额度安全网；当前模型耗尽时仍自动切到另一侧并探测恢复。
- *  - 期间用户在本聊天发任何消息 → 取消该会话的纯等待 watcher（fallback
- *    探针不取消：它只打探针，不向会话注入消息，与新消息互不干扰）；
+ *      ③ **不自动切回**（2026-09-13 用户定调）：额度恢复不是切换条件——
+ *         只要接管侧没满，就留在接管侧干活；想换回手动 /gpt /glm。
+ *         恢复探针/快照还原整套已删除，不再有探针 watcher。
+ *      ④ 接管侧也限额（两侧都满）：**不切来切去**，只提示一次；之后
+ *         等用户在额度恢复后发消息接续（当前侧恢复即可干活）或手动切换。
+ *  - **手动偏好模式**：/gpt /glm 快切。手动选择决定常态模型，但不关闭
+ *    额度安全网；当前模型耗尽时仍自动切到另一侧保底。
+ *  - 期间用户在本聊天发任何消息 → 取消该会话的纯等待 watcher；
  *  - 超过 maxMs 仍失败 → 放弃并通知（保留最后一次错误）。
+ *  - 启动/新建会话默认模型 = settings 的 agent-default-model（GLM），
+ *    fallback 只在额度耗尽那一刻临时改写 default。
  *
  * 刻意不做的事：跨进程持久化等待状态（桥重启后等待即失效，用户重发
  * 一条消息即可，与手动模式一致）；对非本桥绑定会话的 session 动作。
@@ -62,7 +61,7 @@ const LONG_PATTERNS = [
   // AUTH:401 {"message":"Not authenticated. Please login first at /","code":"invalid_api_key"}
   // —— 2026-09-12 用户报告：该 401 被 classifyFailure 判为"非额度错误"直接放弃，
   // GPT 侧永远不触发 fallback，只剩一张 API 错误卡。凭据/登录类中断必须按
-  // 窗口类处理：切到另一侧继续干活 + 探针探测该侧恢复（代理重新登录后探通）。
+  // 窗口类处理：切到另一侧继续干活（想回 GPT 时手动切换）。
   /not authenticated/i,
   /please login first/i,
   /invalid_api_key/,
@@ -147,22 +146,16 @@ export class AutoContinue {
     // ---- 限额自动换模型状态 ----
     /** 'auto' | 'manual'（手动选择常态模型；两者都保留额度安全网）。 */
     this.mode = 'auto';
-    /** true = 已切到备用模型，watcher 到点跑主模型探针。 */
+    /** true = 已因额度耗尽切到另一侧（不自动切回，直到手动 /gpt /glm /auto）。 */
     this.fallbackActive = false;
-    /** 切换前各会话模型快照 sessionId → {provider,model}（恢复时还原）。 */
-    this.snapshots = new Map();
-    /** 额度中断现场 sessionId → { chatId, doneOnBackup }：切回主模型时对
-     *  未完成的自动补发「继续」（doneOnBackup=true 的除外，别硬塞）。 */
-    this.interrupted = new Map();
-    /** 备用模型侧出错只提示一次。 */
-    this.backupErrorNotified = false;
-    /** 当前因限额离开的模型、临时接管模型及对应恢复探针。自动切换必须
-     * 由实际报错模型决定方向，不能永远假设 primary(GLM) 报错。 */
+    /** 接管侧出错/两侧都满只提示一次（接管侧成功回合后重置，可再次提示）。 */
+    this.takeoverErrorNotified = false;
+    /** fallback 期间接管侧是否成功跑通过回合（区分「两侧都满」与「又满了」文案）。 */
+    this.takeoverSucceeded = false;
+    /** 当前因限额离开的模型与接管模型。自动切换必须由实际报错模型决定
+     *  方向，不能永远假设 primary(GLM) 报错。 */
     this.limitedModel = null;
     this.takeoverModel = null;
-    this.recoveryProbe = null;
-    /** 探针注入点（离线测试用）：async () => boolean。 */
-    this.probeFn = null;
   }
 
   /** 主/备模型对（配置了才可用）。 */
@@ -172,15 +165,23 @@ export class AutoContinue {
   #current(sessionId) {
     try { return this.driver.currentModel(this.driver.live.get(sessionId)?.agent); } catch { return null; }
   }
-  /** Resolve failover from the model that actually produced the quota error.
-   * primary→backup preserves the original behavior; backup→primary is the
-   * missing reverse path that made automatic GPT exhaustion fail while /glm worked. */
+  /** 由实际报错的模型决定切换方向（双向）：GLM 满→切 GPT；GPT 满→切 GLM。
+   *  报错模型不在配置对内（第三方模型）→ null（维持纯等待老行为）。 */
   #routeFor(sessionId) {
     const primary = this.#primary(); const backup = this.#backup(); const current = this.#current(sessionId);
     if (!primary || !backup || !current) return null;
-    if (this.#same(current, primary)) return { limited: primary, takeover: backup, probe: this.config.fallbackProbe };
-    if (this.#same(current, backup)) return { limited: backup, takeover: primary, probe: this.config.fallbackBackupProbe };
+    if (this.#same(current, primary)) return { limited: primary, takeover: backup };
+    if (this.#same(current, backup)) return { limited: backup, takeover: primary };
     return null;
+  }
+
+  /** 清空 fallback 状态（手动切换/用户主动回到受限侧时调用）。 */
+  #clearFallbackState() {
+    this.fallbackActive = false;
+    this.limitedModel = null;
+    this.takeoverModel = null;
+    this.takeoverErrorNotified = false;
+    this.takeoverSucceeded = false;
   }
 
   /** index.js 的 session/event 钩子转发进来（外层已有 try/catch）。 */
@@ -196,31 +197,29 @@ export class AutoContinue {
 
     if (reason?.kind !== 'error') {
       if (reason?.kind === 'completed') {
-        // fallback 期间的成功来自备用模型：不是主模型恢复信号，不 finish、
-        // 也不刷新 lastOkAt（它是主模型窗口恢复点推算的锚，被备用模型
-        // 的成功污染会让推算失真）。
-        if (!this.fallbackActive) {
-          this.lastOkAt = Date.now();
-          if (this.watchers.has(sessionId)) this.#finish(sessionId, chatId);
-        } else if (this.interrupted.has(sessionId)) {
-          // 备用模型把被打断的任务跑完了：切回主模型时不再补发「继续」。
-          this.interrupted.get(sessionId).doneOnBackup = true;
+        if (this.fallbackActive) {
+          // 接管侧的成功不是恢复信号（本来就不回切），但证明该侧当前可用：
+          // 重置一次性提示旗，若之后再限额可以再次告知用户。
+          this.takeoverErrorNotified = false;
+          this.takeoverSucceeded = true;
+          return;
         }
+        this.lastOkAt = Date.now();
+        if (this.watchers.has(sessionId)) this.#finish(sessionId, chatId);
       }
       return;
     }
 
     const message = [reason.error?.code, reason.error?.message].filter(Boolean).join(': ');
 
-    // fallback 进行中：会话在备用模型上跑，这里的错误是备用侧的。
-    // 不重新调度等待（主模型探针已在跑），只提示一次。
+    // fallback 进行中：错误出自接管侧（或用户手动切回的模型），交给
+    // 接管侧错误处理（两侧都满 → 只提示，不切来切去）。
     if (this.fallbackActive) {
-      this.#onBackupSideError(sessionId, chatId, message);
+      this.#onTakeoverSideError(sessionId, chatId, message);
       return;
     }
-    // 手动模式只表示“把当前模型作为用户偏好”，不能关闭额度安全网。
-    // 旧实现这里直接 return，导致用户手动 /gpt 后GPT窗口耗尽只显示API错误，
-    // 而 /glm 手动切换仍可用——正是反向fallback失效的现场。
+    // 手动偏好模式只表示「把当前模型作为用户偏好」，不能关闭额度安全网
+    // （2026-09-12 事故：/gpt 后 GPT 耗尽只剩 API 错误卡，手动 /glm 却可用）。
     const kind = classifyFailure(message, cfg.autoContinuePatterns ?? []);
     if (!kind) {
       // 与额度无关的失败：若此前在等待，就此打住（配置问题不该傻等 5 小时）
@@ -230,46 +229,54 @@ export class AutoContinue {
     this.#schedule(sessionId, chatId, kind, message);
   }
 
-  /** fallback 中备用模型侧的回合错误：诊断卡一次，不重调度。 */
-  #onBackupSideError(sessionId, chatId, message) {
-    const backup = this.takeoverModel ?? this.#backup();
+  /** fallback 中接管侧的回合错误。两侧都满 → 只提示一次，**不切来切去**
+   *  （2026-09-13 用户定调）；非额度错误同样只提示一次。用户若已手动把
+   *  会话切回受限侧（cur===limited），视为主动选择：清掉 fallback 状态，
+   *  按全新错误重新分类处理。 */
+  #onTakeoverSideError(sessionId, chatId, message) {
     const cur = this.#current(sessionId);
-    // 只有错误确实出自备用模型上的会话才算「两边都受限」——fallback 刚切入
-    // 时主模型上在途请求的尾巴错误不算。
-    const fromBackup = backup && cur?.provider === backup.provider && cur?.model === backup.model;
-    // 备用模型上被限/出错的会话记入中断清单：探针探通、切回主模型时
-    // 一并自动补发「继续」（两边都受限期间任务挂起，不能就此丢下）。
-    if (fromBackup && classifyFailure(message) && !this.interrupted.has(sessionId)) {
-      this.interrupted.set(sessionId, { chatId, doneOnBackup: false });
+    if (cur && this.limitedModel && cur.provider === this.limitedModel.provider && cur.model === this.limitedModel.model) {
+      // 用户手动回到了受限侧：fallback 状态作废，重新分类（等待/再切换由事件定）
+      this.#clearFallbackState();
+      const kind = classifyFailure(message, this.config.autoContinuePatterns ?? []);
+      if (kind) this.#schedule(sessionId, chatId, kind, message);
+      return;
     }
-    if (!this.backupErrorNotified) {
-      this.backupErrorNotified = true;
-      const backupText = String(message);
-      const missingCredential = /MISSING_CREDENTIAL|no credential|API.?KEY.*not set|not configured/i.test(backupText);
-      const proxyLoggedOut = /not authenticated|please login first|invalid_api_key/i.test(backupText);
-      const backupTitle = missingCredential ? '❌ GPT备用通道未配置凭据'
-        : proxyLoggedOut ? '⚠️ GPT备用通道未登录'
-        : (fromBackup ? '⚠️ 备用模型也受限' : '⚠️ 备用模型侧出错');
-      this.#send(chatId, buildInfoCard(backupTitle, [
-        missingCredential
-          ? '主模型已切换到GPT备用通道，但备用通道凭据缺失或未注入；这不是GPT额度耗尽。已保留主模型恢复探测。'
-          : proxyLoggedOut
-            ? 'GPT备用通道的 codex-proxy 会话未登录（Not authenticated / 请先登录）——多为GPT额度窗口耗尽或代理登录过期，不是桥的配置问题。请在 codex-proxy 首页重新登录；桥保持探测，探通即自动切换/还原。'
-            : fromBackup
-              ? '主模型额度窗口耗尽且备用模型也报错——两边订阅可能都在限额内，桥继续探测主模型恢复，探通即自动切回并继续。'
-              : 'fallback 期间备用模型回合出错，桥继续探测主模型恢复。',
-        '', '可用 /glm 手动切回主模型，或稍后再试。', '',
-        `\`\`\`\n${String(message).slice(0, 300)}\n\`\`\``,
-      ].join('\n'), { template: 'grey' }));
-      log.warn(`fallback backup-side error for ${sessionId}: ${String(message).slice(0, 200)}`);
-    }
+    if (this.takeoverErrorNotified) return;   // 只提示一次，避免错误风暴刷卡
+    this.takeoverErrorNotified = true;
+    const takeover = this.takeoverModel ?? this.#backup();
+    const fromTakeover = !!takeover && cur?.provider === takeover.provider && cur?.model === takeover.model;
+    const quotaHit = !!classifyFailure(message);
+    const againAfterSuccess = fromTakeover && quotaHit && this.takeoverSucceeded;
+    const text = String(message);
+    const missingCredential = /MISSING_CREDENTIAL|no credential|API.?KEY.*not set|not configured/i.test(text);
+    const proxyLoggedOut = /not authenticated|please login first|invalid_api_key/i.test(text);
+    const title = missingCredential ? '❌ GPT备用通道未配置凭据'
+      : proxyLoggedOut ? '⚠️ GPT备用通道未登录'
+      : againAfterSuccess ? '⏹ 接管侧额度又耗尽'
+      : (fromTakeover && quotaHit) ? '⏹ 两侧额度都在限额内，自动切换已暂停'
+      : '⚠️ 接管模型侧出错';
+    const limitedName = `${this.limitedModel?.provider ?? '?'}/${this.limitedModel?.model ?? '?'}`;
+    const takeoverName = `${takeover?.provider ?? '?'}/${takeover?.model ?? '?'}`;
+    const body = missingCredential
+      ? `已切换到GPT备用通道，但该通道凭据缺失或未注入；这不是GPT额度耗尽。请检查 CODEX_PROXY_API_KEY。`
+      : proxyLoggedOut
+        ? `GPT备用通道的 codex-proxy 会话未登录（Not authenticated / 请先登录）——多为GPT额度窗口耗尽或代理登录过期，不是桥的配置问题。请在 codex-proxy 首页重新登录后再手动 \`/gpt\` 切换。`
+        : againAfterSuccess
+          ? `接管侧 **${takeoverName}** 窗口再次打满。桥不自动切回；另一侧 **${limitedName}** 若已恢复可手动 \`/glm\` \`/gpt\` 切换，否则等窗口重置后直接发消息接续。`
+          : (fromTakeover && quotaHit)
+            ? `**${limitedName}** 与 **${takeoverName}** 的额度窗口都在限额内。桥**不再来回切换**（避免空转）；等任一侧窗口重置后直接发消息即可接续（当前停在 ${takeoverName}），也可手动 \`/gpt\` \`/glm\` 切换。`
+            : `fallback 期间接管模型回合出错；桥保持现状，不做自动动作。`;
+    this.#send(chatId, buildInfoCard(title, [
+      body, '', `\`\`\`\n${String(message).slice(0, 300)}\n\`\`\``,
+    ].join('\n'), { template: 'grey' }));
+    log.warn(`fallback takeover-side error for ${sessionId}: ${String(message).slice(0, 200)}`);
   }
 
-  /** 用户在聊天里发了新消息 → 取消该会话的自动等待（fallback 探针除外：
-   *  它只打主模型探针、不向会话注入消息，与新消息互不干扰）。 */
+  /** 用户在聊天里发了新消息 → 取消该会话的自动等待（用户接管优先）。 */
   cancelForChat(chatId) {
     for (const [sessionId, w] of this.watchers) {
-      if (w.chatId === chatId && !this.fallbackActive) {
+      if (w.chatId === chatId) {
         this.#clearTimer(sessionId);
         this.watchers.delete(sessionId);
         log.info(`auto-continue cancelled for ${sessionId} (user spoke in chat)`);
@@ -280,7 +287,6 @@ export class AutoContinue {
   dispose() {
     for (const sessionId of [...this.watchers.keys()]) this.#clearTimer(sessionId);
     this.watchers.clear();
-    this.interrupted.clear();
   }
 
   #clearTimer(sessionId) {
@@ -333,8 +339,8 @@ export class AutoContinue {
     }
 
     // —— 限额自动换模型：首次判定窗口打满（long）即切入，原任务换脑续跑。
-    //    时间调度照常走（#fire 在 fallback 态改跑主模型探针）。
-    if (kind === 'long') this.#maybeEnterFallback(sessionId, chatId, message);
+    //    切换成功后不再安排等待 watcher（任务已立即续跑；回切只能手动）。
+    if (kind === 'long' && this.#maybeEnterFallback(sessionId, chatId, message)) return;
 
     // —— 计算下一次尝试时间
     let delayMs;
@@ -394,45 +400,32 @@ export class AutoContinue {
 
   // ---------------------------------------------------------- fallback ----
 
-  /** 首次 long（窗口打满判定）→ 切备用模型。幂等：只进一次。 */
+  /** 首次 long（窗口打满判定）→ 切到另一侧。幂等：只进一次。
+   *  返回 true = 已切换（调用方不再安排等待 watcher）。 */
   #maybeEnterFallback(sessionId, chatId, message) {
-    if (this.fallbackActive) return;                 // 已在 fallback
+    if (this.fallbackActive) return true;             // 已在 fallback，视作已处理
     const route = this.#routeFor(sessionId);
     if (!route) {
       log.warn(`fallback: quota source is not a configured primary/backup model — staying in wait mode`);
-      return;
+      return false;
     }
-    const { limited, takeover, probe } = route;
-    if (!probe?.url || !probe?.apiKeyEnv || !process.env[probe.apiKeyEnv]) {
-      log.warn(`fallback: recovery probe for ${limited.provider}/${limited.model} misconfigured or ${probe?.apiKeyEnv} missing — staying in wait mode`);
-      return;                                        // 探针不可用 → 不切（否则切过去探不回）
-    }
+    const { limited, takeover } = route;
 
     this.fallbackActive = true;
-    this.backupErrorNotified = false;
+    this.takeoverErrorNotified = false;
     this.limitedModel = { ...limited };
     this.takeoverModel = { ...takeover };
-    this.recoveryProbe = { ...probe };
 
-    // ① 快照故障发生瞬间所有live会话的实际模型。必须覆盖手动切换时留下的
-    //    旧快照：用户先/gpt后GPT耗尽，恢复探通时应还原GPT偏好，而不是更早的GLM。
-    this.snapshots.clear();
-    for (const [id, entry] of this.driver.live) {
-      try {
-        const cur = this.driver.currentModel(entry.agent);
-        if (cur) this.snapshots.set(id, { ...cur });
-      } catch {}
-    }
-    // ② 全量切换 + 新会话默认也走备用模型
+    // ① 全量切换 + 新会话默认也走接管模型
     const skipped = this.driver.applyModelToAll(takeover.provider, takeover.model);
     this.driver.defaultOverride = { ...takeover };
 
-    // ③ 原任务在备用模型上立即续跑。
+    // ② 原任务在接管模型上立即续跑。
     //    turn/end 在 session.append() 里同步分发，此刻 agent 的 phase 还停在
     //    'running'（kick() 的 finally 稍后才置回 idle）——按 status==='idle'
     //    判断永远不成立，导致「切了模型却没自动继续」（2026-09-08 事故①）。
     //    driver.submit：running→steer（置 wakeRequested，驱动循环收尾时自动
-    //    重开，下一回合走已切换的备用模型）；idle→followup。两条路都能接上，
+    //    重开，下一回合走已切换的模型）；idle→followup。两条路都能接上，
     //    故不再看 status。
     //    但 steer/followup → inbox.splice 自身要 session.append('agent/inbox/
     //    spliced')——外层 turn/end 的 append 尚未返回，dsh-session 的重入锁
@@ -444,13 +437,13 @@ export class AutoContinue {
     if (entry?.agent) {
       const resumeText = this.config.autoContinueMessage ?? '继续';
       const tryResume = (left) => {
-        if (!this.fallbackActive) return;   // 探针已切回/手动退出，别重复续跑
+        if (!this.fallbackActive) return;   // 手动切换抢先了，别重复续跑
         try {
           this.driver.submit(entry.agent, resumeText);
         } catch (e) {
           if (left > 0) { setTimeout(() => tryResume(left - 1), 250); return; }
           log.warn(`fallback resume submit failed for ${sessionId}: ${e.message}`);
-          this.#send(chatId, buildInfoCard('⚠️ 备用模型已切换，但自动续跑失败', [
+          this.#send(chatId, buildInfoCard('⚠️ 模型已切换，但自动续跑失败', [
             `模型已切到 **${takeover.provider}/${takeover.model}**，但给被打断的任务补发「继续」未成功。`,
             '', '请手动发一条「继续」接续任务。', '',
             `\`\`\`\n${String(e.message).slice(0, 200)}\n\`\`\``,
@@ -459,97 +452,18 @@ export class AutoContinue {
       };
       setTimeout(() => tryResume(8), 0);
     }
-    this.interrupted.set(sessionId, { chatId, doneOnBackup: false });
 
-    // ④ 橙卡告知（续跑结果是异步的，成败由后续行为/灰卡体现，不在此预支）
+    // ③ 橙卡告知（续跑结果是异步的，成败由后续行为/灰卡体现，不在此预支）
     this.#send(chatId, buildInfoCard('🔄 额度窗口打满，已切换可用模型', [
       `**${limited.provider}/${limited.model}** 额度窗口耗尽，已把会话切到 **${takeover.provider}/${takeover.model}** 接续干活，被打断的任务将自动继续。`,
       '',
-      `桥同时开始探测 ${limited.provider}/${limited.model} 恢复，探通即还原切换前模型（无需手动）。手动调试：\`/gpt\` \`/glm\` \`/auto\`。`,
+      `额度恢复后**不会自动切回**（避免来回折腾）；需要换回时手动 \`/gpt\` \`/glm\`。若两侧都在限额内，桥会提示并停止切换。`,
       '',
       `\`\`\`\n${String(message).slice(0, 300)}\n\`\`\``,
     ].join('\n'), { template: 'orange' }));
     log.info(`fallback entered: limited=${limited.provider}/${limited.model}, all sessions -> ${takeover.provider}/${takeover.model}`
       + `${skipped.length ? ` (skipped: ${skipped.join(',')})` : ''}`);
-  }
-
-  /** 主模型恢复探针：1-token 最小请求（同 key 同窗口，消耗可忽略）。
-   *  this.probeFn 可注入覆盖（离线测试用，不打真网络）。 */
-  async #probePrimary() {
-    if (typeof this.probeFn === 'function') return await this.probeFn();
-    const p = this.recoveryProbe ?? this.config.fallbackProbe;
-    const key = process.env[p.apiKeyEnv];
-    if (!key) return false;
-    try {
-      const resp = await fetch(p.url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
-        body: JSON.stringify({
-          model: p.model,
-          messages: [{ role: 'user', content: 'ping' }],
-          max_tokens: 1,
-          stream: false,
-        }),
-        signal: AbortSignal.timeout(20_000),
-      });
-      return resp.ok; // 200 = 窗口恢复；429/5xx = 仍受限
-    } catch {
-      return false;  // 网络错误/超时 → 当作未恢复，下轮再探
-    }
-  }
-
-  /** fallback 退出：还原快照（无快照的 live 会话回主模型）+ 自动续跑中断
-   *  过且未在备用模型上跑完的任务 + 绿卡。 */
-  #exitFallback(chatId) {
-    const recovered = this.limitedModel ?? this.#primary() ?? parsePair('glm-coding/glm-5.3');
-    this.fallbackActive = false;
-    this.driver.defaultOverride = null;
-    let restored = 0;
-    for (const [id, entry] of this.driver.live) {
-      const target = this.snapshots.get(id) ?? recovered;
-      try {
-        this.driver.setModel(entry.agent, target.provider, target.model);
-        restored++;
-      } catch {}
-    }
-    this.snapshots.clear();
-    // 额度中断过、备用模型上没跑完的会话：模型已还原，自动补发「继续」。
-    // 三种结局分开播报——running 的会话跳过续跑（下个请求自然走主模型），
-    // 但必须如实告知「仍在进行中」，不能谎报「已在备用模型上跑完」
-    // （2026-09-09 12:07 事故③：绿卡说跑完了，任务其实在 job_output 轮询
-    //  里，用户两条「继续」又等不到回音，被迫重启桥）。
-    let recontinued = 0;
-    let inFlight = 0;            // 仍在跑的回合：下个请求自动走已还原的主模型
-    let finishedOnBackup = 0;
-    const failed = [];
-    for (const [id, info] of this.interrupted) {
-      const entry = this.driver.live.get(id);
-      if (!entry?.agent) { failed.push(id); continue; }
-      if (info.doneOnBackup) { finishedOnBackup++; continue; } // 备用上已完成，不硬塞继续
-      try {
-        if (entry.agent.status === 'running') { inFlight++; continue; }
-        this.driver.submit(entry.agent, this.config.autoContinueMessage ?? '继续');
-        recontinued++;
-      } catch { failed.push(id); }
-    }
-    this.interrupted.clear();
-    this.limitedModel = null;
-    this.takeoverModel = null;
-    this.recoveryProbe = null;
-    this.#clearAllWatchers();
-    this.#send(chatId, buildInfoCard('✅ 主模型已恢复，已自动切回', [
-      `${recovered.provider}/${recovered.model} 额度窗口已重置：${restored} 个会话已切回原模型（快照还原）。`,
-      ...[
-        recontinued > 0 ? `被打断的任务已自动继续（${recontinued} 个），无需人工发「继续」。` : '',
-        inFlight > 0 ? `${inFlight} 个会话的任务仍在进行中，其下一个请求自动走主模型（正在等的长工具调用可能还需 1-2 分钟）。` : '',
-        finishedOnBackup > 0 ? `${finishedOnBackup} 个任务已在备用模型上跑完。` : '',
-      ].filter(Boolean),
-      ...(failed.length ? ['', `以下会话自动续跑失败，可手动发「继续」：${failed.join('、')}`] : []),
-    ].join('\n'), { template: 'green' }));
-    log.info(`fallback exited: primary recovered, sessions restored=${restored}, recontinued=${recontinued}`
-      + (inFlight ? `, inFlight=${inFlight}` : '')
-      + (finishedOnBackup ? `, finishedOnBackup=${finishedOnBackup}` : '')
-      + (failed.length ? `, failed=${failed.length}` : ''));
+    return true;
   }
 
   // ------------------------------------------------------------ manual ----
@@ -563,28 +477,17 @@ export class AutoContinue {
       if (!pair) {
         return { ok: false, text: `fallback${target === 'gpt' ? 'Backup' : 'Primary'} 未配置（config.json）` };
       }
-      // 停探针/等待，进手动模式（用户接管：中断清单一并清空，切回时不再自动续跑）
+      // 停等待 watcher，退出 fallback 状态（手动接管是用户明确意志）
       this.#clearAllWatchers();
-      this.interrupted.clear();
-      if (this.snapshots.size === 0) {
-        for (const [id, entry] of this.driver.live) {
-          try {
-            const cur = this.driver.currentModel(entry.agent);
-            if (cur) this.snapshots.set(id, { ...cur });
-          } catch {}
-        }
-      }
+      this.#clearFallbackState();
       if (target === 'gpt') {
         this.mode = 'manual';
-        this.fallbackActive = false;
         this.driver.defaultOverride = { ...pair };
         this.driver.applyModelToAll(pair.provider, pair.model);
         return { ok: true, text: `已切到 ${pair.provider}/${pair.model}（手动偏好模式；额度耗尽时仍会自动切到另一侧保底）。\n下回合起生效。/glm 切回 · /auto 恢复默认自动策略` };
       }
       // /glm：切回主模型并恢复自动
       this.mode = 'auto';
-      this.fallbackActive = false;
-      this.snapshots.clear();
       this.driver.defaultOverride = null;
       this.driver.applyModelToAll(pair.provider, pair.model);
       return { ok: true, text: `已切回 ${pair.provider}/${pair.model}，自动切换已恢复。` };
@@ -592,8 +495,8 @@ export class AutoContinue {
     if (target === 'auto') {
       this.mode = 'auto';
       this.#clearAllWatchers();
-      this.interrupted.clear();
-      return { ok: true, text: '已恢复自动切换（当前模型保持不变；下次限额事件会自动 fallback）。' };
+      this.#clearFallbackState();
+      return { ok: true, text: '已恢复自动切换（当前模型保持不变；下次额度耗尽会自动切到另一侧）。' };
     }
     return { ok: false, text: '用法：/gpt · /glm · /auto' };
   }
@@ -603,45 +506,22 @@ export class AutoContinue {
     const backup = this.#backup();
     const primary = this.#primary();
     if (!backup || !primary) return '模型切换：未配置（fallback 关闭）';
+    if (this.fallbackActive) {
+      const t = this.takeoverModel ?? backup;
+      const l = this.limitedModel ?? primary;
+      return `模型切换：**额度耗尽已切换**（${t.provider}/${t.model} 接管，${l.provider}/${l.model} 限额；不自动切回，手动 /gpt /glm）`;
+    }
     if (this.mode === 'manual') return `模型切换：**手动偏好**（额度安全网仍启用；/auto 恢复默认自动策略）`;
-    if (this.fallbackActive) return `模型切换：**限额 fallback 中**（${this.takeoverModel?.provider ?? backup.provider}/${this.takeoverModel?.model ?? backup.model} 接管，探针探测 ${this.limitedModel?.provider ?? primary.provider}/${this.limitedModel?.model ?? primary.model} 恢复中）`;
-    return `模型切换：自动（主 ${primary.provider}/${primary.model} ↔ 备 ${backup.provider}/${backup.model}）`;
+    return `模型切换：自动双向（任一侧额度耗尽 → 切另一侧续跑，不自动切回；默认 ${primary.provider}/${primary.model}）`;
   }
 
   // ------------------------------------------------------------- timer ----
 
-  /** 到点：fallback 态打主模型探针；否则补发继续消息（用户若已接管/会话
-   *  已不在，安静退出）。 */
+  /** 到点：补发继续消息（用户若已接管/会话已不在，安静退出）。 */
   async #fire(sessionId) {
     const w = this.watchers.get(sessionId);
     if (!w) return;
     w.timer = null;
-
-    if (this.fallbackActive) {
-      // —— 探针模式：主模型 1-token 探测，200 即切回 ——
-      const ok = await this.#probePrimary();
-      if (!this.fallbackActive) return;   // 探针期间被手动退出了
-      if (ok) {
-        this.#exitFallback(w.chatId);
-        return;
-      }
-      w.attempts++;
-      const cfg = this.config;
-      // maxMs 放弃：不再探，停 fallback 但保持备用模型（别把用户从能用的
-      // 模型上切回仍受限的），通知手动处理。
-      if (Date.now() - w.firstAt > (cfg.autoContinueMaxMs ?? 6 * 3_600_000)) {
-        this.#clearAllWatchers();
-        this.#send(w.chatId, buildInfoCard('⏹ 恢复探测已放弃', [
-          `超过 ${Math.round((cfg.autoContinueMaxMs ?? 6 * 3_600_000) / 3_600_000)} 小时主模型仍未恢复，探测停止（会话保持在备用模型上可用）。`,
-          '', '主模型恢复后手动 /glm 切回，或 /auto 恢复自动。',
-        ].join('\n'), { template: 'grey' }));
-        log.warn('fallback probe gave up after max wait');
-        return;
-      }
-      w.timer = setTimeout(() => this.#fire(sessionId), cfg.autoContinuePollMs ?? 10 * 60_000);
-      log.info(`fallback probe #${w.attempts} still limited`);
-      return;
-    }
 
     const entry = this.driver.live.get(sessionId);
     const agent = entry?.agent;
