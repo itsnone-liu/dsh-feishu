@@ -478,20 +478,83 @@ await ok('fallback: backup-side error → one diagnostic card, no re-scheduling'
   ac.dispose();
 });
 
-await ok('manual: /gpt switches + suppresses automation; /glm restores auto', () => {
-  const { ac, applied, turnEnd } = fbHarness();
+await ok('manual: /gpt switches + suppresses automation; /glm restores auto', async () => {
+  const { ac, applied, driver, turnEnd } = fbHarness();
   const r1 = ac.manualSwitch('gpt');
   assert.ok(r1.ok);
   assert.equal(ac.mode, 'manual');
   assert.ok(applied.some((x) => x === 'ALL:codex-gpt/gpt-5.6-luna'));
-  // manual 下 quota 错误完全静默
+  // manual + 会话仍在主模型侧（mock 未跟着切）→ quota 错误保持静默：
+  // 新语义下手动模式只对「备用侧」的额度耗尽动作（规则5）。
+  driver.currentModel = () => ({ provider: 'glm-coding', model: 'glm-5.3' });
   turnEnd({ kind: 'error', error: { code: '429', message: '额度耗尽 quota exhausted' } });
-  assert.equal(ac.watchers.size, 0, 'no auto behavior in manual mode');
+  await sleep(40);
+  assert.equal(ac.watchers.size, 0, 'no auto behavior for primary-side errors in manual mode');
   assert.ok(!ac.fallbackActive);
   const r2 = ac.manualSwitch('glm');
   assert.ok(r2.ok);
   assert.equal(ac.mode, 'auto');
   assert.ok(applied.some((x) => x === 'ALL:glm-coding/glm-5.3'));
+  ac.dispose();
+});
+
+await ok('manual rule5: backup-side quota error + GLM ok → auto switch back + resume (2026-09-13 incident)', async () => {
+  const { ac, cards, submitted, applied, driver, turnEnd } = fbHarness();
+  ac.manualSwitch('gpt');
+  driver.currentModel = () => ({ provider: 'codex-gpt', model: 'gpt-6-astra' });
+  ac.probeFn = async () => true;    // GLM 有额度
+  applied.length = 0;
+  turnEnd({ kind: 'error', error: { code: '429', message: 'usage_limit_reached: The usage limit has been reached' } });
+  await sleep(60);
+  assert.equal(ac.mode, 'auto', 'rejoined auto state machine');
+  assert.ok(!ac.fallbackActive);
+  assert.equal(driver.defaultOverride, null, 'override cleared');
+  assert.ok(applied.some((x) => x === 'glm-coding/glm-5.3'), 'sessions restored to primary');
+  assert.ok(submitted.some((s) => s.text === '继续'), 'interrupted task auto-resumed on GLM');
+  assert.ok(cards.some((c) => /已自动切回GLM/.test(c.header.title.content)), 'switch-back card');
+  ac.dispose();
+});
+
+await ok('manual rule4: backup quota + GLM also limited → dual-limit wait, then auto switch back on recovery', async () => {
+  const { ac, cards, submitted, turnEnd, driver } = fbHarness();
+  ac.manualSwitch('gpt');
+  driver.currentModel = () => ({ provider: 'codex-gpt', model: 'gpt-5.6-luna' });
+  ac.probeFn = async () => false;   // GLM 也受限
+  turnEnd({ kind: 'error', error: { code: '429', message: 'usage_limit_reached: usage limit reached' } });
+  await sleep(40);
+  assert.equal(ac.mode, 'auto');
+  assert.ok(ac.fallbackActive, 'dual-limit fallback wait entered');
+  assert.equal(ac.watchers.size, 1, 'probe watcher armed');
+  assert.equal(ac.interrupted.size, 1, 'interrupted task tracked');
+  assert.ok(cards.some((c) => /双方额度窗口都已打满/.test(c.header.title.content)), 'dual-limit card');
+  // GLM 恢复 → 探针探通 → 自动切回并续跑
+  ac.probeFn = async () => true;
+  await sleep(450);                 // firstMs 80 + poll 120 + 余量
+  assert.ok(!ac.fallbackActive, 'recovered after primary probe ok');
+  assert.ok(submitted.some((s) => s.text === '继续'), 'auto-continued after switch-back');
+  ac.dispose();
+});
+
+await ok('manual: transient 429 on backup does NOT switch (short ≠ quota)', async () => {
+  const { ac, driver, turnEnd } = fbHarness();
+  ac.manualSwitch('gpt');
+  driver.currentModel = () => ({ provider: 'codex-gpt', model: 'gpt-5.6-luna' });
+  turnEnd({ kind: 'error', error: { code: '429', message: 'HTTP 429 too many requests' } });
+  await sleep(40);
+  assert.equal(ac.mode, 'manual', 'transient error keeps manual mode');
+  assert.equal(ac.watchers.size, 0);
+  assert.ok(!ac.fallbackActive);
+  ac.dispose();
+});
+
+await ok('manual: quota error on a NON-backup provider stays silent', async () => {
+  const { ac, driver, turnEnd } = fbHarness();
+  ac.manualSwitch('gpt');
+  driver.currentModel = () => ({ provider: 'deepseek', model: 'v4' });
+  turnEnd({ kind: 'error', error: { code: '429', message: 'usage limit reached (额度耗尽)' } });
+  await sleep(40);
+  assert.equal(ac.mode, 'manual', 'custom provider untouched');
+  assert.equal(ac.watchers.size, 0);
   ac.dispose();
 });
 

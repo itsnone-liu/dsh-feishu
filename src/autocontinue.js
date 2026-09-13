@@ -30,8 +30,11 @@
  *         备用模型上已完成的任务不硬塞继续。
  *    备用模型自己出错/限额：只发一次诊断卡（两边都受限，等主模型恢复），
  *    出错的会话记入中断清单，探针探通切回时一并自动续跑。
- *  - **手动模式**：/gpt /glm 快切（调试用）。手动切换 = 抑制一切自动切换
- *    与探针，直到 /glm 或 /auto 恢复自动。
+ *  - **手动模式**：/gpt /glm 快切。手动切换 = 抑制 GLM→GPT 方向的自动
+ *    fallback 与探针（用户自己选了 GPT 就用 GPT）；但 GPT（备用侧）自身
+ *    额度耗尽时仍按规则切回主模型：主模型有额度 → 立即切回续跑；主模型
+ *    也受限 → 双满额等待（2026-09-13 18:13 事故：/gpt 后 GPT 打满，
+ *    manual 拦截了一切动作，只报错卡不切换，用户被迫手动 /glm）。
  *  - 期间用户在本聊天发任何消息 → 取消该会话的纯等待 watcher（fallback
  *    探针不取消：它只打探针，不向会话注入消息，与新消息互不干扰）；
  *  - 超过 maxMs 仍失败 → 放弃并通知（保留最后一次错误）。
@@ -183,8 +186,15 @@ export class AutoContinue {
       this.#onBackupSideError(sessionId, chatId, message);
       return;
     }
-    // 手动模式：用户接管（/gpt），自动机制完全静默。
-    if (this.mode === 'manual') return;
+    // 手动模式：用户 /gpt 接管，GLM→GPT 方向的自动 fallback 与探针静默；
+    // 但备用侧额度耗尽仍要按规则切回主模型（见 #manualBackupExhausted）。
+    if (this.mode === 'manual') {
+      if (classifyFailure(message, cfg.autoContinuePatterns ?? []) === 'long') {
+        this.#manualBackupExhausted(sessionId, chatId, message)
+          .catch((e) => log.warn(`manual backup-exhausted handling failed: ${e?.message ?? e}`));
+      }
+      return;
+    }
 
     const kind = classifyFailure(message, cfg.autoContinuePatterns ?? []);
     if (!kind) {
@@ -193,6 +203,86 @@ export class AutoContinue {
       return;
     }
     this.#schedule(sessionId, chatId, kind, message);
+  }
+
+  /** 手动模式（/gpt）下备用模型额度耗尽 → 并回自动状态机（规则5）：
+   *  主模型有额度 → 立即切回并续跑（规则2镜像）；主模型也受限 → 转入
+   *  fallback 双满额等待（规则4：探针等主模型恢复，探通自动切回续跑）。
+   *  仅当报错会话当前确实在备用 provider 上才动作（用户 /model 选了别的
+   *  自定义 provider 时不越权切换）。 */
+  async #manualBackupExhausted(sessionId, chatId, message) {
+    const primary = this.#primary();
+    const backup = this.#backup();
+    if (!primary || !backup) return;   // 未配置主备对 → 保持纯手动老行为
+    let onBackupSide = false;
+    try {
+      const cur = this.driver.currentModel(this.driver.live.get(sessionId)?.agent);
+      onBackupSide = !!cur && cur.provider === backup.provider;
+    } catch {}
+    if (!onBackupSide) return;
+
+    this.mode = 'auto';   // 并回自动状态机
+    // 主模型可用性：探针可用先探一次（1 token），探不了就乐观切回。
+    const probeReady = typeof this.probeFn === 'function'
+      || (this.config.fallbackProbe?.url && process.env[this.config.fallbackProbe.apiKeyEnv]);
+    const primaryOk = probeReady ? await this.#probePrimary() : true;
+
+    if (primaryOk) {
+      // —— 主模型可用：切回 + 续跑。
+      this.fallbackActive = false;
+      this.backupErrorNotified = false;
+      this.driver.defaultOverride = null;
+      let restored = 0;
+      for (const [id, entry] of this.driver.live) {
+        const target = this.snapshots.get(id) ?? primary;
+        try { this.driver.setModel(entry.agent, target.provider, target.model); restored++; } catch {}
+      }
+      this.snapshots.clear();
+      this.interrupted.clear();
+      this.#clearAllWatchers();
+      const entry = this.driver.live.get(sessionId);
+      if (entry?.agent) {
+        const resumeText = this.config.autoContinueMessage ?? '继续';
+        const tryResume = (left) => {
+          if (this.mode !== 'auto' || this.fallbackActive) return;
+          try {
+            this.driver.submit(entry.agent, resumeText);
+          } catch (e) {
+            if (left > 0) { setTimeout(() => tryResume(left - 1), 250); return; }
+            log.warn(`manual-exit resume submit failed for ${sessionId}: ${e.message}`);
+            this.#send(chatId, buildInfoCard('⚠️ 已切回GLM，但自动续跑失败', [
+              `模型已切回 **${primary.provider}/${primary.model}**，但给被打断的任务补发「继续」未成功。`,
+              '', '请手动发一条「继续」接续任务。', '',
+              `\`\`\`\n${String(e.message).slice(0, 200)}\n\`\`\``,
+            ].join('\n'), { template: 'grey' }));
+          }
+        };
+        setTimeout(() => tryResume(8), 0);
+      }
+      this.#send(chatId, buildInfoCard('🔄 GPT额度耗尽，已自动切回GLM', [
+        `手动选择的GPT额度窗口打满，已把会话切回 **${primary.provider}/${primary.model}**，被打断的任务将自动继续。`,
+        '', '自动切换已恢复（GLM为主模型，限额时会再自动换GPT）。', '',
+        `\`\`\`\n${String(message).slice(0, 300)}\n\`\`\``,
+      ].join('\n'), { template: 'orange' }));
+      log.info(`manual-mode backup exhausted: sessions restored to ${primary.provider}/${primary.model} (restored=${restored})`);
+      return;
+    }
+
+    // —— 主模型也受限：双满额。会话留在备用模型上，探针等主模型恢复。
+    this.fallbackActive = true;
+    this.backupErrorNotified = true;   // 本分支已发卡，抑制 #onBackupSideError 重复卡
+    this.interrupted.set(sessionId, { chatId, doneOnBackup: false });
+    this.#send(chatId, buildInfoCard('⏳ 双方额度窗口都已打满', [
+      `GPT（手动选择）与GLM的额度窗口当前都受限，任务先挂起。`,
+      '',
+      `桥会自动探测GLM恢复，探通即自动切回并续跑，无需手动发「继续」。手动调试：\`/gpt\` \`/glm\` \`/auto\`。`,
+      '',
+      `\`\`\`\n${String(message).slice(0, 300)}\n\`\`\``,
+    ].join('\n'), { template: 'orange' }));
+    log.info('manual-mode backup exhausted and primary also limited: entering dual-limit wait');
+    // 复用长等待调度：fallback 态下 #fire 改跑主模型探针，探通 #exitFallback
+    // 还原快照并自动续跑（schedule 的首卡在 fallback 态自动抑制）。
+    this.#schedule(sessionId, chatId, 'long', message);
   }
 
   /** fallback 中备用模型侧的回合错误：诊断卡一次，不重调度。 */
@@ -530,7 +620,7 @@ export class AutoContinue {
         this.fallbackActive = false;
         this.driver.defaultOverride = { ...pair };
         this.driver.applyModelToAll(pair.provider, pair.model);
-        return { ok: true, text: `已切到 ${pair.provider}/${pair.model}（手动模式：自动切换与探针已暂停）。\n下回合起生效。/glm 切回 · /auto 恢复自动` };
+        return { ok: true, text: `已切到 ${pair.provider}/${pair.model}（手动模式：GLM→GPT的自动切换与探针已暂停；GPT满额仍会自动切回GLM）。\n下回合起生效。/glm 切回 · /auto 恢复自动` };
       }
       // /glm：切回主模型并恢复自动
       this.mode = 'auto';
