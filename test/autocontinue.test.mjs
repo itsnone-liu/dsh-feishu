@@ -355,6 +355,43 @@ await ok('fallback: codex-proxy AUTH 401 (GPT quota symptom) → long → revers
   h.ac.dispose();
 });
 
+await ok('fallback: 同provider非默认模型满额也切换（2026-09-14 事故：sol 上的 401 永不切）', async () => {
+  // 实测：会话跑 codex-gpt/gpt-5.6-sol，GPT 5h 窗口耗尽 → 401。旧 #routeFor
+  // 要求 provider+model 与配置对全等（只认 gpt-5.6-luna），判成"quota source
+  // is not a configured primary/backup model"→ 永不切换。额度是账号级的：
+  // 按 provider 侧路由，takeover 仍切 canonical pair。
+  const h = fbHarness();
+  h.driver.currentModel = () => ({ provider: 'codex-gpt', model: 'gpt-5.6-sol' });
+  h.turnEnd({ kind: 'error', error: { code: 'AUTH', message: 'AUTH: 401: {"message":"Not authenticated. Please login first at /","code":"invalid_api_key"}' } });
+  assert.ok(h.ac.fallbackActive, 'same-provider non-default model still triggers fallback');
+  assert.ok(h.applied.includes('ALL:glm-coding/glm-5.3'), 'switched to GLM canonical pair');
+  assert.deepEqual(h.driver.defaultOverride, { provider: 'glm-coding', model: 'glm-5.3' });
+  assert.deepEqual(h.ac.limitedModel, { provider: 'codex-gpt', model: 'gpt-5.6-sol' }, 'limited records the actual exhausted model');
+  await sleep(30);
+  assert.ok(h.submitted.some((s) => s.text === '继续'), 'interrupted task resumes on GLM');
+  h.ac.dispose();
+});
+
+await ok('fallback: GLM 侧非默认模型满额 → 切 GPT（对称成立）', async () => {
+  const h = fbHarness();
+  h.driver.currentModel = () => ({ provider: 'glm-coding', model: 'glm-4.7' });
+  h.turnEnd({ kind: 'error', error: { code: '1308', message: '已达到5小时的使用上限，额度耗尽' } });
+  assert.ok(h.ac.fallbackActive, 'GLM non-default model triggers fallback');
+  assert.ok(h.applied.includes('ALL:codex-gpt/gpt-5.6-luna'), 'switched to GPT canonical pair');
+  assert.deepEqual(h.ac.limitedModel, { provider: 'glm-coding', model: 'glm-4.7' });
+  h.ac.dispose();
+});
+
+await ok('fallback: 第三方 provider 满额 → 仍不切换（维持等待老行为）', async () => {
+  const h = fbHarness();
+  h.driver.currentModel = () => ({ provider: 'deepseek-official', model: 'deepseek-v4-flash' });
+  h.turnEnd({ kind: 'error', error: { code: '429', message: '额度耗尽 quota exhausted' } });
+  assert.ok(!h.ac.fallbackActive, 'unknown provider must not switch');
+  assert.equal(h.applied.length, 0, 'no model applied');
+  assert.ok(h.ac.watchers.size > 0, 'stays in wait mode');
+  h.ac.dispose();
+});
+
 await ok('fallback: 不自动切回 — 接管侧正常干活时不还原（2026-09-13 定调）', async () => {
   const h = fbHarness();
   h.turnEnd({ kind: 'error', error: { code: '429', message: '已达到5小时的使用上限，额度耗尽' } }); // GLM→GPT

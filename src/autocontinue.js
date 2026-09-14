@@ -161,17 +161,27 @@ export class AutoContinue {
   /** 主/备模型对（配置了才可用）。 */
   #primary() { return this.config.fallbackPrimary ? parsePair(this.config.fallbackPrimary) : null; }
   #backup() { return this.config.fallbackBackup ? parsePair(this.config.fallbackBackup) : null; }
-  #same(a, b) { return !!a && !!b && a.provider === b.provider && a.model === b.model; }
   #current(sessionId) {
     try { return this.driver.currentModel(this.driver.live.get(sessionId)?.agent); } catch { return null; }
   }
-  /** 由实际报错的模型决定切换方向（双向）：GLM 满→切 GPT；GPT 满→切 GLM。
-   *  报错模型不在配置对内（第三方模型）→ null（维持纯等待老行为）。 */
+  /** 由实际报错的模型决定切换方向（双向）：GLM 侧满→切 GPT；GPT 侧满→切 GLM。
+   *  2026-09-14 修复：额度按账号耗尽（codex-proxy 登录 / GLM coding 套餐），
+   *  同 provider 下任何模型（gpt-5.6-sol/terra/astra、glm-4.7/5-turbo）会一起
+   *  满。旧的 provider+model 全等配对把跑在非默认模型上的会话判成 "quota
+   *  source is not a configured primary/backup model"，安全网整个失效（实测：
+   *  会话跑 codex-gpt/gpt-5.6-sol，GPT 满 → 永不切 GLM，只刷等待卡）。
+   *  改为按 provider 侧匹配：limited 记录实际耗尽模型（文案准确），takeover
+   *  仍切到配置的 canonical pair。第三方 provider（两侧都不是）→ null。 */
   #routeFor(sessionId) {
     const primary = this.#primary(); const backup = this.#backup(); const current = this.#current(sessionId);
-    if (!primary || !backup || !current) return null;
-    if (this.#same(current, primary)) return { limited: primary, takeover: backup };
-    if (this.#same(current, backup)) return { limited: backup, takeover: primary };
+    if (!primary || !backup) return null;
+    if (!current) {
+      log.warn('fallback: no live model for the failing session — staying in wait mode');
+      return null;
+    }
+    if (current.provider === primary.provider) return { limited: current, takeover: backup };
+    if (current.provider === backup.provider) return { limited: current, takeover: primary };
+    log.warn(`fallback: quota source ${current.provider}/${current.model} is not a configured primary/backup provider — staying in wait mode`);
     return null;
   }
 
@@ -231,11 +241,12 @@ export class AutoContinue {
 
   /** fallback 中接管侧的回合错误。两侧都满 → 只提示一次，**不切来切去**
    *  （2026-09-13 用户定调）；非额度错误同样只提示一次。用户若已手动把
-   *  会话切回受限侧（cur===limited），视为主动选择：清掉 fallback 状态，
+   *  会话切回受限侧（同 provider 即算——额度是账号级的，切回该侧任何
+   *  模型都是回到受限通道），视为主动选择：清掉 fallback 状态，
    *  按全新错误重新分类处理。 */
   #onTakeoverSideError(sessionId, chatId, message) {
     const cur = this.#current(sessionId);
-    if (cur && this.limitedModel && cur.provider === this.limitedModel.provider && cur.model === this.limitedModel.model) {
+    if (cur && this.limitedModel && cur.provider === this.limitedModel.provider) {
       // 用户手动回到了受限侧：fallback 状态作废，重新分类（等待/再切换由事件定）
       this.#clearFallbackState();
       const kind = classifyFailure(message, this.config.autoContinuePatterns ?? []);
@@ -405,10 +416,7 @@ export class AutoContinue {
   #maybeEnterFallback(sessionId, chatId, message) {
     if (this.fallbackActive) return true;             // 已在 fallback，视作已处理
     const route = this.#routeFor(sessionId);
-    if (!route) {
-      log.warn(`fallback: quota source is not a configured primary/backup model — staying in wait mode`);
-      return false;
-    }
+    if (!route) return false;   // 具体 warn 由 #routeFor 记录（含实际模型对）
     const { limited, takeover } = route;
 
     this.fallbackActive = true;
