@@ -104,8 +104,9 @@ const DEFAULTS = {
   phaseWebProvider: 'chatgpt-web',
   /** 默认网页档位（Astra 轻推理档；/plan /review 可带 light|medium|high|extra-high|pro 覆盖）。 */
   phaseWebModel: 'chatgpt-web/light',
-  /** 网页 daemon 探针 URL（降级后轮询；'' = 禁用探针）。 */
-  phaseWebProbeUrl: 'http://127.0.0.1:17841/v1/models',
+  /** 网页 daemon 探针 URL（降级后轮询；'' = 禁用探针）。走 shim 的 /__health：
+   *  daemon 进程活着即 200（真实额度/登录故障由回合失败→降级兜底）。 */
+  phaseWebProbeUrl: 'http://127.0.0.1:17842/__health',
   /** 探针 Bearer token 的环境变量名（daemon 的 controlToken）。 */
   phaseWebProbeAuthEnv: 'CHATGPT_WEB_TOKEN',
   /** 探针间隔（ms）。 */
