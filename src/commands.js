@@ -28,6 +28,7 @@ const HELP = [
   '- **直接发图片 = 识图**：无需切模型 —— 文本模型会自动调用 `inspect_image` 外挂识图（Qwen-VL）；若当前模型本身支持视觉则原生识图。连发多张图会自动合并为一个回合（1.5 秒窗口）',
   '- 订阅额度耗尽时桥会**自动等待恢复并继续**；配置了模型对时会**双向自动切换**：任一侧（GPT或GLM）额度满→自动切到另一侧续跑；**额度恢复不自动切回**（需换回手动 `/gpt` `/glm`）；两侧都满则只提示、不来回切',
   '- `/gpt` `/glm` `/auto` 手动快切模型：选择常态模型（启动/新建默认 GLM），手动选择不关闭额度安全网',
+  '- **`/plan` `/exec` `/review` 相位工作流**：`/plan`→网页额度做方案规划（不写码）· `/exec`→方案存档+切回执行模型开工并记审计起点 · `/review [档位|commit]`→收集 diff 切网页额度审计（默认轻档 light，复杂改动 `/review high` 深审）· 审完 `/exec` 修复循环。产物存档于工作区 `.dsh/phases/`；网页通道故障自动降级 Codex 额度继续',
   '- `/new [cwd]` 新会话 · `/stop` 停止本轮 · `/status` 状态 · `/doctor` 诊断（识图链路体检）',
   '- `/mode` 查看/切换权限模式（`/mode ro` 只读 · `/mode rw` 工作区可写 · `/mode full` 全权）',
   '- `/model` 查看/切换模型（如 `/model glm-5.3`；跨厂商用 `厂商/模型` 全称；📷 标记原生支持识图）',
@@ -54,7 +55,7 @@ const MODE_ALIASES = {
 };
 
 export class Commands {
-  constructor({ config, store, driver, renderer, transport, permissionPresets, llm, agentPresets, visionReady = false, autoContinue = null }) {
+  constructor({ config, store, driver, renderer, transport, permissionPresets, llm, agentPresets, visionReady = false, autoContinue = null, phases = null }) {
     this.config = config;
     this.store = store;
     this.driver = driver;
@@ -65,6 +66,7 @@ export class Commands {
     this.agentPresets = agentPresets;
     this.visionReady = visionReady;
     this.autoContinue = autoContinue;
+    this.phases = phases;
   }
 
 
@@ -100,6 +102,12 @@ export class Commands {
           return await this.cmdQuickSwitch(chatId, 'glm');
         case 'auto':
           return await this.cmdQuickSwitch(chatId, 'auto');
+        case 'plan':
+          return await this.cmdPhase(chatId, arg, 'plan');
+        case 'exec':
+          return await this.cmdPhase(chatId, '', 'exec');
+        case 'review':
+          return await this.cmdPhase(chatId, arg, 'review');
         case 'preset':
         case 'presets':
           return await this.cmdPreset(chatId, arg);
@@ -258,6 +266,31 @@ export class Commands {
     return true;
   }
 
+  /** /plan /exec /review 相位切换（网页额度 ↔ Codex 额度）。 */
+  async cmdPhase(chatId, arg, phase) {
+    if (!this.phases) {
+      await this.transport.sendCard(chatId, buildErrorCard('相位服务不可用', '桥未加载 phases 模块。'));
+      return true;
+    }
+    const res = await this.#sessionForMode(chatId);
+    if (res.error) {
+      await this.transport.sendCard(chatId, buildInfoCard('相位切换', res.error, { template: 'grey' }));
+      return true;
+    }
+    const binding = this.store.get(chatId);
+    const cwd = binding?.cwd ?? this.config.defaultCwd;
+    try {
+      const out = await this.phases.handle(chatId, res.agent, cwd, phase, arg ?? '');
+      await this.transport.sendCard(chatId, out.ok
+        ? buildInfoCard(`相位 · ${phase}`, out.text, { template: out.ok ? 'green' : 'grey' })
+        : buildErrorCard('相位切换失败', out.text));
+    } catch (e) {
+      log.error(`phase ${phase} for ${chatId}: ${e.stack ?? e}`);
+      await this.transport.sendCard(chatId, buildErrorCard('相位切换失败', e.message)).catch(() => {});
+    }
+    return true;
+  }
+
   async cmdStatus(chatId) {
     const binding = this.store.get(chatId);
     const lines = [`chat：\`${chatId}\``];
@@ -274,6 +307,8 @@ export class Commands {
     }
     lines.push(`审批模式：\`${this.config.approval}\``);
     if (this.autoContinue?.statusLine) lines.push(this.autoContinue.statusLine());
+    const phaseLine = this.phases?.statusLine?.(chatId);
+    if (phaseLine) lines.push(phaseLine);
     await this.transport.sendCard(chatId, buildInfoCard('桥状态', lines.join('\n')));
     return true;
   }

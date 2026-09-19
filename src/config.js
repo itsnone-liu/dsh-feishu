@@ -96,6 +96,24 @@ const DEFAULTS = {
   fallbackPrimary: 'glm-coding/glm-5.3',
   /** 另一侧模型（须已在 dsh settings.yaml providers 里配好）。 */
   fallbackBackup: 'codex-gpt/gpt-5.6-luna',
+  /** 网页额度相位（/plan /exec /review，2026-09-20 方案，见 src/phases.js）。
+   *  `false` 关闭。 */
+  phaseWeb: true,
+  /** 网页额度 provider 名（须已在 dsh settings.yaml 配好，api: openai-responses，
+   *  指向 codex-chatgpt-web daemon 127.0.0.1:17841）。 */
+  phaseWebProvider: 'chatgpt-web',
+  /** 默认网页档位（Astra 轻推理档；/plan /review 可带 light|medium|high|extra-high|pro 覆盖）。 */
+  phaseWebModel: 'chatgpt-web/light',
+  /** 网页 daemon 探针 URL（降级后轮询；'' = 禁用探针）。 */
+  phaseWebProbeUrl: 'http://127.0.0.1:17841/v1/models',
+  /** 探针 Bearer token 的环境变量名（daemon 的 controlToken）。 */
+  phaseWebProbeAuthEnv: 'CHATGPT_WEB_TOKEN',
+  /** 探针间隔（ms）。 */
+  phaseWebProbeMs: 60_000,
+  /** /review 注入预算（字符，≈50k token）。 */
+  phaseReviewBudgetChars: 150_000,
+  /** 单文件全文上限（字符）。 */
+  phaseReviewFileMaxChars: 60_000,
 };
 
 function coerce(raw) {

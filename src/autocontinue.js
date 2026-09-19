@@ -140,6 +140,9 @@ export class AutoContinue {
     this.driver = driver;
     this.renderer = renderer;
     this.transport = transport;
+    /** PhaseManager（/plan /exec /review 网页额度相位）。index.js 装配后注入；
+     *  网页侧（chatgpt-web）错误由它先认领并降级，这里跳过避免双重 watcher。 */
+    this.phases = null;
     /** sessionId → watcher state */
     this.watchers = new Map();
 
@@ -197,6 +200,10 @@ export class AutoContinue {
   /** index.js 的 session/event 钩子转发进来（外层已有 try/catch）。 */
   onEvent(session, event) {
     if (event?.type !== 'turn/end') return;
+    // 网页额度相位（plan/review）的错误由 PhaseManager 降级处理（切回 exec
+    // 侧继续），本模块跳过 —— chatgpt-web 不在 fallback 对里，否则这里会
+    // 给它安排无意义的等待 watcher。
+    if (this.phases?.onTurnError?.(session, event) === true) return;
     const cfg = this.config;
     if (cfg.autoContinue === false) return;
     const sessionId = session?.id;

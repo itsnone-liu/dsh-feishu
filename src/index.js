@@ -28,6 +28,7 @@ import { ChatRouter } from './router.js';
 import { Commands } from './commands.js';
 import { InteractionManager } from './ask.js';
 import { AutoContinue } from './autocontinue.js';
+import { PhaseManager } from './phases.js';
 import { createTransport } from './transport/index.js';
 import { installSelfGuard } from './selfguard.js';
 import { installVisionTool } from './vision-tool.js';
@@ -91,6 +92,9 @@ function apply(ctx, config) {
       const commands = new Commands({ config: cfg, store, driver, renderer, transport, permissionPresets: ctx.permissionPresets, llm: ctx.llm, agentPresets: ctx.agentPresets, visionReady, autoContinue: null });
       const autoContinue = new AutoContinue({ config: cfg, driver, renderer, transport });
       commands.autoContinue = autoContinue; // 注入（构造顺序：Commands 先建，AutoContinue 需要 transport 就绪）
+      const phases = new PhaseManager({ config: cfg, driver, transport, autoContinue });
+      commands.phases = phases;
+      autoContinue.phases = phases;   // 网页侧错误认领（onTurnError）
       const router = new ChatRouter({ config: cfg, store, driver, renderer, transport, interactions, commands, visionReady, autoContinue });
 
       // ---- outbound seams ----
@@ -143,6 +147,7 @@ function apply(ctx, config) {
       const cleanup = () => {
         for (const d of disposers) { try { d(); } catch {} }
         autoContinue.dispose();
+        phases.dispose();
         transport.stop().catch(() => {});
         driver.disposeAll().catch((e) => log.warn(`driver dispose: ${e.message}`));
       };
