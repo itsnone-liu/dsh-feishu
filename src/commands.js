@@ -27,7 +27,7 @@ const HELP = [
   '- 直接发文字 = 和 agent 说话（运行中发送会作为下一步转向输入）',
   '- **直接发图片 = 识图**：无需切模型 —— 文本模型会自动调用 `inspect_image` 外挂识图（Qwen-VL）；若当前模型本身支持视觉则原生识图。连发多张图会自动合并为一个回合（1.5 秒窗口）',
   '- 订阅额度耗尽时桥会**自动等待恢复并继续**；配置了模型对时会**双向自动切换**：任一侧（GPT或GLM）额度满→自动切到另一侧续跑；**额度恢复不自动切回**（需换回手动 `/gpt` `/glm`）；两侧都满则只提示、不来回切',
-  '- `/gpt` `/glm` `/auto` 手动快切模型：选择常态模型（启动/新建默认 GLM），手动选择不关闭额度安全网',
+  '- `/gpt` `/glm` `/auto` `/ds` 手动快切模型：选择常态模型（启动/新建默认 GLM），手动选择不关闭额度安全网；`/ds` 切百炼 DeepSeek（独立通道，不参与额度切换对，切走/切回都靠手动）',
   '- **`/plan` `/exec` `/review` 相位工作流**：`/plan`→网页额度做方案规划（不写码）· `/exec`→方案存档+切回执行模型开工并记审计起点 · `/review [档位|commit]`→收集 diff 切网页额度审计（默认轻档 light，复杂改动 `/review high` 深审）· 审完 `/exec` 修复循环。产物存档于工作区 `.dsh/phases/`；网页通道故障自动降级 Codex 额度继续',
   '- `/new [cwd]` 新会话 · `/stop` 停止本轮 · `/status` 状态 · `/doctor` 诊断（识图链路体检）',
   '- `/mode` 查看/切换权限模式（`/mode ro` 只读 · `/mode rw` 工作区可写 · `/mode full` 全权）',
@@ -102,6 +102,8 @@ export class Commands {
           return await this.cmdQuickSwitch(chatId, 'glm');
         case 'auto':
           return await this.cmdQuickSwitch(chatId, 'auto');
+        case 'ds':
+          return await this.cmdQuickSwitch(chatId, 'ds');
         case 'plan':
           return await this.cmdPhase(chatId, arg, 'plan');
         case 'exec':
@@ -251,9 +253,9 @@ export class Commands {
     return true;
   }
 
-  /** /gpt /glm /auto — 限额自动切换的手动快切（调试利器）。
+  /** /gpt /glm /ds /auto — 限额自动切换的手动快切（调试利器）。
    *  /gpt = 切备用模型并暂停自动切换；/glm = 切回主模型并恢复自动；
-   *  /auto = 仅恢复自动（模型不动）。 */
+   *  /ds = 切百炼 DeepSeek（不在切换对内，纯手动）；/auto = 仅恢复自动（模型不动）。 */
   async cmdQuickSwitch(chatId, target) {
     if (!this.autoContinue?.manualSwitch) {
       await this.transport.sendCard(chatId, buildErrorCard('切换服务不可用', '桥未加载 auto-continue 模块。'));
@@ -457,7 +459,7 @@ export class Commands {
     // resolve the target
     let provider;
     let model;
-    if (arg === 'gpt' || arg === 'glm') {
+    if (arg === 'gpt' || arg === 'glm' || arg === 'ds') {
       // 快捷别名 → 手动快切（保证 fallback 状态机同步，不能裸 setModel）
       return await this.cmdQuickSwitch(chatId, arg);
     }

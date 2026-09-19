@@ -507,13 +507,28 @@ export class AutoContinue {
       this.driver.applyModelToAll(pair.provider, pair.model);
       return { ok: true, text: `已切回 ${pair.provider}/${pair.model}，自动切换已恢复。` };
     }
+    if (target === 'ds') {
+      const pair = this.config.dsModel ? parsePair(this.config.dsModel) : null;
+      if (!pair?.provider || !pair.model) {
+        return { ok: false, text: 'dsModel 未配置（config.json 或内置默认）' };
+      }
+      // 手动接管是用户明确意志：停等待 watcher、退出 fallback 状态。
+      // ds 不在 fallback 对里：额度切换永不路由到它；它额度耗尽时
+      // #routeFor 对第三方 provider 返回 null → 只同模型等待恢复，不切走。
+      this.#clearAllWatchers();
+      this.#clearFallbackState();
+      this.mode = 'manual';
+      this.driver.defaultOverride = { ...pair };
+      this.driver.applyModelToAll(pair.provider, pair.model);
+      return { ok: true, text: `已切到 ${pair.provider}/${pair.model}（百炼 DeepSeek，手动模式；不在额度切换对内，桥不会自动切走）。\n下回合起生效。/glm 切回主模型 · /gpt 切备用 · /auto 恢复自动` };
+    }
     if (target === 'auto') {
       this.mode = 'auto';
       this.#clearAllWatchers();
       this.#clearFallbackState();
       return { ok: true, text: '已恢复自动切换（当前模型保持不变；下次额度耗尽会自动切到另一侧）。' };
     }
-    return { ok: false, text: '用法：/gpt · /glm · /auto' };
+    return { ok: false, text: '用法：/gpt · /glm · /ds · /auto' };
   }
 
   /** 当前切换状态（/status 用）。 */
