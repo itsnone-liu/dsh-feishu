@@ -40,6 +40,35 @@ const HELP = [
   'agent 提问或请求审批时会弹出按钮卡片；直接回复文字等于自由输入。',
 ].join('\n');
 
+/** Build the fail-closed Windows handoff script used by /restart. Pure for tests. */
+export function buildWindowsRestartScript({ pid, stamp, launcher, runBridge, logFile, bridgeTask = 'dsh-feishu-bridge' }) {
+  const q = (s) => `'${String(s).replace(/'/g, "''")}'`;
+  return [
+    `$ErrorActionPreference = 'Continue'`,
+    `"restart requested ${stamp} oldPid=${pid} launcher='${launcher}'" | Add-Content -Path ${q(logFile)} -Encoding UTF8`,
+    `$deadline = (Get-Date).AddSeconds(15)`,
+    `while ((Get-Date) -lt $deadline) { $p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if (-not $p) { break }; Start-Sleep -Milliseconds 500 }`,
+    `$p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if ($p) { try { Stop-Process -Id ${pid} -Force } catch {} }`,
+    `Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object { $_.CommandLine -match 'profile feishu' } | ForEach-Object { "stopping leftover bridge pid=$($_.ProcessId)" | Add-Content -Path ${q(logFile)} -Encoding UTF8; Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`,
+    `Get-CimInstance Win32_Process -Filter "Name='wscript.exe'" | Where-Object { $_.CommandLine -match 'profile feishu' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`,
+    `Start-Sleep 1`,
+    `if (-not (Test-Path ${q(runBridge)})) { "FATAL: canonical launcher missing: ${runBridge}" | Add-Content -Path ${q(logFile)} -Encoding UTF8; exit 2 }`,
+    `try { Register-ScheduledTask -TaskName ${q(bridgeTask)} -Action (New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -File "' + ${q(runBridge)} + '"') -WorkingDirectory ${q(path.dirname(runBridge))}) -Settings (New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable) -Force -ErrorAction Stop | Out-Null } catch { "FATAL: failed to register bridge task: $($_.Exception.Message)" | Add-Content -Path ${q(logFile)} -Encoding UTF8; exit 3 }`,
+    `schtasks /Run /TN ${q(bridgeTask)} | Add-Content -Path ${q(logFile)} -Encoding UTF8`,
+    `if ($LASTEXITCODE -ne 0) { "FATAL: failed to start bridge task, exit=$LASTEXITCODE" | Add-Content -Path ${q(logFile)} -Encoding UTF8; exit 4 }`,
+    `$bridgeLog = Join-Path ${q(path.dirname(runBridge))} 'bridge.out.log'`,
+    `$newBridge = $null; $healthy = $false; $seenAt = $null`,
+    `for ($i = 0; $i -lt 60; $i++) {`,
+    `  $newBridge = Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.ProcessId -ne ${pid} -and $_.CommandLine -match 'dsh-feishu\\\\node_modules\\\\@deepseek-ai\\\\dsh\\\\lib\\\\bin.js' -and $_.CommandLine -match 'profile feishu' } | Select-Object -First 1`,
+    `  if ($newBridge -and -not $seenAt) { $seenAt = Get-Date }`,
+    `  if ($newBridge -and $seenAt -and ((Get-Date) - $seenAt).TotalSeconds -ge 3 -and (Test-Path $bridgeLog)) { $tail = Get-Content $bridgeLog -Tail 20 -ErrorAction SilentlyContinue; $last = $tail | Select-Object -Last 1; if (($tail -match 'bridge up').Count -gt 0 -and $last -match 'ws client ready') { $healthy = $true; break } }`,
+    `  Start-Sleep -Milliseconds 500`,
+    `}`,
+    `if (-not $healthy) { "FATAL: bridge task started but health check failed (pid=$($newBridge.ProcessId), log=$bridgeLog)" | Add-Content -Path ${q(logFile)} -Encoding UTF8; exit 5 }`,
+    `"restart verified $(Get-Date -Format o) newPid=$($newBridge.ProcessId) entry=$($newBridge.CommandLine)" | Add-Content -Path ${q(logFile)} -Encoding UTF8`,
+  ].join('\n');
+}
+
 /** Friendly aliases → preset table keys (applied only when the key exists). */
 const MODE_ALIASES = {
   ro: 'read-only',
@@ -718,8 +747,10 @@ export class Commands {
     if (process.env.DSH_FEISHU_LAUNCHER && fs.existsSync(process.env.DSH_FEISHU_LAUNCHER)) {
       return process.env.DSH_FEISHU_LAUNCHER;
     }
-    // The harness runs with cwd = the directory that holds node_modules/@deepseek-ai/dsh
+    // Prefer the canonical foreground launcher. Legacy siblings are accepted
+    // only as location hints; cmdRestart still resolves and executes run_bridge.ps1.
     const candidates = [
+      path.join(process.cwd(), 'run_bridge.ps1'),
       path.join(process.cwd(), 'start_bridge.ps1'),
       path.join(process.cwd(), 'start-dsh-feishu.ps1'),
       path.join(process.cwd(), 'start-dsh-feishu.bat'),
@@ -764,26 +795,21 @@ export class Commands {
     // this restarter only waits for the old PID, sweeps leftovers, re-registers
     // that task (idempotent) and /Run's it.
     const bridgeTask = 'dsh-feishu-bridge';
-    const runBridge = path.join(path.dirname(launcher), 'run_bridge.ps1');
-    const q = (s) => `'${String(s).replace(/'/g, "''")}'`;
-    const script = [
-      `$ErrorActionPreference = 'Continue'`,
-      `"restart requested ${stamp} oldPid=$pid launcher='${launcher}'" | Add-Content -Path ${q(logFile)} -Encoding UTF8`,
-      `$deadline = (Get-Date).AddSeconds(15)`,
-      `while ((Get-Date) -lt $deadline) { $p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if (-not $p) { break }; Start-Sleep -Milliseconds 500 }`,
-      `$p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if ($p) { try { Stop-Process -Id ${pid} -Force } catch {} }`,
-      `Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object { $_.CommandLine -match 'profile feishu' } | ForEach-Object { "stopping leftover bridge pid=$($_.ProcessId)" | Add-Content -Path ${q(logFile)} -Encoding UTF8; Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`,
-      `Get-CimInstance Win32_Process -Filter "Name='wscript.exe'" | Where-Object { $_.CommandLine -match 'profile feishu' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`,
-      `Start-Sleep 1`,
-      `if (Test-Path ${q(runBridge)}) {`,
-      `  Register-ScheduledTask -TaskName ${q(bridgeTask)} -Action (New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -File "' + ${q(runBridge)} + '"') -WorkingDirectory ${q(path.dirname(runBridge))}) -Settings (New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable) -Force | Out-Null`,
-      `  schtasks /Run /TN ${q(bridgeTask)} | Add-Content -Path ${q(logFile)} -Encoding UTF8`,
-      `} else {`,
-      `  "WARNING: ${runBridge} not found; falling back to direct in-job launch (job-kill risk, see 2026-08-26 incident)" | Add-Content -Path ${q(logFile)} -Encoding UTF8`,
-      `  & ${q(launcher)} *>&1 | Add-Content -Path ${q(logFile)} -Encoding UTF8`,
-      `}`,
-      `"restart finished $(Get-Date -Format o)" | Add-Content -Path ${q(logFile)} -Encoding UTF8`,
-    ].join('\n');
+    // restartLauncher may point directly at the canonical run_bridge.ps1 or at
+    // a legacy sibling launcher.  In either case we ONLY execute run_bridge.ps1.
+    // Missing canonical launcher is fail-closed: never fall back to the legacy
+    // start_bridge.ps1, which starts from D:\\dsh-install and can miss the plugin.
+    const runBridge = path.basename(launcher).toLowerCase() === 'run_bridge.ps1'
+      ? launcher
+      : path.join(path.dirname(launcher), 'run_bridge.ps1');
+    if (!fs.existsSync(runBridge)) {
+      await this.transport.sendCard(chatId, buildErrorCard(
+        '权威启动脚本不存在',
+        `拒绝重启，避免落入错误依赖目录：\`${runBridge}\`。请先修复该文件。`,
+      ));
+      return true;
+    }
+    const script = buildWindowsRestartScript({ pid, stamp, launcher, runBridge, logFile, bridgeTask });
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(wrapper, script, 'utf8');
 
