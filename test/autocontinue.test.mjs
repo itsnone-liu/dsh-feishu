@@ -566,6 +566,17 @@ await ok('manual: /gpt preference keeps quota safety net; /glm restores auto', (
   ac.dispose();
 });
 
+await ok('manual: /ds selects Bailian V4.1 Flash outside fallback pair', () => {
+  const { ac, applied, driver } = fbHarness({ dsModel: 'bailian-ds/deepseek-v4.1-flash' });
+  const r = ac.manualSwitch('ds');
+  assert.ok(r.ok);
+  assert.equal(ac.mode, 'manual');
+  assert.deepEqual(driver.defaultOverride, { provider: 'bailian-ds', model: 'deepseek-v4.1-flash' });
+  assert.ok(applied.includes('ALL:bailian-ds/deepseek-v4.1-flash'));
+  assert.match(r.text, /不会自动切走/);
+  ac.dispose();
+});
+
 await ok('manual: /auto only re-enables, keeps current model', () => {
   const { ac, applied } = fbHarness();
   ac.manualSwitch('gpt');

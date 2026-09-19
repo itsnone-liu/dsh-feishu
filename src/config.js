@@ -96,10 +96,10 @@ const DEFAULTS = {
   fallbackPrimary: 'glm-coding/glm-5.3',
   /** 另一侧模型（须已在 dsh settings.yaml providers 里配好）。 */
   fallbackBackup: 'codex-gpt/gpt-5.6-luna',
-  /** /ds 手动切换目标（2026-09-20）：百炼 DeepSeek（DashScope compatible-mode）。
+  /** /ds 手动切换目标（2026-09-20）：百炼 Token 套餐 DeepSeek V4.1 Flash。
    *  独立于 fallback 对——仅用户手动选择；额度切换永不路由到它，它出错
    *  也只同模型等待/报错，不自动切走。须已在 dsh settings.yaml 配好。 */
-  dsModel: 'bailian-ds/deepseek-v4-pro',
+  dsModel: 'bailian-ds/deepseek-v4.1-flash',
   /** 网页额度相位（/plan /exec /review，2026-09-20 方案，见 src/phases.js）。
    *  `false` 关闭。 */
   phaseWeb: true,
