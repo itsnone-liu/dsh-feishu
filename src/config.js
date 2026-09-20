@@ -100,7 +100,7 @@ const DEFAULTS = {
   /** 额外手动快切目标：/命令名 → 'provider/model'（须已在 dsh settings.yaml
    *  providers 里配好）。与 /gpt 同语义：手动模式，/glm 或 /auto 恢复。 */
   manualModels: {
-    ds: 'dashscope/deepseek-v4.1-flash',
+    ds: 'dashscope-tokenplan/deepseek-v4.1-flash',
   },
 };
 
