@@ -97,6 +97,11 @@ const DEFAULTS = {
     apiKeyEnv: 'GLM_API_KEY',
     model: 'glm-5-turbo',
   },
+  /** 额外手动快切目标：/命令名 → 'provider/model'（须已在 dsh settings.yaml
+   *  providers 里配好）。与 /gpt 同语义：手动模式，/glm 或 /auto 恢复。 */
+  manualModels: {
+    ds: 'dashscope/deepseek-v4.1-flash',
+  },
 };
 
 function coerce(raw) {
@@ -114,6 +119,7 @@ function coerce(raw) {
   if (raw?.allowGroupChats === true) cfg.groups = 'mention';
   // 限额自动切换：嵌套探针配置按字段合并；false 显式关闭
   cfg.fallbackProbe = { ...DEFAULTS.fallbackProbe, ...(raw?.fallbackProbe ?? {}) };
+  cfg.manualModels = { ...DEFAULTS.manualModels, ...(raw?.manualModels ?? {}) };
   if (raw?.fallbackPrimary === false) cfg.fallbackPrimary = '';
   if (raw?.fallbackBackup === false) cfg.fallbackBackup = '';
   if (!['off', 'mention', 'all'].includes(cfg.groups)) cfg.groups = 'off';

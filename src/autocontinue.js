@@ -630,6 +630,31 @@ export class AutoContinue {
       this.driver.applyModelToAll(pair.provider, pair.model);
       return { ok: true, text: `已切回 ${pair.provider}/${pair.model}，自动切换已恢复。` };
     }
+    // 扩展手动快切（config.manualModels，如 /ds → dashscope/deepseek-v4.1-flash）：
+    // 与 /gpt 同语义（手动模式），/glm 切回主模型、/auto 恢复。
+    const manualPair = this.config?.manualModels?.[target];
+    if (target !== 'glm' && target !== 'auto' && manualPair) {
+      const pair = parsePair(manualPair);
+      if (!pair || !pair.provider || !pair.model) {
+        return { ok: false, text: `manualModels.${target} 配置应为 'provider/model'，当前：\`${manualPair}\`` };
+      }
+      this.#clearAllWatchers();
+      this.interrupted.clear();
+      if (this.snapshots.size === 0) {
+        for (const [id, entry] of this.driver.live) {
+          try {
+            const cur = this.driver.currentModel(entry.agent);
+            if (cur) this.snapshots.set(id, { ...cur });
+          } catch {}
+        }
+      }
+      this.mode = 'manual';
+      this.fallbackActive = false;
+      this.driver.defaultOverride = { ...pair };
+      this.driver.applyModelToAll(pair.provider, pair.model);
+      return { ok: true, text: `已切到 ${pair.provider}/${pair.model}（手动模式：自动切换与探针已暂停；该模型限额不自动回切）。
+下回合起生效。/glm 切回主模型恢复自动 · /auto 仅恢复自动` };
+    }
     if (target === 'auto') {
       this.mode = 'auto';
       this.#clearAllWatchers();

@@ -498,6 +498,36 @@ await ok('manual: /gpt switches + suppresses automation; /glm restores auto', as
   ac.dispose();
 });
 
+await ok('manual /ds: switches to configured manualModels target; /glm restores primary+auto', async () => {
+  const { ac, applied, driver, turnEnd } = fbHarness({ manualModels: { ds: 'dashscope/deepseek-v4.1-flash' } });
+  const r1 = ac.manualSwitch('ds');
+  assert.ok(r1.ok, `switch ok: ${r1.text}`);
+  assert.equal(ac.mode, 'manual');
+  assert.equal(ac.fallbackActive, false);
+  assert.ok(applied.some((x) => x === 'ALL:dashscope/deepseek-v4.1-flash'), 'applied to all sessions');
+  assert.deepEqual(driver.defaultOverride, { provider: 'dashscope', model: 'deepseek-v4.1-flash' }, 'override pinned');
+  assert.ok(ac.snapshots.size >= 1, 'pre-switch model snapshot saved for restore');
+  // 手动模式下主模型侧 quota 错误保持静默（与 /gpt 同语义）
+  driver.currentModel = () => ({ provider: 'dashscope', model: 'deepseek-v4.1-flash' });
+  turnEnd({ kind: 'error', error: { code: '429', message: '额度耗尽 quota exhausted' } });
+  await sleep(40);
+  assert.equal(ac.watchers.size, 0, 'no automation while on manual target');
+  // /glm 切回：主模型 + 自动恢复 + 快照清空 + override 清除
+  const r2 = ac.manualSwitch('glm');
+  assert.ok(r2.ok);
+  assert.equal(ac.mode, 'auto');
+  assert.equal(driver.defaultOverride, null);
+  assert.ok(applied.some((x) => x === 'ALL:glm-coding/glm-5.3'));
+  ac.dispose();
+});
+
+await ok('manual /ds: unconfigured target without manualModels entry → usage hint', () => {
+  const { ac } = fbHarness();   // 无 manualModels 配置
+  const r = ac.manualSwitch('ds');
+  assert.ok(!r.ok);
+  ac.dispose();
+});
+
 await ok('manual rule5: backup-side quota error + GLM ok → auto switch back + resume (2026-09-13 incident)', async () => {
   const { ac, cards, submitted, applied, driver, turnEnd } = fbHarness();
   ac.manualSwitch('gpt');
