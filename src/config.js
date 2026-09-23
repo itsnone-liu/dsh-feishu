@@ -56,9 +56,14 @@ const DEFAULTS = {
   /** Base delay (ms) for card-patch failure backoff; retries double up to 15×. */
   cardRetryBaseMs: 1000,
   /** Feishu HTTP request timeout (ms) for the official-SDK axios client.
-   *  0 disables (NOT recommended — a zombie keep-alive socket then hangs the
-   *  card renderer forever; see 2026-08-26 empty-card lesson). */
-  httpTimeoutMs: 15_000,
+     *  0 disables (NOT recommended — a zombie keep-alive socket then hangs the
+     *  card renderer forever; see 2026-08-26 empty-card lesson).
+     *  2026-09-20: briefly raised to 30s while chasing "ds output stops halfway",
+     *  then reverted. That symptom was NOT a card-layer problem at all — it was
+     *  pi-ai's false-overflow detection firing on bailian-ds's under-declared
+     *  contextWindow (see .dsh/settings.yaml). Raising the timeout only delays
+     *  the retry, so it made the freeze longer, not shorter. Kept at 15s. */
+    httpTimeoutMs: 15_000,
   /** ask_user_question timeout (ms); 0 = wait forever. */
   askTimeoutMs: 0,
   /** TEST ONLY: drive a scripted fake agent instead of a real model loop. */
@@ -95,7 +100,7 @@ const DEFAULTS = {
    *  两侧都满只提示不互切。'' 或 null = 关闭（纯等待老行为）。 */
   fallbackPrimary: 'glm-coding/glm-5.3',
   /** 另一侧模型（须已在 dsh settings.yaml providers 里配好）。 */
-  fallbackBackup: 'codex-gpt/gpt-5.6-luna',
+  fallbackBackup: 'codex-gpt/gpt-6-luna',
   /** /ds 手动切换目标（2026-09-20）：百炼 Token 套餐 DeepSeek V4.1 Flash。
    *  独立于 fallback 对——仅用户手动选择；额度切换永不路由到它，它出错
    *  也只同模型等待/报错，不自动切走。须已在 dsh settings.yaml 配好。 */
