@@ -22,7 +22,7 @@ export class AuditLifecycle {
     this.gitGateFactory = gitGateFactory;
     this.executorFactory = executorFactory;
     this.taskPacketLoader = taskPacketLoader;
-    this.retryScheduler = retryScheduler ?? new AuditRetryScheduler({ onRetry: (runId) => this.executors.get(runId)?.retry(runId), onError: (e, runId) => this.onError?.(e, runId) });
+    this.retryScheduler = retryScheduler ?? new AuditRetryScheduler({ onRetry: (runId) => this.retry(runId), onError: (e, runId) => this.onError?.(e, runId) });
     this.executors = new Map();
     this.liveRuns = new Map();
     this.eventQueues = new Map();
@@ -110,6 +110,7 @@ export class AuditLifecycle {
       if (action === 'stop') {
         this.retryScheduler.cancel(runId);
         this.executors.get(runId)?.stop(runId);
+        this.executors.delete(runId);
       } else if (action === 'pause') {
         this.retryScheduler.cancel(runId);
       }
@@ -119,6 +120,10 @@ export class AuditLifecycle {
       }
       return result;
     });
+  }
+
+  async retry(runId) {
+    return this.#serial(runId, () => this.executors.get(runId)?.retry(runId) ?? { ignored: true });
   }
 
   async onEvent(session, event) {
