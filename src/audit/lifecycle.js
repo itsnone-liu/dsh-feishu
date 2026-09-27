@@ -123,6 +123,9 @@ export class AuditLifecycle {
     const executor = this.executorFactory({ driver: this.driver, gitGate: gate });
     this.executors.set(runId, executor);
     await executor.start({ run, agent, gitGate: gate, sendPrompt: false });
+    if (run.s.state === 'WAIT_GIT_PUSH' && run.s.pendingRemoteSync) {
+      this.retryScheduler.schedule(runId, (id) => this.executors.get(id)?.retry(id), run.s.retry.pushAttempts);
+    }
     return { run, agent, executor };
   }
 }
