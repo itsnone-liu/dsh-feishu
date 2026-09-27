@@ -92,6 +92,19 @@ export class AuditLifecycle {
     return { run, executor, agent, git };
   }
 
+  async review(runId, reviewer) {
+    return this.#serial(runId, async () => {
+      const executor = this.executors.get(runId);
+      const run = this.liveRuns.get(runId);
+      if (!executor || !run) throw Object.assign(new Error(`executor run not found: ${runId}`), { code: 'AUDIT_EXECUTOR_NOT_FOUND' });
+      const inFlight = run.s.auditInFlight;
+      if (!inFlight) throw Object.assign(new Error('audit packet unavailable outside AUDITING'), { code: 'AUDIT_REVIEW_NOT_READY' });
+      const packet = { runId, stage: run.s.currentStage, iteration: run.s.iteration, targetCommit: inFlight.headCommit, baseCommit: run.s.stageBaseCommit, repo: run.manifest.repo, branch: run.manifest.branch, goal: run.manifest.goal, stageRequirements: run.manifest.stageRequirements };
+      const verdict = await reviewer.review(packet);
+      return executor.applyVerdict(runId, verdict);
+    });
+  }
+
   async applyVerdict(runId, verdict) {
     return this.#serial(runId, () => {
       const executor = this.executors.get(runId);
