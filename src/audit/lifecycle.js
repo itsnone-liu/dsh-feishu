@@ -98,9 +98,17 @@ export class AuditLifecycle {
       const run = this.liveRuns.get(runId);
       if (!executor || !run) throw Object.assign(new Error(`executor run not found: ${runId}`), { code: 'AUDIT_EXECUTOR_NOT_FOUND' });
       const inFlight = run.s.auditInFlight;
-      if (!inFlight) throw Object.assign(new Error('audit packet unavailable outside AUDITING'), { code: 'AUDIT_REVIEW_NOT_READY' });
-      const packet = { runId, stage: run.s.currentStage, iteration: run.s.iteration, targetCommit: inFlight.headCommit, baseCommit: run.s.stageBaseCommit, repo: run.manifest.repo, branch: run.manifest.branch, goal: run.manifest.goal, stageRequirements: run.manifest.stageRequirements };
-      const verdict = await reviewer.review(packet);
+      if (run.s.state !== 'AUDITING' || !inFlight) throw Object.assign(new Error('audit packet unavailable outside AUDITING'), { code: 'AUDIT_REVIEW_NOT_READY' });
+      const stage = inFlight.stage ?? run.s.currentStage;
+      const packet = { runId, hostId: run.manifest.hostId, stage, iteration: inFlight.iteration ?? run.s.iteration, repo: run.manifest.repo, branch: run.manifest.branch, targetCommit: inFlight.headCommit, baseCommit: run.s.stageBaseCommit, goal: run.manifest.goal, stageRequirement: run.manifest.stageRequirements?.[stage] ?? null };
+      let verdict;
+      try { verdict = await reviewer.review(packet); }
+      catch (e) {
+        if (e?.code === 'AUDIT_VERDICT_MALFORMED' || e?.code === 'AUDIT_VERDICT_MISSING') {
+          return run.verdictMissing();
+        }
+        throw e;
+      }
       return executor.applyVerdict(runId, verdict);
     });
   }
