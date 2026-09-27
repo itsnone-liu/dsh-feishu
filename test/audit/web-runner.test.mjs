@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // A5.1 WebAuditRunner 单元测试 —— 全部确定性，无网络依赖（transport 注入）。
 import assert from 'node:assert';
-import { WebAuditRunner, extractReviewerText } from '../../src/audit/web-runner.js';
+import { WebAuditRunner, extractReviewerText, consumeSseStream } from '../../src/audit/web-runner.js';
 import { buildVerdictText } from '../../src/audit/protocol.js';
 
 let pass = 0, fail = 0;
@@ -72,7 +72,7 @@ await ok('request shape: model/stream/store/input + bearer from injected auth', 
   assert.equal(seen.method, 'POST');
   assert.equal(seen.headers.Authorization, 'Bearer tok-test');
   assert.equal(seen.body.model, 'gpt-5.6-luna');
-  assert.equal(seen.body.stream, false);
+  assert.equal(seen.body.stream, true);
   assert.equal(seen.body.store, false);
   const dev = seen.body.input.find((m) => m.role === 'developer');
   const usr = seen.body.input.find((m) => m.role === 'user');
@@ -150,6 +150,39 @@ await ok('default readAuth surfaces auth.json failure as AUDIT_WEB_LOGIN_EXPIRED
   const r2 = new WebAuditRunner({ readAuth: () => { const j = { readFileSync: null, OPENAI_API_KEY: null }; return j.OPENAI_API_KEY; }, transport: async () => ({ status: 200, json: {}, text: '' }) });
   // readAuth 返回 null → 请求头 Bearer null 属于配置错误面；此处仅验证注入路径本身不崩溃
   assert.equal(typeof r2.readAuth, 'function');
+});
+
+
+await ok('SSE stream consumption: deltas + response.completed + chat delta + split chunks', async () => {
+  const enc = new TextEncoder();
+  const events = [
+    'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"[DSH-AUDIT]\\n"}\n\n',
+    'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"STATE: APPROVE"}\n\n',
+    'event: response.completed\ndata: {"type":"response.completed","response":{"id":"rs","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"full text from completed"}]}]}}\ndata: [DONE]\n\n',
+  ];
+  const stream = new ReadableStream({
+    start(c) {
+      // 故意把第一个事件切成两半，验证跨 chunk 缓冲
+      const half = events[0].slice(0, 40); const rest = events[0].slice(40);
+      c.enqueue(enc.encode(half)); c.enqueue(enc.encode(rest));
+      c.enqueue(enc.encode(events[1])); c.enqueue(enc.encode(events[2])); c.close();
+    },
+  });
+  const { json, outputText } = await consumeSseStream(stream);
+  assert.equal(outputText, '[DSH-AUDIT]\nSTATE: APPROVE');
+  assert.equal(extractReviewerText(json), 'full text from completed');
+
+  // chat-completions delta 形状 + 事件行缺 data 前缀忽略 + CRLF
+  const chat = new ReadableStream({
+    start(c) {
+      c.enqueue(enc.encode('event: x\r\ndata: {"choices":[{"delta":{"content":"hello "}}]}\r\n'));
+      c.enqueue(enc.encode('data: {"choices":[{"delta":{"content":"world"}}]}\n'));
+      c.enqueue(enc.encode('data: [DONE]\n')); c.close();
+    },
+  });
+  const r2 = await consumeSseStream(chat);
+  assert.equal(r2.outputText, 'hello world');
+  assert.equal(r2.json, null); // chat delta 形状无 completed 事件，json 为空但文本已拿到
 });
 
 console.log(`\n${pass} passed, ${fail} failed`); process.exitCode = fail ? 1 : 0;

@@ -123,7 +123,7 @@ await ok('real WebAuditRunner type drives frozen lifecycle to TARGET_REACHED, ze
     assert.equal(bodies.length, 3);
     assert.ok(bodies.every((b) => b.input.some((msg) => msg.role === 'developer' && msg.content.includes('independent auditor'))));
     assert.ok(bodies[0].input.some((msg) => msg.content.includes(`RUN_ID: ${run.runId}`) && msg.content.includes('HOST_ID: h1')));
-    assert.ok(bodies.every((b) => b.model === 'gpt-5.6-luna' && b.stream === false && b.store === false));
+    assert.ok(bodies.every((b) => b.model === 'gpt-5.6-luna' && b.stream === true && b.store === false));
   } finally { m.cleanup(); }
 });
 

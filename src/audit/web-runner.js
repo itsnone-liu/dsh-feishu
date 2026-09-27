@@ -100,10 +100,54 @@ export function extractReviewerText(json) {
 
 async function defaultTransport({ url, method, headers, body, timeoutMs }) {
   const res = await fetch(url, { method, headers, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
+  const contentType = res.headers.get('content-type') ?? '';
+  if (contentType.includes('text/event-stream')) {
+    return consumeSseStream(res.body);
+  }
   const text = await res.text();
   let json = null;
   try { json = JSON.parse(text); } catch { /* 非 JSON 应答按文本处理 */ }
-  return { status: res.status, json, text };
+  // 非流式应答：模型文本在 json 内，由 extractReviewerText 提取；outputText 留空。
+  return { status: res.status, json, outputText: null };
+}
+
+/**
+ * 消费 Responses SSE 流（headroom :8787 强制 stream=true，2026-09-27 live 实测）。
+ * 注意：headroom 的 response.completed 事件里 output 数组为空，模型文本只存在于
+ * output_text.delta 事件 —— 因此累积 delta 是唯一可靠的文本来源。
+ * 兼容：response.output_text.delta / chat.completions delta 形状。
+ */
+export async function consumeSseStream(stream) {
+  let finalJson = null;
+  const deltas = [];
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  const handleLine = (line) => {
+    if (!line.startsWith('data:')) return;
+    const payload = line.slice(5).trim();
+    if (!payload || payload === '[DONE]') return;
+    let evt;
+    try { evt = JSON.parse(payload); } catch { return; }
+    if (evt.type === 'response.output_text.delta' && typeof evt.delta === 'string') deltas.push(evt.delta);
+    else if (evt.type === 'response.completed' && evt.response) finalJson = evt.response;
+    else if (evt.type === 'response.failed' || evt.type === 'error') finalJson = evt;
+    else if (typeof evt.choices?.[0]?.delta?.content === 'string') deltas.push(evt.choices[0].delta.content);
+    else if (typeof evt.choices?.[0]?.message?.content === 'string') deltas.push(evt.choices[0].message.content);
+  };
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, idx).replace(/\r$/, '');
+      buf = buf.slice(idx + 1);
+      handleLine(line);
+    }
+  }
+  if (buf) handleLine(buf.replace(/\r$/, ''));
+  return { status: 200, json: finalJson, outputText: deltas.join('') || null };
 }
 
 const webError = (code, message, extra = {}) => Object.assign(new Error(message), { code, ...extra });
@@ -169,12 +213,13 @@ export class WebAuditRunner {
         { type: 'message', role: 'user', content: userText },
       ],
       store: false,
-      stream: false,
+      stream: true, // headroom :8787 强制流式（live 实测 HTTP 400 "Stream must be set to true"）
     };
     const record = { packet, attempts: 0, outcome: null };
     this.calls.push(record);
-    const json = await this.#postWithRetries(body, token, record);
-    const text = extractReviewerText(json);
+    const res = await this.#postWithRetries(body, token, record);
+    // SSE 应答：模型文本在 outputText（delta 累积）；JSON 应答：从 json 提取。
+    const text = res.outputText ?? extractReviewerText(res.json);
     if (!text) throw webError('AUDIT_VERDICT_MISSING', 'web reviewer returned no output text');
     let verdict;
     try { verdict = parseAuditorVerdict(text); }
@@ -205,8 +250,8 @@ export class WebAuditRunner {
         lastError = webError('AUDIT_WEB_UNREACHABLE', `web reviewer transport failed: ${e?.message ?? e}`, { cause: e });
         continue;
       }
-      if (res.status >= 200 && res.status < 300) { record.outcome = record.outcome ?? `http_${res.status}`; return res.json; }
-      const snippet = (res.json?.error?.message ?? res.text ?? '').toString().slice(0, 300);
+      if (res.status >= 200 && res.status < 300) { record.outcome = record.outcome ?? `http_${res.status}`; return res; }
+      const snippet = (res.json?.error?.message ?? res.outputText ?? '').toString().slice(0, 300);
       if (res.status === 401 || res.status === 403) {
         throw webError('AUDIT_WEB_LOGIN_EXPIRED', `web reviewer auth rejected (HTTP ${res.status}): ${snippet}`);
       }
