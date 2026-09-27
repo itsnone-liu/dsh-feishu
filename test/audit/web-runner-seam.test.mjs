@@ -171,4 +171,43 @@ await ok('web malformed verdict walks frozen verdictMissing retry (exactly one V
   } finally { m.cleanup(); }
 });
 
+await ok('HTTP 200 + stream failure inside frozen lifecycle: no VERDICT_RETRY, round latched, explicit review() recovers', async () => {
+  const x = fixture(); const m = setup(x);
+  try {
+    const started = await m.lifecycle.start({ chatId: 'chat-a', stopAfter: 'T1' });
+    const run = started.run;
+    // 先流内失败一次（200 + response.failed），再正常返回 verdict。
+    let failNext = true;
+    const runner = new WebAuditRunner({
+      readAuth: () => 't', retryDelayMs: 1, sleep: async () => {},
+      transport: async () => {
+        if (failNext) {
+          failNext = false;
+          return { status: 200, json: null, outputText: null,
+            streamError: { type: 'response.failed', code: 'server_error', status: null, message: 'upstream exploded' } };
+        }
+        const text = buildVerdictText({ state: 'APPROVE', runId: run.runId, hostId: 'h1', stage: 'T1', iteration: 1, summary: ['ok'], evidence: ['ok'] });
+        return { status: 200, json: { output: [{ type: 'message', content: [{ type: 'output_text', text }] }] }, outputText: null, streamError: null };
+      },
+    });
+    m.lifecycle.reviewer = runner;
+    const a = m.commit('a.txt', 'A', 'A');
+    await m.lifecycle.onEvent({ id: m.agent.id }, { type: 'turn/start', data: { turn: 1 } });
+    await m.lifecycle.onEvent({ id: m.agent.id }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: buildExecutorMarkerText({ runId: run.runId, hostId: 'h1', stage: 'T1', iteration: 1, head: a }) }] } } });
+    await assert.rejects(() => m.lifecycle.onEvent({ id: m.agent.id }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } }), (e) => e.code === 'AUDIT_WEB_UPSTREAM_ERROR');
+    assert.equal(runner.calls.length, 1);
+    assert.equal(run.s.state, 'AUDITING');
+    // 关键：infrastructure failure 不得触发 verdictMissing 自动重试
+    const events = m.store.loadRun(run.runId).events;
+    assert.equal(events.filter((e) => e.event === 'VERDICT_RETRY').length, 0);
+    // round latched：重复 turn/end 不再打网页额度
+    await m.lifecycle.onEvent({ id: m.agent.id }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } }).catch(() => undefined);
+    assert.equal(runner.calls.length, 1);
+    // 显式恢复出口仍可用
+    await m.lifecycle.review(run.runId, runner);
+    assert.equal(runner.calls.length, 2);
+    assert.equal(run.s.state, 'STOPPED_TARGET_REACHED');
+  } finally { m.cleanup(); }
+});
+
 console.log(`\n${pass} passed, ${fail} failed`); process.exitCode = fail ? 1 : 0;

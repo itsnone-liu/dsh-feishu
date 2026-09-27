@@ -31,7 +31,9 @@ await ok('real web chain returns a parseable frozen-protocol verdict', async () 
   const v = await r.review(packet);
   console.log(`  state=${v.state} stage=${v.stage} iteration=${v.iteration} summary=${JSON.stringify(v.summary?.[0] ?? null)}`);
   assert.equal(v.runId, packet.runId, 'verdict must echo the packet RUN_ID (identity is kernel-validated)');
-  assert.equal(v.stage, packet.stage);
+  assert.equal(v.hostId, packet.hostId, 'verdict must echo HOST_ID');
+  assert.equal(v.stage, packet.stage, 'verdict must echo STAGE');
+  assert.equal(v.iteration, packet.iteration, 'verdict must echo ITERATION');
   assert.ok(['APPROVE', 'REVISE', 'NEED_USER'].includes(v.state));
 });
 

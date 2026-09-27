@@ -102,7 +102,10 @@ async function defaultTransport({ url, method, headers, body, timeoutMs }) {
   const res = await fetch(url, { method, headers, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
   const contentType = res.headers.get('content-type') ?? '';
   if (contentType.includes('text/event-stream')) {
-    return consumeSseStream(res.body);
+    // SSE consumer 不伪造 HTTP 状态：真实 res.status 原样上抛，
+    // 429/5xx 走既有分类，200+response.failed 走 streamError 分类（A5.3）。
+    const sse = await consumeSseStream(res.body);
+    return { status: res.status, json: sse.json, outputText: sse.outputText, streamError: sse.streamError };
   }
   const text = await res.text();
   let json = null;
@@ -116,9 +119,12 @@ async function defaultTransport({ url, method, headers, body, timeoutMs }) {
  * 注意：headroom 的 response.completed 事件里 output 数组为空，模型文本只存在于
  * output_text.delta 事件 —— 因此累积 delta 是唯一可靠的文本来源。
  * 兼容：response.output_text.delta / chat.completions delta 形状。
+ * streamError：response.failed / error 事件的结构化提取 —— HTTP 200 下流内失败
+ * 也必须归类为 infrastructure error，绝不降级成 verdictMissing 自动重试（A4 冻结）。
  */
 export async function consumeSseStream(stream) {
   let finalJson = null;
+  let streamError = null;
   const deltas = [];
   const reader = stream.getReader();
   const decoder = new TextDecoder();
@@ -131,7 +137,16 @@ export async function consumeSseStream(stream) {
     try { evt = JSON.parse(payload); } catch { return; }
     if (evt.type === 'response.output_text.delta' && typeof evt.delta === 'string') deltas.push(evt.delta);
     else if (evt.type === 'response.completed' && evt.response) finalJson = evt.response;
-    else if (evt.type === 'response.failed' || evt.type === 'error') finalJson = evt;
+    else if (evt.type === 'response.failed' || evt.type === 'error') {
+      finalJson = evt;
+      const err = evt.error ?? evt.response?.error ?? {};
+      streamError = {
+        type: evt.type,
+        code: err.code ?? evt.code ?? null,
+        status: err.status ?? evt.status ?? null,
+        message: err.message ?? evt.message ?? evt.type,
+      };
+    }
     else if (typeof evt.choices?.[0]?.delta?.content === 'string') deltas.push(evt.choices[0].delta.content);
     else if (typeof evt.choices?.[0]?.message?.content === 'string') deltas.push(evt.choices[0].message.content);
   };
@@ -147,10 +162,22 @@ export async function consumeSseStream(stream) {
     }
   }
   if (buf) handleLine(buf.replace(/\r$/, ''));
-  return { status: 200, json: finalJson, outputText: deltas.join('') || null };
+  return { json: finalJson, outputText: deltas.join('') || null, streamError };
 }
 
 const webError = (code, message, extra = {}) => Object.assign(new Error(message), { code, ...extra });
+
+/** HTTP 200 + SSE 流内失败（response.failed / error）→ infrastructure 分类。 */
+function classifyStreamError(se) {
+  const sig = `${se?.code ?? ''} ${se?.status ?? ''} ${se?.message ?? ''}`.toLowerCase();
+  if (/\b(401|403)\b/.test(sig) || sig.includes('unauthorized') || sig.includes('forbidden') || sig.includes('login') || sig.includes('token_expired')) {
+    return 'AUDIT_WEB_LOGIN_EXPIRED';
+  }
+  if (/\b429\b/.test(sig) || sig.includes('rate_limit') || sig.includes('rate limit') || sig.includes('quota')) {
+    return 'AUDIT_WEB_QUOTA';
+  }
+  return 'AUDIT_WEB_UPSTREAM_ERROR'; // 识别不了也按 infrastructure 处理，绝不降级成协议错误
+}
 
 export class WebAuditRunner {
   constructor({
@@ -250,7 +277,16 @@ export class WebAuditRunner {
         lastError = webError('AUDIT_WEB_UNREACHABLE', `web reviewer transport failed: ${e?.message ?? e}`, { cause: e });
         continue;
       }
-      if (res.status >= 200 && res.status < 300) { record.outcome = record.outcome ?? `http_${res.status}`; return res; }
+      if (res.status >= 200 && res.status < 300) {
+        // HTTP 200 但流内 response.failed / error：infrastructure error，round latch，
+        // 绝不降级成 verdictMissing（A4 冻结语义，A5.3 收口）。
+        if (res.streamError) {
+          const code = classifyStreamError(res.streamError);
+          throw webError(code, `web reviewer stream failed (${res.streamError.type}${res.streamError.code ? ` ${res.streamError.code}` : ''}): ${String(res.streamError.message).slice(0, 300)}`);
+        }
+        record.outcome = record.outcome ?? `http_${res.status}`;
+        return res;
+      }
       const snippet = (res.json?.error?.message ?? res.outputText ?? '').toString().slice(0, 300);
       if (res.status === 401 || res.status === 403) {
         throw webError('AUDIT_WEB_LOGIN_EXPIRED', `web reviewer auth rejected (HTTP ${res.status}): ${snippet}`);

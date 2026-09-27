@@ -185,4 +185,54 @@ await ok('SSE stream consumption: deltas + response.completed + chat delta + spl
   assert.equal(r2.json, null); // chat delta 形状无 completed 事件，json 为空但文本已拿到
 });
 
+// ---------- A5.3：SSE 失败语义（走真实 defaultTransport，patch 全局 fetch） ----------
+const realFetch = globalThis.fetch;
+const sseResponse = (status, events) => ({
+  status,
+  headers: { get: (k) => (String(k).toLowerCase() === 'content-type' ? 'text/event-stream' : null) },
+  body: new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(events)); c.close(); } }),
+});
+const withFetch = (impl, fn) => { globalThis.fetch = impl; return fn().finally(() => { globalThis.fetch = realFetch; }); };
+const liveRunner = () => new WebAuditRunner({ readAuth: () => 't', retryDelayMs: 1, sleep: async () => {} });
+
+await ok('SSE + HTTP 429 → AUDIT_WEB_QUOTA（真实状态码不再被伪装成 200）', async () => {
+  let calls = 0;
+  await withFetch(async () => { calls++; return sseResponse(429, ''); }, async () => {
+    const r = liveRunner();
+    await assert.rejects(() => r.review(packet), (e) => e.code === 'AUDIT_WEB_QUOTA');
+    assert.equal(r.calls[0].attempts, 1);
+    assert.equal(calls, 1);
+  });
+});
+
+await ok('SSE + HTTP 503 → 瞬态重试耗尽 → AUDIT_WEB_UPSTREAM_ERROR', async () => {
+  let calls = 0;
+  await withFetch(async () => { calls++; return sseResponse(503, ''); }, async () => {
+    const r = liveRunner();
+    await assert.rejects(() => r.review(packet), (e) => e.code === 'AUDIT_WEB_UPSTREAM_ERROR');
+    assert.equal(r.calls[0].attempts, 3);
+    assert.equal(calls, 3);
+  });
+});
+
+await ok('HTTP 200 + response.failed → infrastructure error（绝不降级 verdictMissing）', async () => {
+  const events = 'event: response.failed\ndata: {"type":"response.failed","response":{"error":{"code":"server_error","message":"upstream exploded"}}}\n\ndata: [DONE]\n\n';
+  await withFetch(async () => sseResponse(200, events), async () => {
+    const r = liveRunner();
+    await assert.rejects(() => r.review(packet), (e) => e.code === 'AUDIT_WEB_UPSTREAM_ERROR' && /upstream exploded/.test(e.message));
+    assert.equal(r.calls[0].attempts, 1);
+  });
+});
+
+await ok('HTTP 200 + 流内错误按 code 细分：rate_limit → QUOTA；401 → LOGIN_EXPIRED', async () => {
+  await withFetch(async () => sseResponse(200, 'event: response.failed\ndata: {"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"slow down"}}}\n\n'), async () => {
+    const r = liveRunner();
+    await assert.rejects(() => r.review(packet), (e) => e.code === 'AUDIT_WEB_QUOTA');
+  });
+  await withFetch(async () => sseResponse(200, 'event: error\ndata: {"type":"error","code":401,"message":"token_expired"}\n\n'), async () => {
+    const r = liveRunner();
+    await assert.rejects(() => r.review(packet), (e) => e.code === 'AUDIT_WEB_LOGIN_EXPIRED');
+  });
+});
+
 console.log(`\n${pass} passed, ${fail} failed`); process.exitCode = fail ? 1 : 0;
