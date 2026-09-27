@@ -373,5 +373,32 @@ await ok('crash window: auditedCommits written, AUDITING state not yet → repla
   assert.equal(ev.filter((e) => e === 'AUDIT_STARTED').length, 1);
 });
 
+await ok('crash window: until() saveManifest done, saveState not → manifest wins (A1.2-1)', () => {
+  const store = newStore();
+  // 初始 stopAfter=T2；模拟用户 /audit until T1 后的 crash 夹缝：
+  // manifest.stopAfter 已写 T1，state.stopAfter 仍 T2（旧值）。
+  const run = AuditRun.create(store, { ...MANIFEST, runId: 'rc15', stopAfter: 'T1' });
+  assert.equal(run.s.stopAfter, 'T1');
+  writeState(store, 'rc15', (s) => ({ ...s, stopAfter: 'T2' })); // 陈旧 state（两个值都合法 → 枚举校验放行）
+  const mfile = path.join(store.root, 'runs', 'rc15', 'manifest.json');
+  const m = JSON.parse(fs.readFileSync(mfile, 'utf8'));
+  assert.equal(m.stopAfter, 'T1'); // manifest 保持权威值 T1
+
+  const reopened = AuditRun.open(store)('rc15');
+  assert.equal(reopened.s.stopAfter, 'T1'); // reconciliation：state ← manifest
+  // 端到端语义：T1 APPROVE 必须停（若按陈旧 state.stopAfter=T2 会错误推进 —— G7）
+  const marker = parseExecutorMarker(buildExecutorMarkerText({
+    runId: 'rc15', hostId: 'h1', stage: 'T1', iteration: 1, head: 'cE1',
+  }));
+  reopened.executorReady(marker, {});
+  reopened.remoteSyncResult({ ok: true, tipMatches: true });
+  const v = parseAuditorVerdict(buildVerdictText({
+    state: 'APPROVE', runId: 'rc15', hostId: 'h1', stage: 'T1', iteration: 1,
+  }));
+  const r = reopened.auditorVerdict(v);
+  assert.equal(r.stopped, true);
+  assert.equal(reopened.s.state, 'STOPPED_TARGET_REACHED'); // 严格停在 until 目标
+});
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exitCode = fail ? 1 : 0;

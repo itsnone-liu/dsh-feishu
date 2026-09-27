@@ -246,6 +246,52 @@ await ok('DSH quota before marker → wait → recover → READY', () => {
   assert.ok(eventsOf(store, 'e18').includes('DSH_QUOTA_WAIT'));
 });
 
+// ---------- A1.2：retry counter 按「协议周期」计，不按 run 累计 ----------
+await ok('markerRetries reset on accepted READY: T2 missing still gets its retry (A1.2-2)', () => {
+  const store = newStore();
+  const { run } = scenario(store, 'e22',
+    [{ type: 'MISSING_MARKER' }, { type: 'READY' }, { type: 'MISSING_MARKER' }, { type: 'READY' }],
+    [{ type: 'APPROVE' }, { type: 'APPROVE' }]);
+  assert.equal(run.s.state, 'STOPPED_TARGET_REACHED');
+  const ev = eventsOf(store, 'e22');
+  assert.equal(ev.filter((e) => e === 'MARKER_RETRY').length, 2); // 每个 stage 各得一次重问
+  assert.equal(ev.filter((e) => e === 'MARKER_PARSE_FAILED').length, 0); // 不再直接 fail
+});
+
+await ok('verdictRetries reset on accepted verdict: across REVISE and stage (A1.2-3)', () => {
+  const store = newStore();
+  const { run } = scenario(store, 'e23',
+    [{ type: 'READY' }, { type: 'READY' }],
+    [
+      { type: 'MALFORMED_OUTPUT' }, { type: 'REVISE' },   // iter1: 坏输出→重发→REVISE 接受（reset）
+      { type: 'MALFORMED_OUTPUT' }, { type: 'APPROVE' },  // iter2: 又坏输出→仍得重试→APPROVE
+    ],
+    { manifest: { stopAfter: 'T1' } });
+  assert.equal(run.s.state, 'STOPPED_TARGET_REACHED');
+  const ev = eventsOf(store, 'e23');
+  assert.equal(ev.filter((e) => e === 'VERDICT_RETRY').length, 2);
+  assert.equal(ev.filter((e) => e === 'VERDICT_PARSE_FAILED').length, 0);
+});
+
+await ok('pushAttempts reset per remote-sync episode: T2 first transient not fatal (A1.2-4)', () => {
+  const store = newStore();
+  const { run } = scenario(store, 'e24',
+    [
+      { type: 'READY', pushAll: [
+        { ok: false, kind: 'transient' }, { ok: false, kind: 'transient' },
+        { ok: false, kind: 'transient' }, { ok: true, tipMatches: true },
+      ] },                                    // T1: 3 次瞬时失败后第 4 次成功（episode 归零）
+      { type: 'READY', pushAll: [
+        { ok: false, kind: 'transient' }, { ok: true, tipMatches: true },
+      ] },                                    // T2: 新 episode 第 1 次失败不继承 T1 的计数
+    ],
+    [{ type: 'APPROVE' }, { type: 'APPROVE' }]);
+  assert.equal(run.s.state, 'STOPPED_TARGET_REACHED');
+  const ev = eventsOf(store, 'e24');
+  assert.equal(ev.filter((e) => e === 'ERROR_GIT_REMOTE').length, 0); // 不再误 fatal
+  assert.equal(ev.filter((e) => e === 'GIT_PUSH_WAIT').length, 2);    // 两个 episode 各进一次 WAIT
+});
+
 // ---------- 多 run 隔离 ----------
 await ok('two concurrent runs: events and commits never cross', () => {
   const store = newStore();

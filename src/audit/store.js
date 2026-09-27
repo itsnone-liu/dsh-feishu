@@ -225,7 +225,16 @@ export class AuditStore {
       bad(`revisionCount must be an integer >= 0, got ${state.revisionCount}`);
     }
     if (typeof state.startedAt !== 'number') bad('startedAt must be a number');
-    if (state.state !== 'NEXT_STAGE' && manifest.currentStage !== state.currentStage) {
+    if (state.state === 'NEXT_STAGE') {
+      // A1.2-5：两段式推进窗口内 manifest.currentStage 只允许「尚未推进」或
+      // 「已推进到 immediate next」两种；任意其他分歧 = 磁盘被外部篡改。
+      const idx = manifest.stages.indexOf(state.currentStage);
+      const allowed = [state.currentStage, manifest.stages[idx + 1]];
+      if (!allowed.includes(manifest.currentStage)) {
+        bad(`NEXT_STAGE window: manifest.currentStage "${manifest.currentStage}" is neither `
+          + `"${state.currentStage}" nor its immediate next "${manifest.stages[idx + 1]}"`);
+      }
+    } else if (manifest.currentStage !== state.currentStage) {
       bad(`manifest.currentStage "${manifest.currentStage}" != state.currentStage `
         + `"${state.currentStage}" in state ${state.state} (only NEXT_STAGE may diverge mid-advance)`);
     }

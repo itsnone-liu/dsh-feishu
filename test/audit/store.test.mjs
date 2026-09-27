@@ -133,6 +133,26 @@ await ok('loadRun tolerates currentStage divergence ONLY for NEXT_STAGE (mid-adv
   assert.equal(loaded.state.state, 'NEXT_STAGE');
 });
 
+await ok('NEXT_STAGE window: manifest.currentStage may only be same or immediate next (A1.2-5)', () => {
+  const s = tmpStore();
+  s.createRun(M({ stages: ['T1', 'T2', 'T3'], stopAfter: 'T3' }), S());
+  const sfile = path.join(s.root, 'runs', 'r1', 'state.json');
+  const st = JSON.parse(fs.readFileSync(sfile, 'utf8'));
+  st.state = 'NEXT_STAGE';
+  fs.writeFileSync(sfile, `${JSON.stringify(st, null, 2)}\n`);
+
+  // immediate next（T2）：放行 —— 推进已完成 manifest 写、未完成 state 写的窗口
+  const mfile = path.join(s.root, 'runs', 'r1', 'manifest.json');
+  const m = JSON.parse(fs.readFileSync(mfile, 'utf8'));
+  fs.writeFileSync(mfile, `${JSON.stringify({ ...m, currentStage: 'T2' }, null, 2)}\n`);
+  assert.equal(s.loadRun('r1').manifest.currentStage, 'T2');
+
+  // 非相邻（T3）：拒绝 —— 任意其他分歧视为外部篡改
+  fs.writeFileSync(mfile, `${JSON.stringify({ ...m, currentStage: 'T3' }, null, 2)}\n`);
+  assert.throws(() => s.loadRun('r1'), (e) => e.code === 'AUDIT_STORE_CORRUPTION'
+    && /NEXT_STAGE window/.test(e.message));
+});
+
 await ok('loadRun validates every event line schema (not just JSON parse)', () => {
   const s = tmpStore();
   s.createRun(M(), S());

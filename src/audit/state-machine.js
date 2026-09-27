@@ -137,12 +137,20 @@ export class AuditRun {
   get isTerminal() { return TERMINAL_STATES.includes(this.s.state); }
 
   /**
-   * 持久化中间态确定性收敛（A1.1 P0-2）。覆盖三类两段式转移的 crash 窗口：
+   * 持久化中间态确定性收敛（A1.1 P0-2 / A1.2）。覆盖：
+   *  - stopAfter 双文件 crash 窗口（A1.2-1）：until() 先写 manifest 后写 state，
+   *    崩溃夹缝中两者可能分歧 —— manifest 是 stopAfter 的权威源，此处确定性
+   *    state ← manifest 并落盘（否则 T1 APPROVE 可能按陈旧 state.stopAfter 误进 T2）；
    *  - NEXT_STAGE 已落盘、阶段推进未完成 → 补完推进（幂等：STAGE_ADVANCED 已发则被 dedupe 吞）；
    *  - REVISE_LOOP_EXHAUSTED / HISTORY_REWRITTEN 已落盘、PAUSED_NEEDS_USER 未转 → 补转。
    * 稳态调用为 no-op。不得把瞬态恢复留给上层猜测。
    */
   recoverTransientState() {
+    if (this.s.stopAfter !== this.manifest.stopAfter) {
+      this.s.stopAfter = this.manifest.stopAfter;
+      this.#touch();
+      this.store.saveState(this.s);
+    }
     const st = this.s.state;
     if (st === 'NEXT_STAGE') {
       this.#completeStageAdvance();
@@ -237,7 +245,11 @@ export class AuditRun {
       return { historyRewritten: true };
     }
     // HEAD 前进到本 stage 新 commit；待 §29 gate 确认远端可见。
+    // A1.2-2/4：合法 marker 被接受 = 新的 executor 协议周期 + 新的 remote-sync episode，
+    // 旧周期的 markerRetries / pushAttempts 不继承（§9/§29 的上限按周期计，不按 run 累计）。
     this.s.headCommit = parsed.head;
+    this.s.markerRetries = 0;
+    this.s.retry.pushAttempts = 0;
     this.s.pendingRemoteSync = { stage: this.s.currentStage, iteration: this.s.iteration, head: parsed.head };
     this.#emit('READY_FOR_AUDIT');
     this.#touch(); this.store.saveState(this.s);
@@ -267,6 +279,7 @@ export class AuditRun {
       }
       this.s.pendingRemoteSync = null;
       this.s.auditInFlight = { stage: sync.stage, iteration: sync.iteration, headCommit: sync.head };
+      this.s.retry.pushAttempts = 0; // A1.2-4：episode 成功即归零
       this.#transition('AUDITING');
       this.#emit('AUDIT_STARTED');
       return { auditing: true };
@@ -367,6 +380,7 @@ export class AuditRun {
       parsed,
     );
     this.s.lastVerdict = { ...parsed, headCommit: this.s.auditInFlight.headCommit };
+    this.s.verdictRetries = 0; // A1.2-3：合法 verdict 被接受 = 协议周期成功，旧失败不跨 iteration/stage 继承
 
     if (parsed.state === 'APPROVE') {
       this.#emit('AUDIT_APPROVE');
