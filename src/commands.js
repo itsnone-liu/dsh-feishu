@@ -20,6 +20,7 @@ import { execFile } from 'node:child_process';
 import { buildInfoCard, buildErrorCard } from './cards.js';
 import { isWorkspaceAllowed, dshHome } from './config.js';
 import { log } from './log.js';
+import { handleAuditCommand } from './audit/commands.js';
 
 const HELP = [
   '**dsh-feishu 桥**',
@@ -55,7 +56,7 @@ const MODE_ALIASES = {
 };
 
 export class Commands {
-  constructor({ config, store, driver, renderer, transport, permissionPresets, llm, agentPresets, visionReady = false, autoContinue = null }) {
+  constructor({ config, store, driver, renderer, transport, permissionPresets, llm, agentPresets, visionReady = false, autoContinue = null, auditController = null }) {
     this.config = config;
     this.store = store;
     this.driver = driver;
@@ -66,6 +67,7 @@ export class Commands {
     this.agentPresets = agentPresets;
     this.visionReady = visionReady;
     this.autoContinue = autoContinue;
+    this.auditController = auditController; // A2：/audit 命令面（注入可选，测试/旧装配不炸）
   }
 
 
@@ -87,6 +89,8 @@ export class Commands {
           return await this.cmdNew(chatId, arg);
         case 'stop':
           return await this.cmdStop(chatId);
+        case 'audit':
+          return await this.cmdAudit(chatId, arg);
         case 'status':
           return await this.cmdStatus(chatId);
         case 'mode':
@@ -129,6 +133,29 @@ export class Commands {
       await this.transport.sendCard(chatId, buildErrorCard(`/${cmd} 失败`, e.message));
       return true;
     }
+  }
+
+  /**
+   * /audit — 审计模式命令面（A2）：创建/查看/暂停/恢复/终止/改停止点。
+   * 全部语义由 A1 冻结内核执行；这里只解析参数并发卡片。
+   */
+  async cmdAudit(chatId, arg) {
+    if (!this.auditController) {
+      await this.transport.sendCard(chatId, buildErrorCard(
+        new Error('/audit 未启用：本装配未注入 AuditController（A2 功能）。'),
+      ));
+      return true;
+    }
+    let card;
+    try {
+      const { title, body, template } = handleAuditCommand(this.auditController, arg ?? '');
+      card = buildInfoCard(title, body, template ? { template } : undefined);
+    } catch (e) {
+      log.error(`/audit handler crashed: ${e?.stack ?? e}`);
+      card = buildErrorCard(e);
+    }
+    await this.transport.sendCard(chatId, card);
+    return true;
   }
 
   async cmdNew(chatId, cwdArg) {
