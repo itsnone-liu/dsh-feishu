@@ -77,7 +77,7 @@ export class AuditLifecycle {
     }, { maxReviewIterations: this.controller.maxReviewIterations, now: this.controller.now });
     const executor = this.executorFactory({
       driver: this.driver, gitGate: gate,
-      onTransient: this.retryScheduler ? (entry) => this.retryScheduler.schedule(entry.run.runId) : null,
+      onTransient: this.retryScheduler ? (entry, _result, attempt) => this.retryScheduler.schedule(entry.run.runId, (id) => this.executors.get(id)?.retry(id), attempt) : null,
     });
     this.executors.set(runId, executor);
     await executor.start({ run, agent, gitGate: gate });

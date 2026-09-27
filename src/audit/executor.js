@@ -46,7 +46,7 @@ export class AuditExecutor {
     } catch (e) {
       if (e.code === 'AUDIT_GIT_COMMAND_FAILED') {
         const result = entry.run.remoteSyncResult({ ok: false, kind: 'transient' });
-        if (result.waiting && this.onTransient) await this.onTransient(entry, result);
+        if (result.waiting && this.onTransient) await this.onTransient(entry, result, entry.run.s.retry.pushAttempts);
         return result;
       }
       return entry.run.remoteSyncResult({ ok: false, kind: 'rejected' });
@@ -92,7 +92,7 @@ export class AuditExecutor {
     } catch (e) {
       if (e.code === 'AUDIT_GIT_COMMAND_FAILED') {
         const result = run.remoteSyncResult({ ok: false, kind: 'transient' });
-        if (result.waiting && this.onTransient) await this.onTransient(entry, result);
+        if (result.waiting && this.onTransient) await this.onTransient(entry, result, entry.run.s.retry.pushAttempts);
         return result;
       }
       if (e.code === 'AUDIT_GIT_REJECTED' || e.code === 'AUDIT_GIT_TIP_DIVERGED' || e.code === 'AUDIT_GIT_HEAD_MISMATCH') {
