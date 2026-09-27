@@ -27,7 +27,7 @@ await ok('空参数 → usage 卡', () => {
   const r = handleAuditCommand(newCtrl(), '', 'oc_A');
   assert.equal(r.title, '/audit 用法');
   assert.match(r.body, /audit <阶段>/);
-  assert.match(r.body, /A2 阶段/);
+  assert.match(r.body, /A3 已接入/);
 });
 
 await ok('/audit T2 → 创建卡（EXECUTING + 停止点 + A2 披露）', () => {
