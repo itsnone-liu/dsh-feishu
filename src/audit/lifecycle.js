@@ -101,15 +101,19 @@ export class AuditLifecycle {
       if (run.s.state !== 'AUDITING' || !inFlight) throw Object.assign(new Error('audit packet unavailable outside AUDITING'), { code: 'AUDIT_REVIEW_NOT_READY' });
       const stage = inFlight.stage ?? run.s.currentStage;
       const packet = { runId, hostId: run.manifest.hostId, stage, iteration: inFlight.iteration ?? run.s.iteration, repo: run.manifest.repo, branch: run.manifest.branch, targetCommit: inFlight.headCommit, baseCommit: run.s.stageBaseCommit, goal: run.manifest.goal, stageRequirement: run.manifest.stageRequirements?.[stage] ?? null };
-      let verdict;
-      try { verdict = await reviewer.review(packet); }
-      catch (e) {
-        if (e?.code === 'AUDIT_VERDICT_MALFORMED' || e?.code === 'AUDIT_VERDICT_MISSING') {
-          return run.verdictMissing();
+      for (;;) {
+        let verdict;
+        try { verdict = await reviewer.review(packet); }
+        catch (e) {
+          if (e?.code === 'AUDIT_VERDICT_MALFORMED' || e?.code === 'AUDIT_VERDICT_MISSING') {
+            const missing = run.verdictMissing();
+            if (missing.retry) continue;
+            return missing;
+          }
+          throw e;
         }
-        throw e;
+        return executor.applyVerdict(runId, verdict);
       }
-      return executor.applyVerdict(runId, verdict);
     });
   }
 
