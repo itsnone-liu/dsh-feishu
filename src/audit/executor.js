@@ -76,7 +76,6 @@ export class AuditExecutor {
     } catch {
       return { ignored: true };
     }
-    entry.markerTurn = entry.turn;
     const { run, gitGate } = entry;
     try {
       const ancestryOk = await Promise.all([
@@ -84,6 +83,7 @@ export class AuditExecutor {
         ...run.manifest.auditedCommits,
       ].filter(Boolean).map((commit) => gitGate.isAncestor(commit, marker.head))).then((checks) => checks.every(Boolean));
       const ready = run.executorReady(marker, { ancestryOk });
+      entry.markerTurn = entry.turn;
       if (!ready.pendingRemoteSync) return ready;
       const result = await gitGate.pushAndVerify({
         branch: run.manifest.branch, head: marker.head, remote: 'origin',

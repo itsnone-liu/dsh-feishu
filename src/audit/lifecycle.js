@@ -14,16 +14,19 @@ import { loadTaskPacket } from './task-packet.js';
 import { AuditRetryScheduler } from './retry-scheduler.js';
 
 export class AuditLifecycle {
-  constructor({ controller, driver, bindings, gitGateFactory = (opts) => new GitRemoteGate(opts), executorFactory = (opts) => new AuditExecutor(opts), taskPacketLoader = loadTaskPacket, retryScheduler = null } = {}) {
+  constructor({ controller, driver, bindings, gitGateFactory = (opts) => new GitRemoteGate(opts), executorFactory = (opts) => new AuditExecutor(opts), taskPacketLoader = loadTaskPacket, retryScheduler = null, onError = null } = {}) {
     this.controller = controller;
     this.driver = driver;
+    this.onError = onError;
     this.bindings = bindings;
     this.gitGateFactory = gitGateFactory;
     this.executorFactory = executorFactory;
     this.taskPacketLoader = taskPacketLoader;
-    this.retryScheduler = retryScheduler ?? new AuditRetryScheduler({ onRetry: (runId) => this.executors.get(runId)?.retry(runId) });
+    this.retryScheduler = retryScheduler ?? new AuditRetryScheduler({ onRetry: (runId) => this.executors.get(runId)?.retry(runId), onError: (e, runId) => this.onError?.(e, runId) });
     this.executors = new Map();
+    this.liveRuns = new Map();
     this.eventQueues = new Map();
+    this.busyRuns = new Set();
   }
 
   async start({ chatId, stopAfter, stages, goal, approvedPlan, taskPacket = null } = {}) {
@@ -80,14 +83,38 @@ export class AuditLifecycle {
       onTransient: this.retryScheduler ? (entry, _result, attempt) => this.retryScheduler.schedule(entry.run.runId, (id) => this.executors.get(id)?.retry(id), attempt) : null,
     });
     this.executors.set(runId, executor);
+    this.liveRuns.set(runId, run);
     await executor.start({ run, agent, gitGate: gate });
     return { run, executor, agent, git };
   }
 
   async applyVerdict(runId, verdict) {
-    const executor = this.executors.get(runId);
-    if (!executor) throw Object.assign(new Error(`executor run not found: ${runId}`), { code: 'AUDIT_EXECUTOR_NOT_FOUND' });
-    return executor.applyVerdict(runId, verdict);
+    return this.#serial(runId, () => {
+      const executor = this.executors.get(runId);
+      if (!executor) throw Object.assign(new Error(`executor run not found: ${runId}`), { code: 'AUDIT_EXECUTOR_NOT_FOUND' });
+      return executor.applyVerdict(runId, verdict);
+    });
+  }
+
+  #serial(runId, fn) {
+    const prior = this.eventQueues.get(runId) ?? Promise.resolve();
+    const task = prior.then(fn);
+    this.eventQueues.set(runId, task.catch(() => undefined));
+    return task;
+  }
+
+  async control(runId, action, arg) {
+    return this.#serial(runId, () => {
+      const run = this.liveRuns.get(runId);
+      if (!run) throw Object.assign(new Error(`live run not found: ${runId}`), { code: 'AUDIT_RUN_NOT_FOUND' });
+      if (action === 'pause') return run.pause();
+      if (action === 'resume') return run.resume();
+      if (action === 'stop') {
+        this.retryScheduler.cancel(runId); this.executors.get(runId)?.stop(runId); return run.stop();
+      }
+      if (action === 'until') return run.until(arg);
+      throw new Error(`unknown audit control action ${action}`);
+    });
   }
 
   async onEvent(session, event) {
@@ -122,6 +149,7 @@ export class AuditLifecycle {
     const gate = this.gitGateFactory({ cwd: run.manifest.cwd });
     const executor = this.executorFactory({ driver: this.driver, gitGate: gate });
     this.executors.set(runId, executor);
+    this.liveRuns.set(runId, run);
     await executor.start({ run, agent, gitGate: gate, sendPrompt: false });
     if (run.s.state === 'WAIT_GIT_PUSH' && run.s.pendingRemoteSync) {
       this.retryScheduler.schedule(runId, (id) => this.executors.get(id)?.retry(id), run.s.retry.pushAttempts);

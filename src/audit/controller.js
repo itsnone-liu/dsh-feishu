@@ -124,9 +124,17 @@ export class AuditController {
   }
 
   /** 内核调用统一包装：异常翻译为 {ok:false, code, message}，不吞、不改语义。 */
+  #control(id, action, arg) {
+    try {
+      return this.lifecycle.control(id, action, arg).then((result) => ({ ok: true, runId: id, result }));
+    } catch (e) {
+      return { ok: false, runId: id, code: e.code ?? 'AUDIT_ERROR', message: e.message };
+    }
+  }
+
   #call(id, fn) {
     try {
-      const run = this.#open(id);
+      const run = this.lifecycle?.liveRuns?.get(id) ?? this.#open(id);
       const result = fn(run) ?? {};
       return { ok: true, runId: id, result };
     } catch (e) {
@@ -226,6 +234,7 @@ export class AuditController {
     if (t.error) return t.error;
     const id = t.id;
     if (!id) return { ok: false, code: 'AUDIT_NO_ACTIVE_RUN', message: '没有活跃的审计运行可暂停。' };
+    if (this.lifecycle?.liveRuns?.has(id)) return this.#control(id, 'pause');
     return this.#call(id, (run) => ({ state: (run.pause(), run.s.state) }));
   }
 
@@ -238,6 +247,7 @@ export class AuditController {
     if (t.error) return t.error;
     const id = t.id;
     if (!id) return { ok: false, code: 'AUDIT_NO_ACTIVE_RUN', message: '没有活跃的审计运行可恢复。' };
+    if (this.lifecycle?.liveRuns?.has(id)) return this.#control(id, 'resume');
     return this.#call(id, (run) => {
       if (run.s.state === 'PAUSED_NEEDS_USER') {
         if (run.s.cause === 'HISTORY_REWRITTEN') {
@@ -258,6 +268,7 @@ export class AuditController {
     if (t.error) return t.error;
     const id = t.id;
     if (!id) return { ok: false, code: 'AUDIT_NO_ACTIVE_RUN', message: '没有活跃的审计运行可终止。' };
+    if (this.lifecycle?.liveRuns?.has(id)) return this.#control(id, 'stop');
     return this.#call(id, (run) => ({ state: (run.stop(), run.s.state) }));
   }
 
@@ -272,6 +283,7 @@ export class AuditController {
     if (!canonical) {
       return { ok: false, code: 'AUDIT_MANIFEST_INVALID', message: `停止点 \`${target}\` 不在阶段表 [${this.stages.join(', ')}] 中。` };
     }
+    if (this.lifecycle?.liveRuns?.has(id)) return this.#control(id, 'until', canonical);
     return this.#call(id, (run) => {
       const r = run.until(canonical);
       return { changed: r.changed, stopAfter: run.s.stopAfter };
