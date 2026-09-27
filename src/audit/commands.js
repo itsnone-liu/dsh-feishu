@@ -46,13 +46,15 @@ const stateHint = (s) => STATE_HINTS[s] ?? s;
  * @param {string} arg '/audit' 之后的参数原文
  * @returns {{ title: string, body: string, template?: string }}
  */
-export function handleAuditCommand(controller, arg) {
-  const [first, ...rest] = arg.trim().split(/\s+/);
+export function handleAuditCommand(controller, arg, chatId) {
+  const raw = arg.trim();
+  const [first, ...rest] = raw.split(/\s+/);
   const word = (first ?? '').toLowerCase();
+  const management = new Set(['status', 'pause', 'resume', 'stop', 'until']);
 
-  // —— 创建：/audit T2 ——
-  if (word && /^[A-Za-z]\d*$/.test(first) && !['status', 'pause', 'resume', 'stop', 'until'].includes(word)) {
-    const r = controller.createRun({ stopAfter: first });
+  // 除保留管理词外，非空参数整体都是 stage candidate（允许 C4-D/phase-b/T5.6B 等）。
+  if (raw && !management.has(word)) {
+    const r = controller.createRun({ stopAfter: raw, chatId });
     if (!r.ok) {
       return { title: '❌ 创建失败', body: `${r.message}`, template: 'red' };
     }
@@ -61,7 +63,7 @@ export function handleAuditCommand(controller, arg) {
       body: [
         `run：\`${r.runId}\``,
         `状态：**EXECUTING**（${stateHint('EXECUTING')}）`,
-        `停止点：**${first}**（阶段表 ${controller.stages.join(' · ')}）`,
+        `停止点：**${r.result.stopAfter}**（阶段表 ${controller.stages.join(' · ')}）`,
         '',
         'REVISE 上限 8 次/阶段；身份四元组 RUN_ID/STAGE/ITERATION/HOST_ID 已锁定。',
         'A3 接线前没有执行端驱动，`/audit status` 可随时查看。',
@@ -72,8 +74,13 @@ export function handleAuditCommand(controller, arg) {
   switch (word) {
     case '': return { title: '/audit 用法', body: USAGE };
     case 'status': {
-      const r = controller.status();
-      if (!r.ok) return { title: '没有审计运行', body: r.message, template: 'grey' };
+      const r = controller.status(chatId);
+      if (!r.ok) {
+        if (r.code === 'AUDIT_RUN_OWNED_BY_OTHER_CHAT') {
+          return { title: '本机已有审计运行', body: r.message, template: 'grey' };
+        }
+        return { title: '没有审计运行', body: r.message, template: 'grey' };
+      }
       const s = r.result;
       const lines = [
         `run：\`${r.runId}\``,
@@ -92,24 +99,24 @@ export function handleAuditCommand(controller, arg) {
       return { title: '📊 审计状态', body: lines.join('\n') };
     }
     case 'pause': {
-      const r = controller.pause();
+      const r = controller.pause(chatId);
       if (!r.ok) return { title: '❌ 暂停失败', body: r.message, template: 'red' };
       return { title: '⏸ 已暂停', body: `run \`${r.runId}\` 状态 **${r.result.state}**。\n/audit resume 恢复。` };
     }
     case 'resume': {
-      const r = controller.resume();
+      const r = controller.resume(chatId);
       if (!r.ok) return { title: '❌ 恢复失败', body: r.message, template: 'red' };
       return { title: '▶️ 已恢复', body: `run \`${r.runId}\` 状态 **${r.result.state}**。` };
     }
     case 'stop': {
-      const r = controller.stop();
+      const r = controller.stop(chatId);
       if (!r.ok) return { title: '❌ 终止失败', body: r.message, template: 'red' };
       return { title: '🛑 已终止', body: `run \`${r.runId}\` 已进入终态 **${r.result.state}**。可重新 /audit <阶段> 创建新运行。` };
     }
     case 'until': {
       const target = rest[0];
       if (!target) return { title: '用法', body: '`/audit until <阶段>`（如 `/audit until T3`）', template: 'grey' };
-      const r = controller.until(target);
+      const r = controller.until(chatId, target);
       if (!r.ok) return { title: '❌ 修改失败', body: r.message, template: 'red' };
       const extra = r.result.changed ? `停止点已改为 **${r.result.stopAfter}**（v0.2 §6.2 竞态规则由内核执行）。` : `停止点已是 **${r.result.stopAfter}**，无变化。`;
       return { title: '🎯 停止点', body: `run \`${r.runId}\`：${extra}` };

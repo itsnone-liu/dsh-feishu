@@ -49,33 +49,66 @@ export class AuditController {
     this.maxReviewIterations = p.maxReviewIterations ?? 8;
   }
 
-  /** 当前活跃 run（非终态）。@returns {{id: string, state: string}|null} */
+  /** 大小写不敏感解析阶段名 → 阶段表原名（canonical）；未命中返回 null。create/until 共用。 */
+  resolveStage(input) {
+    const s = String(input ?? '').toLowerCase();
+    return this.stages.find((x) => x.toLowerCase() === s) ?? null;
+  }
+
+  /** 当前活跃 run（非终态）。@returns {{id, state, chatId}|null} */
   activeRun() {
     // listRuns 索引可能滞后（saveState 才更新），以磁盘 state.json 为准逐个 open。
     for (const r of this.store.listRuns()) {
       const loaded = this.store.loadRun(r.runId);
       if (loaded && !isTerminalState(loaded.state.state)) {
-        return { id: loaded.state.runId, state: loaded.state.state };
+        return {
+          id: loaded.state.runId, state: loaded.state.state,
+          chatId: loaded.manifest.chatId ?? null,
+        };
       }
     }
     return null;
   }
 
-  /** 最近一次 run（含终态），status 空闲时展示。 */
-  latestRun() {
+  /** owner 匹配的最近 run（含终态）。非 owner 不回看终态细节（A2.1 P0-1）。 */
+  latestRun(chatId) {
     const runs = this.store.listRuns();
-    if (runs.length === 0) return null;
-    const last = runs[runs.length - 1];
-    const loaded = this.store.loadRun(last.runId);
-    return loaded ? { id: loaded.state.runId } : null;
+    for (let i = runs.length - 1; i >= 0; i -= 1) {
+      const loaded = this.store.loadRun(runs[i].runId);
+      if (loaded && (loaded.manifest.chatId ?? null) === chatId) {
+        return { id: loaded.state.runId };
+      }
+    }
+    return null;
   }
 
-  /** 定位命令目标 run：优先活跃 run；无活跃时回退最近 run（供 status 查看）。 */
-  #target({ allowFinished = false } = {}) {
+  /**
+   * 定位命令目标 run 并做 owner 校验（A2.1 P0-1）。
+   * 冻结语义：单 host 一个 active run（auditConcurrencyPerHost=1）+ run 归属发起 chat。
+   * 非 owner 只知道「本机有审计在跑」，不暴露 stage/commit/事件。
+   * @returns {{id}|{error}|{none}}
+   */
+  #target(chatId, { allowFinished = false } = {}) {
+    if (typeof chatId !== 'string' || chatId.length === 0) {
+      return { error: { ok: false, code: 'AUDIT_ARG_INVALID', message: '缺少 chat 上下文（owner 校验 fail closed）。' } };
+    }
     const active = this.activeRun();
-    if (active) return active.id;
-    if (allowFinished) return this.latestRun()?.id ?? null;
-    return null;
+    if (active) {
+      if (active.chatId !== chatId) {
+        return {
+          error: {
+            ok: false, code: 'AUDIT_RUN_OWNED_BY_OTHER_CHAT',
+            message: '本机已有审计运行中，但不是本聊天发起的；详情与控制权归属发起聊天。',
+          },
+        };
+      }
+      return { id: active.id };
+    }
+    if (allowFinished) {
+      const mine = this.latestRun(chatId);
+      return mine ? { id: mine.id } : { none: true };
+    }
+    return { none: true };
   }
 
   #open(id) {
@@ -93,24 +126,35 @@ export class AuditController {
     }
   }
 
-  /** /audit <stage>：创建 run。已有活跃 run → 拒绝（先 /audit stop）。 */
-  createRun({ stopAfter } = {}) {
+  /**
+   * /audit <stage>：创建 run（A2.1：写入 manifest.chatId = 发起 chat）。
+   * 冻结约束 auditConcurrencyPerHost=1：全 host 已有 active run → 拒绝。
+   * owner 与非 owner 的话术区分：owner 看到自己的 runId/状态；非 owner 只知道「有审计在跑」。
+   */
+  createRun({ stopAfter, chatId } = {}) {
+    if (typeof chatId !== 'string' || chatId.length === 0) {
+      return { ok: false, code: 'AUDIT_ARG_INVALID', message: '缺少 chat 上下文（owner 落盘 fail closed）。' };
+    }
     const active = this.activeRun();
     if (active) {
+      if (active.chatId === chatId) {
+        return {
+          ok: false, code: 'AUDIT_RUN_ACTIVE',
+          message: `已有活跃的审计运行 \`${active.id}\`（状态 ${active.state}）；请先 \`/audit stop\` 或 \`/audit pause\` 后处理。`,
+        };
+      }
       return {
-        ok: false, code: 'AUDIT_RUN_ACTIVE',
-        message: `已有活跃的审计运行 \`${active.id}\`（状态 ${active.state}）；请先 \`/audit stop\` 或 \`/audit pause\` 后处理。`,
+        ok: false, code: 'AUDIT_RUN_OWNED_BY_OTHER_CHAT',
+        message: '本机已有审计运行中，但不是本聊天发起的；详情与控制权归属发起聊天。',
       };
     }
-    // 大小写规范化：t2 → T2（匹配阶段表原名）
-    const stage = this.stages.find((s) => s.toLowerCase() === String(stopAfter).toLowerCase());
-    if (!stage) {
+    const stopAfterStage = this.resolveStage(stopAfter);
+    if (!stopAfterStage) {
       return {
         ok: false, code: 'AUDIT_MANIFEST_INVALID',
         message: `停止点 \`${stopAfter}\` 不在阶段表 [${this.stages.join(', ')}] 中。`,
       };
     }
-    const stopAfterStage = stage;
     // runId：毫秒时间戳 + 冲突时递增后缀（同秒多次创建/时钟注入场景防撞名）。
     const stamp = new Date(this.now()).toISOString().replace(/[-:TZ.]/g, '').slice(0, 17);
     let runId = `audit_${stamp}`;
@@ -118,7 +162,8 @@ export class AuditController {
       runId = `audit_${stamp}_${n}`;
     }
     const input = {
-      runId, hostId: this.hostId, cwd: this.cwd,
+      runId, hostId: this.hostId, chatId, dshSessionId: null, // dshSessionId 等 A3 接 session 时填
+      cwd: this.cwd,
       repo: this.repo, branch: this.branch,
       stages: this.stages, stopAfter: stopAfterStage,
       startingCommit: 'stub-base-a2', // A3：由真实 git HEAD 提供
@@ -129,15 +174,17 @@ export class AuditController {
       const run = AuditRun.create(this.store, input, {
         maxReviewIterations: this.maxReviewIterations, now: this.now,
       });
-      return { ok: true, runId, result: { state: run.s.state, stopAfter } };
+      return { ok: true, runId, result: { state: run.s.state, stopAfter: stopAfterStage } };
     } catch (e) {
       return { ok: false, runId, code: e.code ?? 'AUDIT_ERROR', message: e.message };
     }
   }
 
-  /** /audit status：活跃优先，空闲回退最近 run。 */
-  status() {
-    const id = this.#target({ allowFinished: true });
+  /** /audit status：owner 视角。活跃 run 非 owner → 只报存在性；空闲回退 owner 自己的最近 run。 */
+  status(chatId) {
+    const t = this.#target(chatId, { allowFinished: true });
+    if (t.error) return t.error;
+    const id = t.id;
     if (!id) return { ok: false, code: 'AUDIT_NO_RUN', message: '还没有任何审计运行。用 `/audit <阶段>` 创建（如 `/audit T2`）。' };
     try {
       const run = this.#open(id);
@@ -158,6 +205,7 @@ export class AuditController {
           branch: run.manifest.branch,
           recentEvents: recent,
           startedAt: run.s.startedAt,
+          chatId: run.manifest.chatId ?? null,
         },
       };
     } catch (e) {
@@ -165,8 +213,10 @@ export class AuditController {
     }
   }
 
-  pause() {
-    const id = this.#target();
+  pause(chatId) {
+    const t = this.#target(chatId);
+    if (t.error) return t.error;
+    const id = t.id;
     if (!id) return { ok: false, code: 'AUDIT_NO_ACTIVE_RUN', message: '没有活跃的审计运行可暂停。' };
     return this.#call(id, (run) => ({ state: (run.pause(), run.s.state) }));
   }
@@ -175,8 +225,10 @@ export class AuditController {
    * /audit resume：PAUSED → 回 pausedFrom；PAUSED_NEEDS_USER → resumeFromHuman。
    * HISTORY_REWRITTEN 需要显式 newBaseline —— A2 无该命令通道，明确报错指引发 A3 接线。
    */
-  resume() {
-    const id = this.#target();
+  resume(chatId) {
+    const t = this.#target(chatId);
+    if (t.error) return t.error;
+    const id = t.id;
     if (!id) return { ok: false, code: 'AUDIT_NO_ACTIVE_RUN', message: '没有活跃的审计运行可恢复。' };
     return this.#call(id, (run) => {
       if (run.s.state === 'PAUSED_NEEDS_USER') {
@@ -193,19 +245,27 @@ export class AuditController {
     });
   }
 
-  stop() {
-    const id = this.#target();
+  stop(chatId) {
+    const t = this.#target(chatId);
+    if (t.error) return t.error;
+    const id = t.id;
     if (!id) return { ok: false, code: 'AUDIT_NO_ACTIVE_RUN', message: '没有活跃的审计运行可终止。' };
     return this.#call(id, (run) => ({ state: (run.stop(), run.s.state) }));
   }
 
   /** /audit until X：v0.2 §6.2 竞态规则全部由内核 manifest.changeStopAfter 执行。 */
-  until(target) {
-    const id = this.#target();
+  until(chatId, target) {
+    const t = this.#target(chatId);
+    if (t.error) return t.error;
+    const id = t.id;
     if (!id) return { ok: false, code: 'AUDIT_NO_ACTIVE_RUN', message: '没有活跃的审计运行可修改停止点。' };
     if (!target) return { ok: false, code: 'AUDIT_ARG_INVALID', message: '用法：`/audit until <阶段>`' };
+    const canonical = this.resolveStage(target);
+    if (!canonical) {
+      return { ok: false, code: 'AUDIT_MANIFEST_INVALID', message: `停止点 \`${target}\` 不在阶段表 [${this.stages.join(', ')}] 中。` };
+    }
     return this.#call(id, (run) => {
-      const r = run.until(target);
+      const r = run.until(canonical);
       return { changed: r.changed, stopAfter: run.s.stopAfter };
     });
   }

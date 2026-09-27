@@ -148,7 +148,7 @@ export class Commands {
     }
     let card;
     try {
-      const { title, body, template } = handleAuditCommand(this.auditController, arg ?? '');
+      const { title, body, template } = handleAuditCommand(this.auditController, arg ?? '', chatId);
       card = buildInfoCard(title, body, template ? { template } : undefined);
     } catch (e) {
       log.error(`/audit handler crashed: ${e?.stack ?? e}`);
