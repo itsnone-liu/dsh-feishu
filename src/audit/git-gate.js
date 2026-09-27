@@ -47,6 +47,8 @@ export class GitRemoteGate {
     const { stdout: head } = await this.#git(['rev-parse', 'HEAD']);
     const { stdout: currentBranch } = await this.#git(['symbolic-ref', '--short', 'HEAD']);
     const { stdout: origin } = await this.#git(['remote', 'get-url', 'origin']);
+    const { stdout: dirty } = await this.#git(['status', '--porcelain']);
+    if (dirty) throw new GitGateError('AUDIT_GIT_DIRTY', 'workspace has uncommitted changes');
     if (repo && origin !== repo) {
       throw new GitGateError('AUDIT_GIT_REPO_MISMATCH', `origin mismatch: expected ${repo}, got ${origin}`);
     }
@@ -54,7 +56,22 @@ export class GitRemoteGate {
       throw new GitGateError('AUDIT_GIT_BRANCH_MISMATCH', `branch mismatch: expected ${branch}, got ${currentBranch}`);
     }
     if (/^stub:/i.test(origin)) throw new GitGateError('AUDIT_GIT_STUB_FORBIDDEN', 'stub remote is forbidden for A3 runs');
-    return { cwd: root, repo: origin, branch: currentBranch, head };
+    const { stdout: remoteLine } = await this.#git(['ls-remote', origin, `refs/heads/${currentBranch}`]);
+    const remoteHead = remoteLine.split(/\s+/)[0] ?? '';
+    if (remoteHead !== head) {
+      throw new GitGateError('AUDIT_GIT_START_REMOTE_MISMATCH', `startup remote tip ${remoteHead || '<empty>'} != local HEAD ${head}`, { remoteHead, head });
+    }
+    return { cwd: root, repo: origin, branch: currentBranch, head, remoteHead };
+  }
+
+  async isAncestor(ancestor, descendant) {
+    try {
+      await this.#git(['merge-base', '--is-ancestor', ancestor, descendant]);
+      return true;
+    } catch (e) {
+      if (e.code === 'AUDIT_GIT_COMMAND_FAILED' && e.cause?.status === 1) return false;
+      return false;
+    }
   }
 
   async pushAndVerify({ branch, head, remote = 'origin' } = {}) {

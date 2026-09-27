@@ -10,18 +10,23 @@
 import { AuditRun } from './state-machine.js';
 import { AuditExecutor } from './executor.js';
 import { GitRemoteGate } from './git-gate.js';
+import { loadTaskPacket } from './task-packet.js';
+import { AuditRetryScheduler } from './retry-scheduler.js';
 
 export class AuditLifecycle {
-  constructor({ controller, driver, bindings, gitGateFactory = (opts) => new GitRemoteGate(opts), executorFactory = (opts) => new AuditExecutor(opts) } = {}) {
+  constructor({ controller, driver, bindings, gitGateFactory = (opts) => new GitRemoteGate(opts), executorFactory = (opts) => new AuditExecutor(opts), taskPacketLoader = loadTaskPacket, retryScheduler = null } = {}) {
     this.controller = controller;
     this.driver = driver;
     this.bindings = bindings;
     this.gitGateFactory = gitGateFactory;
     this.executorFactory = executorFactory;
+    this.taskPacketLoader = taskPacketLoader;
+    this.retryScheduler = retryScheduler ?? new AuditRetryScheduler({ onRetry: (runId) => this.executors.get(runId)?.retry(runId) });
     this.executors = new Map();
+    this.eventQueues = new Map();
   }
 
-  async start({ chatId, stopAfter, stages, goal, approvedPlan } = {}) {
+  async start({ chatId, stopAfter, stages, goal, approvedPlan, taskPacket = null } = {}) {
     if (!chatId) throw Object.assign(new Error('chatId is required'), { code: 'AUDIT_ARG_INVALID' });
     const active = this.controller.activeRun();
     if (active) {
@@ -50,7 +55,8 @@ export class AuditLifecycle {
     }
 
     const gate = this.gitGateFactory({ cwd: binding.cwd });
-    const stageList = stages ?? this.controller.stages;
+    const packet = taskPacket ?? this.taskPacketLoader(binding.cwd);
+    const stageList = packet.stages;
     const stopAfterCanonical = stageList.find((s) => s.toLowerCase() === String(stopAfter ?? '').toLowerCase());
     // A3 discovers the actual controlled branch from the bound workspace; A2's
     // default branch is not allowed to reject a legitimate existing session.
@@ -58,33 +64,65 @@ export class AuditLifecycle {
     if (!stopAfterCanonical || !stageList.some((s) => s.toLowerCase() === stopAfterCanonical.toLowerCase())) {
       throw Object.assign(new Error(`停止点 ${stopAfter} 不在阶段表 [${stageList.join(', ')}] 中`), { code: 'AUDIT_MANIFEST_INVALID' });
     }
-    const runId = `audit_${Date.now().toString(36)}`;
+    const stamp = new Date(this.controller.now()).toISOString().replace(/[-:TZ.]/g, '').slice(0, 17);
+    let runId = `audit_${stamp}`;
+    for (let n = 2; this.controller.store.loadRun(runId); n += 1) runId = `audit_${stamp}_${n}`;
     const run = AuditRun.create(this.controller.store, {
       runId, hostId: this.controller.hostId, chatId, dshSessionId: agent.id,
       cwd: git.cwd, repo: git.repo, branch: git.branch,
       stages: stageList, stopAfter: stopAfterCanonical,
       startingCommit: git.head, stageBaseCommit: git.head,
-      goal: goal ?? 'A3 task goal', approvedPlan: approvedPlan ?? 'A3 approved plan',
+      goal: packet.goal, approvedPlan: packet.approvedPlan,
+      taskPacketHash: packet.taskPacketHash, stageRequirements: packet.stageRequirements,
     }, { maxReviewIterations: this.controller.maxReviewIterations, now: this.controller.now });
-    const executor = this.executorFactory({ driver: this.driver, gitGate: gate });
+    const executor = this.executorFactory({
+      driver: this.driver, gitGate: gate,
+      onTransient: this.retryScheduler ? (entry) => this.retryScheduler.schedule(entry.run.runId) : null,
+    });
     this.executors.set(runId, executor);
     await executor.start({ run, agent, gitGate: gate });
     return { run, executor, agent, git };
   }
 
-  async onEvent(session, event) {
-    for (const executor of this.executors.values()) {
-      await executor.onEvent(session, event).catch(() => undefined);
-    }
+  async applyVerdict(runId, verdict) {
+    const executor = this.executors.get(runId);
+    if (!executor) throw Object.assign(new Error(`executor run not found: ${runId}`), { code: 'AUDIT_EXECUTOR_NOT_FOUND' });
+    return executor.applyVerdict(runId, verdict);
   }
 
-  resume(runId) {
+  async onEvent(session, event) {
+    const results = [];
+    for (const [runId, executor] of this.executors) {
+      const prior = this.eventQueues.get(runId) ?? Promise.resolve();
+      const task = prior.then(() => executor.onEvent(session, event));
+      this.eventQueues.set(runId, task.catch(() => undefined));
+      results.push(await task);
+    }
+    return results;
+  }
+
+  async restoreActive() {
+    const restored = [];
+    for (const item of this.controller.store.listRuns()) {
+      const loaded = this.controller.store.loadRun(item.runId);
+      if (!loaded || ['STOPPED', 'STOPPED_TARGET_REACHED', 'ERROR'].includes(loaded.state.state)) continue;
+      restored.push(await this.resume(item.runId));
+    }
+    return restored;
+  }
+
+  async resume(runId) {
     const run = AuditRun.open(this.controller.store, { now: this.controller.now })(runId);
     if (!run) throw Object.assign(new Error(`run not found: ${runId}`), { code: 'AUDIT_RUN_NOT_FOUND' });
     const binding = this.bindings?.get(run.manifest.chatId);
     if (!binding || binding.sessionId !== run.manifest.dshSessionId) {
       throw Object.assign(new Error('persisted dshSessionId does not match the owner chat binding'), { code: 'AUDIT_SESSION_BINDING_MISMATCH' });
     }
-    return this.driver.ensure({ ...binding }, { allowCreate: false }).then((agent) => ({ run, agent }));
+    const agent = await this.driver.ensure({ ...binding }, { allowCreate: false });
+    const gate = this.gitGateFactory({ cwd: run.manifest.cwd });
+    const executor = this.executorFactory({ driver: this.driver, gitGate: gate });
+    this.executors.set(runId, executor);
+    await executor.start({ run, agent, gitGate: gate, sendPrompt: false });
+    return { run, agent, executor };
   }
 }

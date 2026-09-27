@@ -87,6 +87,8 @@ export function createManifest(raw, now = Date.now) {
 
     goal,
     approvedPlan,
+    taskPacketHash: raw.taskPacketHash ?? null,
+    stageRequirements: raw.stageRequirements ?? null,
     stages: [...stages],
     currentStage,
     stopAfter,

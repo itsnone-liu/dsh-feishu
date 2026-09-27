@@ -32,7 +32,7 @@ await ok('start requires an existing owner session and never forks', async () =>
   const calls = [];
   const driver = { ensure: async (binding, opts) => { calls.push({ binding, opts }); return { id: 's-a', status: 'idle' }; }, submit() {} };
   const gate = { inspect: async () => ({ cwd: f.work, repo: 'real-origin', branch: 'main', head: f.head }), pushAndVerify: async () => ({ ok: true, tipMatches: true }) };
-  const life = new AuditLifecycle({ controller: c, driver, bindings, gitGateFactory: () => gate, executorFactory: () => ({ start: async () => ({ started: true }) }) });
+  const life = new AuditLifecycle({ controller: c, driver, bindings, gitGateFactory: () => gate, taskPacketLoader: () => ({ goal: 'g', approvedPlan: 'p', stages: ['T1', 'T2'], stageRequirements: { T1: 'r1', T2: 'r2' }, taskPacketHash: 'hash' }), executorFactory: () => ({ start: async () => ({ started: true }) }) });
   const r = await life.start({ chatId: 'chat-a', stopAfter: 'T2' });
   assert.equal(r.run.manifest.dshSessionId, 's-a');
   assert.equal(r.run.manifest.chatId, 'chat-a');
@@ -61,7 +61,7 @@ await ok('resume requires persisted dshSessionId to match owner binding', async 
   const bindings = new Map([['chat-a', { sessionId: 's-a', cwd: f.work }]]);
   const driver = { ensure: async () => ({ id: 's-a', status: 'idle' }) };
   const gate = { inspect: async () => ({ cwd: f.work, repo: 'real-origin', branch: 'main', head: f.head }) };
-  const life = new AuditLifecycle({ controller: c, driver, bindings, gitGateFactory: () => gate, executorFactory: () => ({ start: async () => ({}) }) });
+  const life = new AuditLifecycle({ controller: c, driver, bindings, gitGateFactory: () => gate, taskPacketLoader: () => ({ goal: 'g', approvedPlan: 'p', stages: ['T1', 'T2'], stageRequirements: {}, taskPacketHash: 'hash' }), executorFactory: () => ({ start: async () => ({}) }) });
   const r = await life.start({ chatId: 'chat-a', stopAfter: 'T1' });
   const resumed = await life.resume(r.run.runId);
   assert.equal(resumed.agent.id, 's-a');

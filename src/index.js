@@ -105,6 +105,10 @@ function apply(ctx, config) {
         bindings: store,
       });
       commands.auditController.lifecycle = commands.auditLifecycle;
+      // A3.1：桥启动时恢复所有非终态 audit run 的 executor 监听；不重复发送 stage prompt。
+      commands.auditLifecycle.restoreActive().catch((e) => {
+        log.error(`audit lifecycle restore failed: ${e?.stack ?? e}`);
+      });
       const router = new ChatRouter({ config: cfg, store, driver, renderer, transport, interactions, commands, visionReady, autoContinue });
 
       // ---- outbound seams ----

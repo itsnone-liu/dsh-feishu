@@ -29,7 +29,7 @@ await ok('start submits exactly one executor prompt to bound session', async () 
 
 await ok('READY marker + verified gate enters AUDITING, then REVISE feedback uses same agent', async () => {
   const f = runFixture();
-  const gate = { pushAndVerify: async ({ head }) => ({ ok: true, tipMatches: true, tip: head }) };
+  const gate = { isAncestor: async () => true, pushAndVerify: async ({ head }) => ({ ok: true, tipMatches: true, tip: head }) };
   const ex = new AuditExecutor({ driver: f.driver, gitGate: gate });
   await ex.start({ run: f.run, agent: f.agent });
   const text = buildExecutorMarkerText({ runId: 'r1', hostId: 'h1', stage: 'T1', iteration: 1, head: 'a'.repeat(40) });
@@ -37,6 +37,17 @@ await ok('READY marker + verified gate enters AUDITING, then REVISE feedback use
   assert.equal(result.auditing, true); assert.equal(f.run.s.state, 'AUDITING');
   const injected = ex.feedback('r1', 'REVISE feedback: fix the current stage and output READY_FOR_AUDIT again.');
   assert.equal(injected.sessionId, 's-a'); assert.equal(f.submitted.length, 2);
+});
+
+await ok('completed turn without marker retries once, then pauses on second completed turn', async () => {
+  const f = runFixture(); const ex = new AuditExecutor({ driver: f.driver, gitGate: {} });
+  await ex.start({ run: f.run, agent: f.agent });
+  await ex.onEvent({ id: 's-a' }, { type: 'turn/start', data: { turn: 1 } });
+  const first = await ex.onEvent({ id: 's-a' }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+  assert.equal(first.retry, true); assert.equal(f.run.s.state, 'EXECUTING');
+  await ex.onEvent({ id: 's-a' }, { type: 'turn/start', data: { turn: 2 } });
+  const second = await ex.onEvent({ id: 's-a' }, { type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } });
+  assert.equal(second.failed, true); assert.equal(f.run.s.state, 'PAUSED_NEEDS_USER');
 });
 
 await ok('malformed assistant prose does not become READY', async () => {

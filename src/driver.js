@@ -75,11 +75,11 @@ export class SessionDriver {
         return await this.#resume(binding);
       } catch (e) {
         log.warn(`resume ${binding.sessionId} failed: ${e.message}`);
-        if (!allowCreate) throw e;
         if (SessionDriver.looksOccupied(e)) {
           e.occupied = true;
           throw e;
         }
+        if (!allowCreate) throw e;
         // fall through: start a fresh session, keep the stale one on disk
       }
     }

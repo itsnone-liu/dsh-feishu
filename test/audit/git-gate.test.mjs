@@ -26,6 +26,7 @@ const repoFixture = () => {
   fs.writeFileSync(path.join(work, 'README'), 'base\n');
   git(work, 'add', 'README'); git(work, 'commit', '-m', 'base');
   git(work, 'remote', 'add', 'origin', bare);
+  git(work, 'push', '-u', 'origin', 'main');
   return { root, work, bare };
 };
 
