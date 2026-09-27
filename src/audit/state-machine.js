@@ -35,8 +35,8 @@ export const TRANSITIONS = Object.freeze({
   WAIT_WEB_QUOTA: ['AUDITING', 'PAUSED', 'PAUSED_NEEDS_USER', 'STOPPED', 'ERROR'], // 恢复重发同一 stage/iteration
   AUDITING: ['EXECUTING', 'NEXT_STAGE', 'STOPPED_TARGET_REACHED', 'REVISE_LOOP_EXHAUSTED', 'WAIT_WEB_QUOTA', 'PAUSED', 'PAUSED_NEEDS_USER', 'HISTORY_REWRITTEN', 'STOPPED', 'ERROR'],
   NEXT_STAGE: ['EXECUTING'],                                            // 瞬态
-  PAUSED: ['EXECUTING', 'AUDITING', 'STOPPED', 'ERROR'],                // resume 回 pausedFrom
-  PAUSED_NEEDS_USER: ['EXECUTING', 'AUDITING', 'STOPPED', 'ERROR'],     // 人工处理后 resume（HISTORY_REWRITTEN 需显式 newBaseline）
+  PAUSED: ['EXECUTING', 'AUDITING', 'WAIT_DSH_QUOTA', 'WAIT_WEB_QUOTA', 'WAIT_GIT_PUSH', 'STOPPED', 'ERROR'],        // resume 精确回 pausedFrom
+  PAUSED_NEEDS_USER: ['EXECUTING', 'AUDITING', 'WAIT_DSH_QUOTA', 'WAIT_WEB_QUOTA', 'WAIT_GIT_PUSH', 'STOPPED', 'ERROR'], // 人工处理后 resume（HISTORY_REWRITTEN 需显式 newBaseline）
   REVISE_LOOP_EXHAUSTED: ['PAUSED_NEEDS_USER'],                         // 终因状态：唯一出边，不得继续推进
   HISTORY_REWRITTEN: ['PAUSED_NEEDS_USER'],                             // 同上
   ERROR: [],
@@ -350,9 +350,8 @@ export class AuditRun {
       return { revise: true };
     }
 
-    // NEED_USER（§10.3）
+    // NEED_USER（§10.3）：auditInFlight 保留 —— 人工回答后同轮继续（同 WEB_QUOTA 恢复语义）。
     this.#emit('NEED_USER');
-    this.s.auditInFlight = null;
     this.#transition('PAUSED_NEEDS_USER', { cause: 'NEED_USER', pausedFrom: 'AUDITING' });
     return { needUser: true };
   }

@@ -431,5 +431,46 @@ await ok('stop → STOPPED terminal with RUN_STOPPED event', () => {
   assert.ok(run.store.loadRun(run.runId).events.some((e) => e.event === 'RUN_STOPPED'));
 });
 
+await ok('stop from WAIT_GIT_PUSH / WAIT_DSH_QUOTA also legal', () => {
+  const { run: r1 } = newRun();
+  r1.dshQuotaExhausted();
+  r1.stop();
+  assert.equal(r1.s.state, 'STOPPED');
+
+  const { run: r2 } = newRun();
+  const marker = parseExecutorMarker(buildExecutorMarkerText({
+    runId: r2.runId, stage: 'T1', iteration: 1, head: 'c1',
+  }));
+  r2.executorReady(marker, {});
+  r2.remoteSyncResult({ ok: false, kind: 'transient' });
+  assert.equal(r2.s.state, 'WAIT_GIT_PUSH');
+  r2.stop();
+  assert.equal(r2.s.state, 'STOPPED');
+});
+
+await ok('pause during WAIT_WEB_QUOTA → PAUSED → resume back to AUDITING', () => {
+  const { run } = newRun();
+  toAuditing(run, 'c1');
+  run.webQuotaExhausted();
+  run.pause();
+  assert.equal(run.s.state, 'PAUSED');
+  assert.equal(run.s.pausedFrom, 'WAIT_WEB_QUOTA'); // 记录的是 pause 时刻所在状态
+  const r = run.resume();
+  assert.equal(r.resumed, 'WAIT_WEB_QUOTA');
+  run.webQuotaRecovered();
+  assert.equal(run.s.state, 'AUDITING');
+});
+
+await ok('NEED_USER resume returns to AUDITING same round (human answered)', () => {
+  const { run } = newRun();
+  toAuditing(run, 'c1');
+  feedVerdict(run, 'NEED_USER', { question: ['clarify goal?'] });
+  assert.equal(run.s.state, 'PAUSED_NEEDS_USER');
+  const r = run.resumeFromHuman({});
+  assert.equal(r.resumed, 'AUDITING');
+  assert.equal(run.s.state, 'AUDITING');
+  assert.deepEqual(run.s.auditInFlight, { stage: 'T1', iteration: 1, headCommit: 'c1' }); // 同轮继续
+});
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exitCode = fail ? 1 : 0;
