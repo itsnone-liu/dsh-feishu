@@ -107,13 +107,14 @@ export class AuditLifecycle {
     return this.#serial(runId, async () => {
       const run = this.liveRuns.get(runId);
       if (!run) throw Object.assign(new Error(`live run not found: ${runId}`), { code: 'AUDIT_RUN_NOT_FOUND' });
-      const result = await operation(run);
       if (action === 'stop') {
         this.retryScheduler.cancel(runId);
         this.executors.get(runId)?.stop(runId);
       } else if (action === 'pause') {
         this.retryScheduler.cancel(runId);
-      } else if (action === 'resume' && run.s.state === 'WAIT_GIT_PUSH' && run.s.pendingRemoteSync) {
+      }
+      const result = await operation(run);
+      if (action === 'resume' && run.s.state === 'WAIT_GIT_PUSH' && run.s.pendingRemoteSync) {
         this.retryScheduler.schedule(runId, (id) => this.executors.get(id)?.retry(id), run.s.retry.pushAttempts);
       }
       return result;

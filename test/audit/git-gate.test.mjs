@@ -62,6 +62,13 @@ await ok('repo/branch mismatch fails closed before a run can start', async () =>
     (e) => e.code === 'AUDIT_GIT_REPO_MISMATCH');
 });
 
+await ok('default provider policy rejects non-GitHub origin', async () => {
+  const f = repoFixture();
+  const gate = new GitRemoteGate({ cwd: f.work });
+  await assert.rejects(() => gate.inspect({ branch: 'main', repo: f.bare }),
+    (e) => e.code === 'AUDIT_GIT_PROVIDER_UNSUPPORTED');
+});
+
 await ok('stub remote is forbidden', async () => {
   const f = repoFixture();
   git(f.work, 'remote', 'set-url', 'origin', 'stub://fake');
