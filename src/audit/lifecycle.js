@@ -27,6 +27,8 @@ export class AuditLifecycle {
     this.liveRuns = new Map();
     this.eventQueues = new Map();
     this.busyRuns = new Set();
+    this.reviewRounds = new Map();
+    this.reviewer = null;
   }
 
   #scheduleRetry(runId, attempt) {
@@ -92,29 +94,47 @@ export class AuditLifecycle {
     return { run, executor, agent, git };
   }
 
-  async review(runId, reviewer) {
-    return this.#serial(runId, async () => {
-      const executor = this.executors.get(runId);
-      const run = this.liveRuns.get(runId);
-      if (!executor || !run) throw Object.assign(new Error(`executor run not found: ${runId}`), { code: 'AUDIT_EXECUTOR_NOT_FOUND' });
-      const inFlight = run.s.auditInFlight;
-      if (run.s.state !== 'AUDITING' || !inFlight) throw Object.assign(new Error('audit packet unavailable outside AUDITING'), { code: 'AUDIT_REVIEW_NOT_READY' });
-      const stage = inFlight.stage ?? run.s.currentStage;
-      const packet = { runId, hostId: run.manifest.hostId, stage, iteration: inFlight.iteration ?? run.s.iteration, repo: run.manifest.repo, branch: run.manifest.branch, targetCommit: inFlight.headCommit, baseCommit: run.s.stageBaseCommit, goal: run.manifest.goal, stageRequirement: run.manifest.stageRequirements?.[stage] ?? null };
-      for (;;) {
-        let verdict;
-        try { verdict = await reviewer.review(packet); }
-        catch (e) {
-          if (e?.code === 'AUDIT_VERDICT_MALFORMED' || e?.code === 'AUDIT_VERDICT_MISSING') {
-            const missing = run.verdictMissing();
-            if (missing.retry) continue;
-            return missing;
-          }
-          throw e;
+  async review(runId, reviewer = this.reviewer) {
+    return this.#serial(runId, () => this.#reviewLocked(runId, reviewer));
+  }
+
+  #reviewRoundKey(run) {
+    const f = run.s.auditInFlight;
+    return f ? `${run.runId}|${f.stage ?? run.s.currentStage}|${f.iteration ?? run.s.iteration}|${f.headCommit}` : null;
+  }
+
+  #maybeAutoReviewLocked(runId) {
+    const run = this.liveRuns.get(runId);
+    const executor = this.executors.get(runId);
+    if (!run || !executor || run.s.state !== 'AUDITING' || !run.s.auditInFlight) return { skipped: true };
+    if (!this.reviewer) return { skipped: true };
+    const key = this.#reviewRoundKey(run);
+    if (key && this.reviewRounds.get(runId) === key) return { deduped: true };
+    if (key) this.reviewRounds.set(runId, key);
+    return this.#reviewLocked(runId, this.reviewer).catch((e) => { this.reviewRounds.delete(runId); throw e; });
+  }
+
+  async #reviewLocked(runId, reviewer) {
+    const executor = this.executors.get(runId);
+    const run = this.liveRuns.get(runId);
+    if (!executor || !run) throw Object.assign(new Error(`executor run not found: ${runId}`), { code: 'AUDIT_EXECUTOR_NOT_FOUND' });
+    const inFlight = run.s.auditInFlight;
+    if (run.s.state !== 'AUDITING' || !inFlight) throw Object.assign(new Error('audit packet unavailable outside AUDITING'), { code: 'AUDIT_REVIEW_NOT_READY' });
+    const stage = inFlight.stage ?? run.s.currentStage;
+    const packet = { runId, hostId: run.manifest.hostId, stage, iteration: inFlight.iteration ?? run.s.iteration, repo: run.manifest.repo, branch: run.manifest.branch, targetCommit: inFlight.headCommit, baseCommit: run.s.stageBaseCommit, goal: run.manifest.goal, stageRequirement: run.manifest.stageRequirements?.[stage] ?? null };
+    for (;;) {
+      let verdict;
+      try { verdict = await reviewer.review(packet); }
+      catch (e) {
+        if (e?.code === 'AUDIT_VERDICT_MALFORMED' || e?.code === 'AUDIT_VERDICT_MISSING') {
+          const missing = run.verdictMissing();
+          if (missing.retry) continue;
+          return missing;
         }
-        return executor.applyVerdict(runId, verdict);
+        throw e;
       }
-    });
+      return executor.applyVerdict(runId, verdict);
+    }
   }
 
   async applyVerdict(runId, verdict) {
@@ -144,22 +164,39 @@ export class AuditLifecycle {
         this.retryScheduler.cancel(runId);
       }
       const result = await operation(run);
-      if (action === 'resume' && run.s.state === 'WAIT_GIT_PUSH' && run.s.pendingRemoteSync) {
-        this.#scheduleRetry(runId, run.s.retry.pushAttempts);
+      if (action === 'resume') {
+        if (run.s.state === 'WAIT_GIT_PUSH' && run.s.pendingRemoteSync) {
+          this.#scheduleRetry(runId, run.s.retry.pushAttempts);
+        }
+        if (run.s.state === 'AUDITING' && run.s.auditInFlight) {
+          this.reviewRounds.delete(runId); // 人工恢复后同轮允许再次审核（NEED_USER 语义）
+          await this.#maybeAutoReviewLocked(runId);
+        }
       }
       return result;
     });
   }
 
   async retry(runId) {
-    return this.#serial(runId, () => this.executors.get(runId)?.retry(runId) ?? { ignored: true });
+    return this.#serial(runId, async () => {
+      const before = this.liveRuns.get(runId);
+      const wasWaiting = before?.s.state === 'WAIT_GIT_PUSH';
+      const result = await (this.executors.get(runId)?.retry(runId) ?? { ignored: true });
+      const run = this.liveRuns.get(runId);
+      if (run && wasWaiting && run.s.state === 'AUDITING') await this.#maybeAutoReviewLocked(runId);
+      return result;
+    });
   }
 
   async onEvent(session, event) {
     const results = [];
     for (const [runId, executor] of this.executors) {
       const prior = this.eventQueues.get(runId) ?? Promise.resolve();
-      const task = prior.then(() => executor.onEvent(session, event));
+      const task = prior.then(async () => {
+        const r = await executor.onEvent(session, event);
+        if (event?.type === 'turn/end') await this.#maybeAutoReviewLocked(runId);
+        return r;
+      });
       this.eventQueues.set(runId, task.catch(() => undefined));
       results.push(await task);
     }
@@ -192,6 +229,7 @@ export class AuditLifecycle {
     if (run.s.state === 'WAIT_GIT_PUSH' && run.s.pendingRemoteSync) {
       this.#scheduleRetry(runId, run.s.retry.pushAttempts);
     }
+    if (run.s.state === 'AUDITING') await this.#maybeAutoReviewLocked(runId);
     return { run, agent, executor };
   }
 }
