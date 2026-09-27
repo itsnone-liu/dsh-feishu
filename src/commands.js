@@ -165,7 +165,7 @@ export class Commands {
           'A3：已绑定现有 DSH session，等待 Executor 输出 READY_FOR_AUDIT。',
         ].join('\n'));
       } else {
-        const { title, body, template } = handleAuditCommand(this.auditController, arg ?? '', chatId);
+        const { title, body, template } = await handleAuditCommand(this.auditController, arg ?? '', chatId);
         card = buildInfoCard(title, body, template ? { template } : undefined);
       }
     } catch (e) {

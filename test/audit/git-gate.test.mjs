@@ -32,7 +32,7 @@ const repoFixture = () => {
 
 await ok('inspect validates real origin, branch and starting HEAD', async () => {
   const f = repoFixture();
-  const gate = new GitRemoteGate({ cwd: f.work });
+  const gate = new GitRemoteGate({ cwd: f.work, allowNonGithubRemote: true });
   const info = await gate.inspect({ branch: 'main', repo: f.bare });
   assert.equal(info.repo, f.bare);
   assert.equal(info.branch, 'main');
@@ -42,7 +42,7 @@ await ok('inspect validates real origin, branch and starting HEAD', async () => 
 
 await ok('pushAndVerify requires exact remote tip == commit HEAD', async () => {
   const f = repoFixture();
-  const gate = new GitRemoteGate({ cwd: f.work });
+  const gate = new GitRemoteGate({ cwd: f.work, allowNonGithubRemote: true });
   const info = await gate.inspect({ branch: 'main', repo: f.bare });
   fs.writeFileSync(path.join(f.work, 'a.txt'), 'A\n');
   git(f.work, 'add', 'a.txt'); git(f.work, 'commit', '-m', 'A');
@@ -55,7 +55,7 @@ await ok('pushAndVerify requires exact remote tip == commit HEAD', async () => {
 
 await ok('repo/branch mismatch fails closed before a run can start', async () => {
   const f = repoFixture();
-  const gate = new GitRemoteGate({ cwd: f.work });
+  const gate = new GitRemoteGate({ cwd: f.work, allowNonGithubRemote: true });
   await assert.rejects(() => gate.inspect({ branch: 'develop', repo: f.bare }),
     (e) => e.code === 'AUDIT_GIT_BRANCH_MISMATCH');
   await assert.rejects(() => gate.inspect({ branch: 'main', repo: `${f.bare}-other` }),
@@ -65,14 +65,14 @@ await ok('repo/branch mismatch fails closed before a run can start', async () =>
 await ok('stub remote is forbidden', async () => {
   const f = repoFixture();
   git(f.work, 'remote', 'set-url', 'origin', 'stub://fake');
-  const gate = new GitRemoteGate({ cwd: f.work });
+  const gate = new GitRemoteGate({ cwd: f.work, allowNonGithubRemote: true });
   await assert.rejects(() => gate.inspect({ branch: 'main', repo: 'stub://fake' }),
     (e) => e.code === 'AUDIT_GIT_STUB_FORBIDDEN');
 });
 
 await ok('remote divergence is reported as tip mismatch', async () => {
   const f = repoFixture();
-  const gate = new GitRemoteGate({ cwd: f.work });
+  const gate = new GitRemoteGate({ cwd: f.work, allowNonGithubRemote: true });
   const info = await gate.inspect({ branch: 'main', repo: f.bare });
   await assert.rejects(() => gate.pushAndVerify({ branch: 'main', head: `${info.head.slice(0, 39)}0` }),
     (e) => e.code === 'AUDIT_GIT_COMMAND_FAILED' || e.code === 'AUDIT_GIT_TIP_DIVERGED' || e.code === 'AUDIT_GIT_HEAD_MISMATCH');

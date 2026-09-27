@@ -20,7 +20,7 @@ await ok('T1 REVISE→T1 new commit→APPROVE automatically starts T2 on same se
   const binding = new Map([['chat-a', { sessionId: 'session-fixed', cwd: x.work }]]); const prompts = [];
   const agent = { id: 'session-fixed', status: 'idle' }; const driver = { ensure: async (_b, opts) => { assert.equal(opts.allowCreate, false); return agent; }, submit: (_a, text) => { prompts.push(text); } };
   const packet = { goal: 'frozen goal', approvedPlan: 'frozen plan', stages: ['T1', 'T2'], stageRequirements: { T1: 'r1', T2: 'r2' }, taskPacketHash: 'packet-hash' };
-  const lifecycle = new AuditLifecycle({ controller, driver, bindings: binding, taskPacketLoader: () => packet });
+  const lifecycle = new AuditLifecycle({ controller, driver, bindings: binding, gitGateFactory: (opts) => new GitRemoteGate({ ...opts, allowNonGithubRemote: true }), taskPacketLoader: () => packet });
   const started = await lifecycle.start({ chatId: 'chat-a', stopAfter: 'T2' }); const run = started.run; const gate = new GitRemoteGate({ cwd: x.work });
   const commit = (file, text, msg) => { fs.writeFileSync(path.join(x.work, file), text); git(x.work, 'add', file); git(x.work, 'commit', '-m', msg); return git(x.work, 'rev-parse', 'HEAD'); };
   const a = commit('a.txt', 'A', 'A');

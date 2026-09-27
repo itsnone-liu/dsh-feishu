@@ -124,9 +124,10 @@ export class AuditController {
   }
 
   /** 内核调用统一包装：异常翻译为 {ok:false, code, message}，不吞、不改语义。 */
-  #control(id, action, arg) {
+  async #control(id, operation, action) {
     try {
-      return this.lifecycle.control(id, action, arg).then((result) => ({ ok: true, runId: id, result }));
+      const result = await this.lifecycle.control(id, operation, action);
+      return { ok: true, runId: id, result };
     } catch (e) {
       return { ok: false, runId: id, code: e.code ?? 'AUDIT_ERROR', message: e.message };
     }
@@ -234,7 +235,7 @@ export class AuditController {
     if (t.error) return t.error;
     const id = t.id;
     if (!id) return { ok: false, code: 'AUDIT_NO_ACTIVE_RUN', message: '没有活跃的审计运行可暂停。' };
-    if (this.lifecycle?.liveRuns?.has(id)) return this.#control(id, 'pause');
+    if (this.lifecycle?.liveRuns?.has(id)) return this.#control(id, (run) => { run.pause(); return { state: run.s.state }; }, 'pause');
     return this.#call(id, (run) => ({ state: (run.pause(), run.s.state) }));
   }
 
@@ -247,7 +248,13 @@ export class AuditController {
     if (t.error) return t.error;
     const id = t.id;
     if (!id) return { ok: false, code: 'AUDIT_NO_ACTIVE_RUN', message: '没有活跃的审计运行可恢复。' };
-    if (this.lifecycle?.liveRuns?.has(id)) return this.#control(id, 'resume');
+    if (this.lifecycle?.liveRuns?.has(id)) return this.#control(id, (run) => {
+      if (run.s.state === 'PAUSED_NEEDS_USER') {
+        if (run.s.cause === 'HISTORY_REWRITTEN') { const e = new Error('历史被改写后的恢复需要显式新 baseline（G11）；A2 命令面未提供该操作，请等待 A3 接线或人工处理 store。'); e.code = 'AUDIT_BASELINE_REQUIRED'; throw e; }
+        const r = run.resumeFromHuman({}); return { state: run.s.state, resumed: r.resumed };
+      }
+      const r = run.resume(); return { state: run.s.state, resumed: r.resumed };
+    }, 'resume');
     return this.#call(id, (run) => {
       if (run.s.state === 'PAUSED_NEEDS_USER') {
         if (run.s.cause === 'HISTORY_REWRITTEN') {
@@ -268,7 +275,7 @@ export class AuditController {
     if (t.error) return t.error;
     const id = t.id;
     if (!id) return { ok: false, code: 'AUDIT_NO_ACTIVE_RUN', message: '没有活跃的审计运行可终止。' };
-    if (this.lifecycle?.liveRuns?.has(id)) return this.#control(id, 'stop');
+    if (this.lifecycle?.liveRuns?.has(id)) return this.#control(id, (run) => { run.stop(); return { state: run.s.state }; }, 'stop');
     return this.#call(id, (run) => ({ state: (run.stop(), run.s.state) }));
   }
 
@@ -283,7 +290,7 @@ export class AuditController {
     if (!canonical) {
       return { ok: false, code: 'AUDIT_MANIFEST_INVALID', message: `停止点 \`${target}\` 不在阶段表 [${this.stages.join(', ')}] 中。` };
     }
-    if (this.lifecycle?.liveRuns?.has(id)) return this.#control(id, 'until', canonical);
+    if (this.lifecycle?.liveRuns?.has(id)) return this.#control(id, (run) => { const r = run.until(canonical); return { changed: r.changed, stopAfter: run.s.stopAfter }; }, 'until');
     return this.#call(id, (run) => {
       const r = run.until(canonical);
       return { changed: r.changed, stopAfter: run.s.stopAfter };

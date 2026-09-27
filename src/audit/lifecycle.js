@@ -103,17 +103,20 @@ export class AuditLifecycle {
     return task;
   }
 
-  async control(runId, action, arg) {
-    return this.#serial(runId, () => {
+  async control(runId, operation, action = null) {
+    return this.#serial(runId, async () => {
       const run = this.liveRuns.get(runId);
       if (!run) throw Object.assign(new Error(`live run not found: ${runId}`), { code: 'AUDIT_RUN_NOT_FOUND' });
-      if (action === 'pause') return run.pause();
-      if (action === 'resume') return run.resume();
+      const result = await operation(run);
       if (action === 'stop') {
-        this.retryScheduler.cancel(runId); this.executors.get(runId)?.stop(runId); return run.stop();
+        this.retryScheduler.cancel(runId);
+        this.executors.get(runId)?.stop(runId);
+      } else if (action === 'pause') {
+        this.retryScheduler.cancel(runId);
+      } else if (action === 'resume' && run.s.state === 'WAIT_GIT_PUSH' && run.s.pendingRemoteSync) {
+        this.retryScheduler.schedule(runId, (id) => this.executors.get(id)?.retry(id), run.s.retry.pushAttempts);
       }
-      if (action === 'until') return run.until(arg);
-      throw new Error(`unknown audit control action ${action}`);
+      return result;
     });
   }
 

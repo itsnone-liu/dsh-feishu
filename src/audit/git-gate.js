@@ -20,10 +20,11 @@ export class GitGateError extends Error {
 }
 
 export class GitRemoteGate {
-  constructor({ cwd, git = 'git', execFileFn = exec } = {}) {
+  constructor({ cwd, git = 'git', execFileFn = exec, allowNonGithubRemote = false } = {}) {
     this.cwd = cwd;
     this.git = git;
     this.execFile = execFileFn;
+    this.allowNonGithubRemote = allowNonGithubRemote;
   }
 
   async #git(args) {
@@ -56,6 +57,9 @@ export class GitRemoteGate {
       throw new GitGateError('AUDIT_GIT_BRANCH_MISMATCH', `branch mismatch: expected ${branch}, got ${currentBranch}`);
     }
     if (/^stub:/i.test(origin)) throw new GitGateError('AUDIT_GIT_STUB_FORBIDDEN', 'stub remote is forbidden for A3 runs');
+    if (!/^https?:\/\/github\.com\//i.test(origin) && !/^git@github\.com:/i.test(origin) && !this.allowNonGithubRemote) {
+      throw new GitGateError('AUDIT_GIT_PROVIDER_UNSUPPORTED', `formal A3 run requires GitHub origin, got ${origin}`);
+    }
     const { stdout: remoteLine } = await this.#git(['ls-remote', origin, `refs/heads/${currentBranch}`]);
     const remoteHead = remoteLine.split(/\s+/)[0] ?? '';
     if (remoteHead !== head) {
