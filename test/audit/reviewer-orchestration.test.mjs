@@ -159,4 +159,41 @@ await ok('restart while AUDITING auto-reviews exactly once; NEED_USER resume all
   assert.equal(r2.s.currentStage, 'T2');
 });
 
+
+await ok('foreign session turn/end never triggers reviewer; own turn/end does', async () => {
+  const x = f(); const m = setup(x);
+  const started = await m.lifecycle.start({ chatId: 'chat-a', stopAfter: 'T2' }); const run = started.run;
+  m.reviewer.script.push({ text: vt('APPROVE', run, 'T1', 1) });
+  const a = m.commit('a.txt', 'A', 'A');
+  await m.lifecycle.onEvent({ id: m.agent.id }, { type: 'turn/start', data: { turn: 1 } });
+  await m.lifecycle.onEvent({ id: m.agent.id }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: buildExecutorMarkerText({ runId: run.runId, hostId: 'h1', stage: 'T1', iteration: 1, head: a }) }] } } });
+  assert.equal(run.s.state, 'AUDITING');
+  // 无关 session 的 turn/end：executor 返回 ignored，reviewer 不得启动。
+  await m.lifecycle.onEvent({ id: 'other-session' }, { type: 'turn/end', data: { turn: 9, reason: { kind: 'completed' } } });
+  assert.equal(m.reviewer.calls.length, 0);
+  // audit 自己的 turn/end 才触发。
+  await m.lifecycle.onEvent({ id: m.agent.id }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+  assert.equal(m.reviewer.calls.length, 1);
+});
+
+await ok('reviewer infrastructure failure latches round; explicit review() can retry', async () => {
+  const x = f(); const m = setup(x);
+  const started = await m.lifecycle.start({ chatId: 'chat-a', stopAfter: 'T2' }); const run = started.run;
+  const a = m.commit('a.txt', 'A', 'A');
+  await m.lifecycle.onEvent({ id: m.agent.id }, { type: 'turn/start', data: { turn: 1 } });
+  await m.lifecycle.onEvent({ id: m.agent.id }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: buildExecutorMarkerText({ runId: run.runId, hostId: 'h1', stage: 'T1', iteration: 1, head: a }) }] } } });
+  const first = m.lifecycle.onEvent({ id: m.agent.id }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+  await assert.rejects(() => first, (e) => e.code === 'AUDIT_REVIEWER_SCRIPT_EXHAUSTED');
+  assert.equal(m.reviewer.calls.length, 1);
+  assert.equal(run.s.state, 'AUDITING');
+  // duplicate turn/end：round key 已 latched，不再自动访问 reviewer。
+  await m.lifecycle.onEvent({ id: m.agent.id }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } }).catch(() => undefined);
+  assert.equal(m.reviewer.calls.length, 1);
+  // 显式 review() 不受 round latch 影响，可作为人工恢复出口。
+  m.reviewer.script.push({ text: vt('APPROVE', run, 'T1', 1) });
+  await m.lifecycle.review(run.runId, m.reviewer);
+  assert.equal(m.reviewer.calls.length, 2);
+  assert.equal(run.s.currentStage, 'T2');
+});
+
 console.log(`\n${pass} passed, ${fail} failed`); process.exitCode = fail ? 1 : 0;

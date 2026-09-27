@@ -63,7 +63,7 @@ export class AuditExecutor {
       if (data.reason?.kind === 'completed' && entry.markerTurn !== entry.turn) {
         const missing = entry.run.markerMissing();
         if (missing.retry) this.driver.submit(entry.agent, '请在同一阶段重新严格输出 READY_FOR_AUDIT marker，不要输出普通说明。');
-        return missing;
+        return { ...missing, turnEnded: true };
       }
       return { turnEnded: true };
     }

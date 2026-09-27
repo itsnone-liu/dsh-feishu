@@ -111,7 +111,9 @@ export class AuditLifecycle {
     const key = this.#reviewRoundKey(run);
     if (key && this.reviewRounds.get(runId) === key) return { deduped: true };
     if (key) this.reviewRounds.set(runId, key);
-    return this.#reviewLocked(runId, this.reviewer).catch((e) => { this.reviewRounds.delete(runId); throw e; });
+    // Infrastructure failure keeps the round key latched: duplicate triggers stay deduped
+    // and only an explicit review()/resume can retry this round (fail-closed).
+    return this.#reviewLocked(runId, this.reviewer);
   }
 
   async #reviewLocked(runId, reviewer) {
@@ -194,7 +196,9 @@ export class AuditLifecycle {
       const prior = this.eventQueues.get(runId) ?? Promise.resolve();
       const task = prior.then(async () => {
         const r = await executor.onEvent(session, event);
-        if (event?.type === 'turn/end') await this.#maybeAutoReviewLocked(runId);
+        // 只有 Executor 确认是本 audit 自己的有效 turn/end 才触发自动审核；
+        // 非绑定 session 的事件返回 {ignored:true}，不得误触 reviewer。
+        if (r?.turnEnded === true) await this.#maybeAutoReviewLocked(runId);
         return r;
       });
       this.eventQueues.set(runId, task.catch(() => undefined));
