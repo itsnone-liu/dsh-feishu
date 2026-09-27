@@ -105,6 +105,13 @@ function apply(ctx, config) {
         bindings: store,
       });
       commands.auditController.lifecycle = commands.auditLifecycle;
+      // A5：真实 Web 审核器接入 —— 只注入 reviewer 实例，不改 A4 冻结 orchestration。
+      // 默认（audit.reviewer=''）关闭时，桥行为与 A4 完全一致。
+      if (cfg.audit?.reviewer === 'web') {
+        const { WebAuditRunner } = await import('./audit/web-runner.js');
+        commands.auditLifecycle.reviewer = new WebAuditRunner({ ...cfg.audit.web });
+        log.info(`audit reviewer: web (${cfg.audit.web.baseUrl}, model=${cfg.audit.web.model})`);
+      }
       // A3.1：桥启动时恢复所有非终态 audit run 的 executor 监听；不重复发送 stage prompt。
       commands.auditLifecycle.restoreActive().catch((e) => {
         log.error(`audit lifecycle restore failed: ${e?.stack ?? e}`);

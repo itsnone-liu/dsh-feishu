@@ -102,6 +102,18 @@ const DEFAULTS = {
   manualModels: {
     ds: 'dashscope-tokenplan/deepseek-v4.1-flash',
   },
+  /** A5：/audit 审核器选择。''（默认，无自动审核，A4 行为）| 'web'（真实网页额度池）。
+   * web 子块只含传输参数，不含任何 orchestration 语义（A4 冻结边界）。 */
+  audit: {
+    reviewer: '',
+    web: {
+      baseUrl: 'http://127.0.0.1:8787',
+      model: 'gpt-5.6-luna',
+      timeoutMs: 300000,
+      transientRetries: 2,
+      retryDelayMs: 5000,
+    },
+  },
 };
 
 function coerce(raw) {
@@ -120,6 +132,12 @@ function coerce(raw) {
   // 限额自动切换：嵌套探针配置按字段合并；false 显式关闭
   cfg.fallbackProbe = { ...DEFAULTS.fallbackProbe, ...(raw?.fallbackProbe ?? {}) };
   cfg.manualModels = { ...DEFAULTS.manualModels, ...(raw?.manualModels ?? {}) };
+  cfg.audit = {
+    ...DEFAULTS.audit,
+    ...(raw?.audit ?? {}),
+    web: { ...DEFAULTS.audit.web, ...(raw?.audit?.web ?? {}) },
+  };
+  if (process.env.DSH_AUDIT_REVIEWER) cfg.audit.reviewer = process.env.DSH_AUDIT_REVIEWER;
   if (raw?.fallbackPrimary === false) cfg.fallbackPrimary = '';
   if (raw?.fallbackBackup === false) cfg.fallbackBackup = '';
   if (!['off', 'mention', 'all'].includes(cfg.groups)) cfg.groups = 'off';
