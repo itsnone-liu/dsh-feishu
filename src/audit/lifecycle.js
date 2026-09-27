@@ -29,6 +29,10 @@ export class AuditLifecycle {
     this.busyRuns = new Set();
   }
 
+  #scheduleRetry(runId, attempt) {
+    return this.retryScheduler.schedule(runId, (id) => this.retry(id), attempt);
+  }
+
   async start({ chatId, stopAfter, stages, goal, approvedPlan, taskPacket = null } = {}) {
     if (!chatId) throw Object.assign(new Error('chatId is required'), { code: 'AUDIT_ARG_INVALID' });
     const active = this.controller.activeRun();
@@ -80,7 +84,7 @@ export class AuditLifecycle {
     }, { maxReviewIterations: this.controller.maxReviewIterations, now: this.controller.now });
     const executor = this.executorFactory({
       driver: this.driver, gitGate: gate,
-      onTransient: this.retryScheduler ? (entry, _result, attempt) => this.retryScheduler.schedule(entry.run.runId, (id) => this.executors.get(id)?.retry(id), attempt) : null,
+      onTransient: this.retryScheduler ? (entry, _result, attempt) => this.#scheduleRetry(entry.run.runId, attempt) : null,
     });
     this.executors.set(runId, executor);
     this.liveRuns.set(runId, run);
@@ -116,7 +120,7 @@ export class AuditLifecycle {
       }
       const result = await operation(run);
       if (action === 'resume' && run.s.state === 'WAIT_GIT_PUSH' && run.s.pendingRemoteSync) {
-        this.retryScheduler.schedule(runId, (id) => this.executors.get(id)?.retry(id), run.s.retry.pushAttempts);
+        this.#scheduleRetry(runId, run.s.retry.pushAttempts);
       }
       return result;
     });
@@ -161,7 +165,7 @@ export class AuditLifecycle {
     this.liveRuns.set(runId, run);
     await executor.start({ run, agent, gitGate: gate, sendPrompt: false });
     if (run.s.state === 'WAIT_GIT_PUSH' && run.s.pendingRemoteSync) {
-      this.retryScheduler.schedule(runId, (id) => this.executors.get(id)?.retry(id), run.s.retry.pushAttempts);
+      this.#scheduleRetry(runId, run.s.retry.pushAttempts);
     }
     return { run, agent, executor };
   }
