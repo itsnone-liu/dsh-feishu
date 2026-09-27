@@ -1,12 +1,24 @@
 # dsh-feishu `/audit` 自动审计模式设计方案
 
-**版本**：v0.2  
-**日期**：2026-09-27（v0.1 同日；v0.2 为协议缺口补丁 + 本机部署评估）  
+**版本**：v0.3  
+**日期**：2026-09-27（v0.1 同日；v0.2 协议缺口补丁 + 本机部署评估；v0.3 审计事实源冻结为 GitHub remote commit）  
 **目标仓库**：`itsnone-liu/dsh-feishu`  
 **设计基线**：`main @ 016115f83995a85682c48f91b1cf4d0e96de7096`  
 **参考项目**：
 - `miuuyy/codex-chatgpt-web`，设计参考基线 `main @ 2d73f626290a5062825bb595dabb89aaf88d16c5`
 - `XiaoDuoYa/codex-with-chatgpt`，设计参考基线 `main @ 9663b88753e35c76796c5bce000293e0bd22cd9e`
+
+> **v0.3 修订记录**（标注 `[v0.3]`；核心原则见新增 §29）：
+>
+> 1. **冻结原则**：所有正式 Audit 以**已 push 到 GitHub 的 commit** 为审计对象；本地未 push 状态不作为正式审计事实源（§29）；
+> 2. READY_FOR_AUDIT 与 Web 审计之间新增 push gate：`commit → push → ls-remote 确认 origin/<branch> tip == headCommit → AUDIT_REMOTE_READY`，未确认前禁止发起审计（§8/§29）；
+> 3. push 失败分类：瞬时（网络）→ `WAIT_GIT_PUSH` 退避重试；非快进 / 远端 tip 被外部改动 → `ERROR_GIT_REMOTE` → `PAUSED_NEEDS_USER`（§29.3）；
+> 4. `codex-chatgpt-web` 职责收窄：只承担「调用网页 GPT」，不再承担「让 GPT 读取本地 workspace」；只读 Codex 降级为**辅助抓取通道**（从 GitHub 取 commit 事实喂给 Web GPT），不得覆盖 GitHub 事实（§5/§29.4）；
+> 5. manifest 新增 `repo` / `branch` / `auditedCommits`；`headCommit` 语义收紧为「已 push 且远端可见的待审 commit」（§7）；
+> 6. 测试事实规则：本地测试 PASS 是 READY gate；测试报告**入库**（随待审 commit 提交）成为 Web GPT 可核对的事实；网页 GPT 无代码执行能力，其职责是核对报告与代码/diff 一致性、检查覆盖不足，而非复跑（§29.5）；
+> 7. handoff 模板加 `REPO` / `TARGET_COMMIT`，审计指令改为「inspect the GitHub repo at commit X」（§15）；
+> 8. G12 新增：Remote-only audit fact source；G2 改写为抓取范围约束（§21）；
+> 9. 崩溃恢复简化：恢复 run 后按 `targetCommit` 重审同一 GitHub commit，不受本地工作区前进影响（§22/§29.2）。
 
 > **v0.2 修订记录**（补丁均以 `[v0.2]` 标注，v0.1 原文未改动）：
 >
@@ -115,9 +127,8 @@ Web GPT 是审核者：
 
 ```text
 Web GPT
-├─ 读取代码
-├─ 读取 git diff/status
-├─ 读取测试结果
+├─ 读取 GitHub remote commit（正式审计事实源 [v0.3]）
+├─ 读取 commit diff / 文件 / 入库测试报告
 ├─ 对照冻结方案
 └─ 给出 APPROVE / REVISE / NEED_USER
 ```
@@ -155,35 +166,43 @@ V1 中 Web GPT **不获得写权限和 shell 执行权**。
 ## 3. 总体架构
 
 ```text
-                         Feishu
+                          Feishu
+                            │
+                      /audit T2
+                            │
+                            ▼
+                 ┌────────────────────┐
+                 │    dsh-feishu      │
+                 │ AuditController    │
+                 └─────────┬──────────┘
                            │
-                     /audit T2
-                           │
-                           ▼
-                ┌────────────────────┐
-                │    dsh-feishu      │
-                │ AuditController    │
-                └─────────┬──────────┘
-                          │
-             ┌────────────┴────────────┐
-             │                         │
-             ▼                         ▼
-      DSH Executor               Web Audit Runner
-      GLM / GPT                        │
-             │                         │
-      edit/test/git                    ▼
-             │                 read-only Codex task
-             │                         │
-             │                         ▼
-             │                codex-chatgpt-web
-             │                         │
-             │                         ▼
-             │                    ChatGPT Web
-             │                         │
-             │                 inspect workspace
-             │                         │
-             └──── REVISE / PASS ◀─────┘
+              ┌────────────┴────────────┐
+              │                         │
+              ▼                         ▼
+       DSH Executor               Web Audit Runner
+       GLM / GPT                        │
+              │                         ▼
+       edit/test/git             只读 Codex 辅助抓取 [v0.3]
+              │               （从 GitHub 取 commit 事实）
+              ▼                         │
+       commit + push ───► GitHub remote ◀── 正式审计事实源
+              │             repo @ headCommit
+              │                         │
+              │               ls-remote 确认 tip==head
+              │               → AUDIT_REMOTE_READY
+              │                         │
+              │                         ▼
+              │                codex-chatgpt-web
+              │                         │
+              │                         ▼
+              │                    ChatGPT Web
+              │                         │
+              │              inspect GitHub commit
+              │                         │
+              └──── REVISE / PASS ◀─────┘
 ```
+
+> `[v0.3]` 正式审计事实源是 GitHub remote 上的 commit，不是本地工作区（§29）。
 
 ---
 
@@ -223,6 +242,8 @@ ChatGPT Web
 
 因此 V1 把它作为一个本机 Web-GPT sidecar，而不是把它的代码复制进 `dsh-feishu`。
 
+> `[v0.3]` 职责收窄：`codex-chatgpt-web` 只承担「调用网页 GPT」这一传输职责，**不再承担「让 GPT 读取本地 workspace」**。审计数据面是 GitHub remote commit（§29）；如需程序化取回 commit 事实（diff/文件/报告），由只读 Codex 辅助抓取并作为只读输入喂给 Web GPT，GitHub commit 始终是唯一权威事实源。
+
 ---
 
 ## 5. Web Audit Runner 的调用方式
@@ -232,6 +253,8 @@ ChatGPT Web
 ```text
 AuditController
       ↓
+确认 AUDIT_REMOTE_READY（GitHub tip == headCommit）[v0.3]
+      ↓
 启动一个 read-only Codex audit task
       ↓
 模型 = chatgpt-web/high（或配置值）
@@ -239,16 +262,15 @@ AuditController
 codex-chatgpt-web
       ↓
 ChatGPT Web
+      ↓
+inspect GitHub repo @ headCommit
 ```
 
-Codex 在这里不是项目执行者，只承担：
+Codex 在这里不是项目执行者，只承担 `[v0.3]`：
 
-- 工作区读取；
-- git 状态读取；
-- git diff；
-- 文件搜索；
-- 测试记录读取；
-- 给 Web GPT 提供审计所需事实。
+- **辅助抓取**：从 GitHub remote 取 `repo @ headCommit` 的 diff（`stageBaseCommit..headCommit`）、文件内容、入库测试报告；
+- 把上述事实作为只读输入提供给 Web GPT；
+- GitHub remote commit 是唯一权威事实源；本地 workspace 状态不进入正式审计。
 
 必须使用只读 sandbox。
 
@@ -347,13 +369,22 @@ $DSH_HOME/feishu/audit/runs/<runId>/manifest.json
   "currentStage": "T1",
   "stopAfter": "T2",
 
+  "repo": "https://github.com/itsnone-liu/<repo>.git",
+  "branch": "main",
   "startingCommit": "...",
   "stageBaseCommit": "...",
+  "auditedCommits": [],
 
   "createdAt": "...",
   "updatedAt": "..."
 }
 ```
+
+> `[v0.3]` 远端字段语义：
+>
+> - `repo` / `branch`：正式审计事实源位置；`/audit` 启动 gate 必须验证本地 HEAD 与 `origin/<branch>` 一致；
+> - `headCommit`（运行态，见 state.json）**始终指已 push 且 `git ls-remote origin <branch>` 可见的 commit**；未 push 的本地 commit 不构成审计对象；
+> - `auditedCommits`：已进入审计链（已发起过 Web 审计）的 commit 列表。这些 commit 进入 G11 保护——被 amend/rebase/force-push 破坏即 `HISTORY_REWRITTEN`。
 
 ### 7.1 Manifest 的角色
 
@@ -423,31 +454,40 @@ V1 使用一个尽量小的状态机：
 
 ```text
 IDLE
- │
- ▼
+  │
+  ▼
 EXECUTING
- │
- │ DSH stage ready
- ▼
-AUDITING
- │
- ├── REVISE ───────────► EXECUTING
- │
- ├── NEED_USER ────────► PAUSED_NEEDS_USER
- │
- ├── WEB_FAILURE ──────► WAIT_WEB / ERROR
- │
- └── APPROVE
-        │
-        ├── current != stopAfter
-        │        ↓
-        │    NEXT_STAGE
-        │        ↓
-        │    EXECUTING
-        │
-        └── current == stopAfter
-                 ↓
-               STOPPED
+  │
+  │ DSH stage ready (READY_FOR_AUDIT, identity ok, no history rewrite)
+  ▼
+REMOTE_SYNC_GATE [v0.3]
+  │  commit → push → ls-remote 确认 origin/<branch> tip == headCommit
+  │
+  ├── push 瞬时失败（网络）────► WAIT_GIT_PUSH ──退避重试──► REMOTE_SYNC_GATE
+  │
+  ├── 非快进 / tip 被外部改动 ──► PAUSED_NEEDS_USER (cause=ERROR_GIT_REMOTE)
+  │
+  └── AUDIT_REMOTE_READY
+         ▼
+      AUDITING
+         │
+         ├── REVISE ───────────► EXECUTING
+         │
+         ├── NEED_USER ────────► PAUSED_NEEDS_USER
+         │
+         ├── WEB_FAILURE ──────► WAIT_WEB / ERROR
+         │
+         └── APPROVE
+                │
+                ├── current != stopAfter
+                │        ↓
+                │    NEXT_STAGE
+                │        ↓
+                │    EXECUTING
+                │
+                └── current == stopAfter
+                         ↓
+                       STOPPED
 ```
 
 额外运行状态：
@@ -455,6 +495,7 @@ AUDITING
 ```text
 WAIT_DSH_QUOTA
 WAIT_WEB_QUOTA
+WAIT_GIT_PUSH       [v0.3]
 PAUSED
 PAUSED_NEEDS_USER
 ERROR
@@ -879,6 +920,10 @@ RUN_ID: ...
 STAGE: T2
 ITERATION: 1
 
+REPO: https://github.com/itsnone-liu/<repo>      [v0.3]
+BRANCH: main                                     [v0.3]
+TARGET_COMMIT: def456   （已 push，ls-remote 确认可见）[v0.3]
+
 ORIGINAL_GOAL:
 ...
 
@@ -891,16 +936,14 @@ T1 approved @ abc123
 BASE_COMMIT:
 abc123
 
-CURRENT_HEAD:
-def456
-
 INSTRUCTION:
-Independently inspect the workspace and git diff.
+Independently inspect the GitHub repo at TARGET_COMMIT
+(diff BASE_COMMIT..TARGET_COMMIT, files, committed test reports).
 Do not trust executor claims.
 Return APPROVE / REVISE / NEED_USER.
 ```
 
-代码正文、diff 和测试不复制进 control prompt，由 read-only Codex 现场读取。
+代码正文、diff 和测试不复制进 control prompt `[v0.3]`：diff / 文件 / 入库测试报告由只读 Codex 从 **GitHub remote @ TARGET_COMMIT** 取回作为输入；本地 workspace 状态不进入正式审计。
 
 ---
 
@@ -1215,9 +1258,20 @@ audit output protocol
 
 Web audit Codex 必须运行在只读权限。
 
-### G2 — Workspace containment
+### G2 — Audit fact containment `[v0.3 改写]`
 
-Web Auditor 只能读取当前 manifest 的 `cwd`。
+正式审计事实只来自 `manifest.repo @ TARGET_COMMIT`（GitHub remote）。只读 Codex 的抓取范围限定为该 repo 该 commit（含 `diff(stageBaseCommit..TARGET_COMMIT)` 与入库测试报告）；本地 workspace 不进入正式审计。
+
+### G12 — Remote-only audit fact source `[v0.3]`
+
+所有正式 Audit 以**已 push 到 GitHub 且 `ls-remote` 确认可见**的 commit 为审计对象：
+
+```text
+READY_FOR_AUDIT → commit → push → ls-remote(tip == headCommit)
+              → AUDIT_REMOTE_READY → 才允许发起 Web 审计
+```
+
+push 失败绝不进入正式审计：瞬时失败 → `WAIT_GIT_PUSH`；非快进 / tip 被外部改动 → `ERROR_GIT_REMOTE` → `PAUSED_NEEDS_USER`（详见 §29）。
 
 ### G3 — Run identity
 
@@ -1320,6 +1374,8 @@ headCommit
 ```
 
 保证语义幂等。
+
+> `[v0.3]` GitHub 模式下恢复更稳：`headCommit` 已 push 到 GitHub，恢复 run 后按 `targetCommit` 重审同一远端 commit，不受本地工作区已前进影响——审错对象在结构上不可能（§29.2）。
 
 ---
 
@@ -1637,7 +1693,8 @@ V1 采用以下方案：
 12. 登录/CAPTCHA/2FA/UI drift 进入人工处理状态；
 13. 审核上下文以 repo 为事实源，通过 fresh audit chat / handoff 避免长上下文；
 14. `/audit T2` 精确定义为 **T2 审核通过后停止**；
-15. V1 不实现 Agent Fabric、多节点调度或通用 workflow 系统。
+15. V1 不实现 Agent Fabric、多节点调度或通用 workflow 系统；
+16. `[v0.3]` **所有正式 Audit 以已 push 到 GitHub 且远端可见的 commit 为唯一审计事实源**；本地未 push 状态、本地 workspace 均不作为正式审计事实（G12 / §29）。
 
 该方案的目标不是构建新的 Agent 平台，而是把现有人工的：
 
@@ -1692,3 +1749,85 @@ DSH → AuditController → Web GPT → AuditController → DSH
 ### 28.4 评估结论
 
 方案 v0.2 在本机**无阻塞项**，可直接进入 A1。执行顺序建议：A1（Protocol+Store+状态机，fake runner 全覆盖，含 v0.2 新增状态/事件）→ A2 → A3 → A4 → A5（真实 Electron 接入 + systemd 单元）→ A6/A7 合并为「双端 proxy 式部署验证」（Windows 跑同款 sidecar）→ A8 故障矩阵（追加：proxy 401 OAuth 过期 → PAUSED_NEEDS_USER）。
+
+---
+
+## 29. GitHub 审计事实源（v0.3 冻结原则）
+
+> **冻结原则**：所有正式 Audit 都以**已经 push 到 GitHub 的 commit** 为审计对象；本地未 push 状态不作为正式审计事实源。
+
+### 29.1 阶段流程
+
+```text
+DSH 完成 T1
+      ↓
+本地测试 PASS
+      ↓
+commit（含入库测试报告，见 29.5）
+      ↓
+git push origin <branch>
+      ↓
+git ls-remote 确认 origin/<branch> tip == audit headCommit
+      ↓
+AUDIT_REMOTE_READY
+      ↓
+Web GPT 审计（数据面 = GitHub）
+      ├─ commit 元数据 / 必要历史
+      ├─ diff(stageBaseCommit..headCommit)
+      ├─ 仓库文件 @ headCommit
+      └─ 入库测试产物/报告
+      ↓
+APPROVE / REVISE / NEED_USER
+```
+
+### 29.2 为什么
+
+1. **审计对象天然冻结**：`T1 audit target = abc1234` 永不改变——无论 Windows / Ubuntu / DSH 后续把本地工作区怎么改，审的始终是 GitHub 上的 abc1234；
+2. **双机对称**：Web GPT 不依赖任何一台机器的本地 workspace，只需要 `repo + commit` 两个参数，两端审计事实完全一致；
+3. **恢复简单**：AuditController 崩溃 → 恢复 run → 读 `targetCommit` → 重审同一 commit。本地工作区已前进也不会审错对象；
+4. **与既有工作流一致**：延续「commit + 报告 = 唯一事实源」的人工审计习惯。
+
+### 29.3 push gate 与失败分类
+
+READY_FOR_AUDIT 之后、Web 审计之前必须通过 REMOTE_SYNC_GATE：
+
+| 失败类型 | 判定 | 状态 | 恢复 |
+|---|---|---|---|
+| 瞬时网络失败 | push/ls-remote 连接错误、超时 | `WAIT_GIT_PUSH` | 指数退避自动重试（30s/60s/120s，上限 N 次） |
+| 非快进被拒 | push rejected (non-fast-forward) | `ERROR_GIT_REMOTE` → `PAUSED_NEEDS_USER` | 人工：远端被外部改动，须确认基准未被动过 |
+| 远端 tip 不符 | ls-remote tip ≠ headCommit（审计发起时） | `ERROR_GIT_REMOTE` → `PAUSED_NEEDS_USER` | 人工：同上，外部 push 过该分支 |
+| 重试耗尽 | WAIT_GIT_PUSH 超过上限 | `PAUSED_NEEDS_USER` | 人工检查网络/凭据 |
+
+规则：
+
+- 未到达 `AUDIT_REMOTE_READY` **绝不发起正式 Web 审计**；
+- `auditedCommits` 中已进入审计链的 commit 受 G11 保护；GitHub 的 non-fast-forward 拒绝天然阻止普通 amend 重放，force-push 由 ls-remote tip/ancestry 校验捕获。
+
+### 29.4 与本地只读 Codex 的关系
+
+```text
+正式审计事实源 = GitHub remote commit（唯一权威）
+本地只读 Codex = 辅助抓取通道（fetch GitHub @ TARGET_COMMIT → diff/文件/报告 → 喂给 Web GPT）
+```
+
+- 辅助抓取结果只是 GitHub 事实的**投影**，冲突时以 GitHub 为准；
+- 本地 workspace / 未 push 状态永远不进入正式审计；
+- `codex-chatgpt-web` 职责相应收窄：只负责调用网页 GPT（§4）。
+
+### 29.5 测试事实规则
+
+网页 GPT 没有代码执行能力，因此测试事实分两层：
+
+```text
+执行层：DSH 本地跑测试（READY gate：测试 PASS 才算 stage ready）
+事实层：测试报告随待审 commit 入库（如 docs/reports/ 或约定路径），成为 Web GPT 可核对的对象
+```
+
+Auditor 对测试的职责 = 核对入库报告与代码 / diff 的一致性、识别覆盖不足与可疑结论；**不是复跑**。executor 自述「测试通过」本身不构成事实——入库报告才是。
+
+### 29.6 对实施阶段的影响
+
+- **A1**：状态机加 `WAIT_GIT_PUSH`；事件加 `GIT_PUSH_WAIT` / `GIT_PUSH_RETRY` / `AUDIT_REMOTE_READY` / `ERROR_GIT_REMOTE`；manifest/state 加 `repo` / `branch` / `targetCommit` / `auditedCommits`；fake runner 增加 push 成功 / 瞬时失败 / 非快进 / tip 分歧注入；
+- **A3**：DSH lifecycle hook 在 READY_FOR_AUDIT 后执行真实 `git push` + `git ls-remote` 校验；
+- **A5**：Web GPT 审计输入从「本地 workspace」改为「GitHub @ TARGET_COMMIT」；
+- **A8**：故障矩阵追加 push 网络中断、非快进、外部 push 污染分支、force-push 改写已审历史四类注入。
