@@ -51,19 +51,27 @@ const newRun = (opts = {}) => {
 /** 驱动到 AUDITING 的便捷函数：READY + push ok。 */
 const toAuditing = (run, head = 'c0001') => {
   const marker = parseExecutorMarker(buildExecutorMarkerText({
-    runId: run.runId, stage: run.s.currentStage, iteration: run.s.iteration, head,
+    runId: run.runId, hostId: 'h1', stage: run.s.currentStage, iteration: run.s.iteration, head,
   }));
   run.executorReady(marker, {});
   return run.remoteSyncResult({ ok: true, tipMatches: true });
 };
 const feedVerdict = (run, state, over = {}) => {
   const text = buildVerdictText({
-    state, runId: run.runId, stage: run.s.currentStage, iteration: run.s.iteration, ...over,
+    state, runId: run.runId, hostId: 'h1', stage: run.s.currentStage, iteration: run.s.iteration, ...over,
   });
   return run.auditorVerdict(parseAuditorVerdict(text));
 };
 
 // ---------- 表健全性 ----------
+await ok('transition table edge count pinned (A1.1 P1: 报告矩阵防漂移锚点)', () => {
+  const edges = Object.values(TRANSITIONS).reduce((n, v) => n + v.length, 0);
+  console.log(`    TRANSITIONS edge count = ${edges}`);
+  // e33c490 后实际边数：STOPPED 出边补齐 + PAUSED 系可 resume 回 WAIT_* 的结果。
+  // 表变更时同步更新此数字并重出 Gate Report 覆盖矩阵。
+  assert.equal(edges, 50, 'edge count changed — update this pin AND regenerate the gate report matrix');
+});
+
 await ok('every state is either terminal or has legal outgoing edges', () => {
   for (const s of STATES) {
     const edges = TRANSITIONS[s];
@@ -124,7 +132,7 @@ await ok('APPROVE @ stopAfter → STOPPED_TARGET_REACHED', () => {
 await ok('READY_FOR_AUDIT is NOT pass: no gate → verdict rejected', () => {
   const { run } = newRun();
   const marker = parseExecutorMarker(buildExecutorMarkerText({
-    runId: run.runId, stage: 'T1', iteration: 1, head: 'cX',
+    runId: run.runId, hostId: 'h1', stage: 'T1', iteration: 1, head: 'cX',
   }));
   run.executorReady(marker, {}); // READY 但未过 push gate
   assert.equal(run.s.state, 'EXECUTING'); // 仍未进入 AUDITING
@@ -196,7 +204,7 @@ await throws('bump must be integer > current max', () => {
 await ok('ancestry broken at READY → HISTORY_REWRITTEN → PAUSED_NEEDS_USER', () => {
   const { run } = newRun();
   const marker = parseExecutorMarker(buildExecutorMarkerText({
-    runId: run.runId, stage: 'T1', iteration: 1, head: 'rewritten',
+    runId: run.runId, hostId: 'h1', stage: 'T1', iteration: 1, head: 'rewritten',
   }));
   const r = run.executorReady(marker, { ancestryOk: false });
   assert.equal(r.historyRewritten, true);
@@ -207,7 +215,7 @@ await ok('ancestry broken at READY → HISTORY_REWRITTEN → PAUSED_NEEDS_USER',
 await throws('resume after rewrite without explicit baseline rejected (no auto rebase)', () => {
   const { run } = newRun();
   const marker = parseExecutorMarker(buildExecutorMarkerText({
-    runId: run.runId, stage: 'T1', iteration: 1, head: 'rewritten',
+    runId: run.runId, hostId: 'h1', stage: 'T1', iteration: 1, head: 'rewritten',
   }));
   run.executorReady(marker, { ancestryOk: false });
   return Promise.resolve().then(() => run.resumeFromHuman({}));
@@ -218,7 +226,7 @@ await ok('resume with explicit newBaseline updates stageBase, keeps auditedCommi
   toAuditing(run, 'c1'); // c1 进入审计链
   feedVerdict(run, 'REVISE');
   const marker = parseExecutorMarker(buildExecutorMarkerText({
-    runId: run.runId, stage: 'T1', iteration: 2, head: 'c2-bad',
+    runId: run.runId, hostId: 'h1', stage: 'T1', iteration: 2, head: 'c2-bad',
   }));
   run.executorReady(marker, { ancestryOk: false });
   run.resumeFromHuman({ newBaselineCommit: 'human-fixed-base' });
@@ -254,7 +262,7 @@ await ok('until target not in stages rejected', () => {
 await ok('transient push → WAIT_GIT_PUSH → retry(transient) → ok → AUDITING', () => {
   const { run } = newRun();
   const marker = parseExecutorMarker(buildExecutorMarkerText({
-    runId: run.runId, stage: 'T1', iteration: 1, head: 'c1',
+    runId: run.runId, hostId: 'h1', stage: 'T1', iteration: 1, head: 'c1',
   }));
   run.executorReady(marker, {});
   let r = run.remoteSyncResult({ ok: false, kind: 'transient' }); // EXECUTING → WAIT
@@ -274,7 +282,7 @@ await ok('transient push → WAIT_GIT_PUSH → retry(transient) → ok → AUDIT
 await ok('transient over pushMax → ERROR_GIT_REMOTE → PAUSED_NEEDS_USER', () => {
   const { run } = newRun();
   const marker = parseExecutorMarker(buildExecutorMarkerText({
-    runId: run.runId, stage: 'T1', iteration: 1, head: 'c1',
+    runId: run.runId, hostId: 'h1', stage: 'T1', iteration: 1, head: 'c1',
   }));
   run.executorReady(marker, {});
   for (let i = 0; i < 4; i++) {
@@ -288,7 +296,7 @@ await ok('transient over pushMax → ERROR_GIT_REMOTE → PAUSED_NEEDS_USER', ()
 await ok('non-fast-forward push → PAUSED_NEEDS_USER immediately', () => {
   const { run } = newRun();
   const marker = parseExecutorMarker(buildExecutorMarkerText({
-    runId: run.runId, stage: 'T1', iteration: 1, head: 'c1',
+    runId: run.runId, hostId: 'h1', stage: 'T1', iteration: 1, head: 'c1',
   }));
   run.executorReady(marker, {});
   const r = run.remoteSyncResult({ ok: false, kind: 'rejected' });
@@ -299,7 +307,7 @@ await ok('non-fast-forward push → PAUSED_NEEDS_USER immediately', () => {
 await ok('push ok but remote tip diverged → PAUSED_NEEDS_USER', () => {
   const { run } = newRun();
   const marker = parseExecutorMarker(buildExecutorMarkerText({
-    runId: run.runId, stage: 'T1', iteration: 1, head: 'c1',
+    runId: run.runId, hostId: 'h1', stage: 'T1', iteration: 1, head: 'c1',
   }));
   run.executorReady(marker, {});
   const r = run.remoteSyncResult({ ok: true, tipMatches: false });
@@ -329,7 +337,7 @@ await ok('verdictMissing ×1 retry, ×2 PAUSED_NEEDS_USER (§14.5)', () => {
 await ok('duplicate verdict delivery → deduped, no double advance', () => {
   const { run } = newRun();
   toAuditing(run, 'c1');
-  const text = buildVerdictText({ state: 'APPROVE', runId: run.runId, stage: 'T1', iteration: 1 });
+  const text = buildVerdictText({ state: 'APPROVE', runId: run.runId, hostId: 'h1', stage: 'T1', iteration: 1 });
   const parsed = parseAuditorVerdict(text);
   const r1 = run.auditorVerdict(parsed);
   assert.equal(r1.advanced, true);
@@ -344,16 +352,40 @@ await ok('identity mismatch on verdict → fail closed, state unchanged', () => 
   const { run } = newRun();
   toAuditing(run, 'c1');
   const bad = parseAuditorVerdict(buildVerdictText({
-    state: 'APPROVE', runId: 'audit_OTHER', stage: 'T1', iteration: 1,
+    state: 'APPROVE', runId: 'audit_OTHER', hostId: 'h1', stage: 'T1', iteration: 1,
   }));
   assert.throws(() => run.auditorVerdict(bad), (e) => e.code === 'AUDIT_IDENTITY_MISMATCH' && e.field === 'RUN_ID');
   assert.equal(run.s.state, 'AUDITING'); // 未推进
 });
 
+await ok('omitted HOST_ID on verdict → rejected (fail closed, A1.1 P0-1)', () => {
+  const { run } = newRun();
+  toAuditing(run, 'c1');
+  const noHost = parseAuditorVerdict(buildVerdictText({
+    state: 'APPROVE', runId: run.runId, stage: 'T1', iteration: 1, // 无 HOST_ID 头行
+  }));
+  assert.equal(noHost.hostId, null);
+  assert.throws(() => run.auditorVerdict(noHost),
+    (e) => e.code === 'AUDIT_IDENTITY_MISMATCH' && e.field === 'HOST_ID');
+  assert.equal(run.s.state, 'AUDITING');
+});
+
+await ok('omitted HOST_ID on executor marker → rejected (fail closed)', () => {
+  const { run } = newRun();
+  const noHost = parseExecutorMarker(buildExecutorMarkerText({
+    runId: run.runId, stage: 'T1', iteration: 1, head: 'c1', // 无 HOST_ID 头行
+  }));
+  assert.equal(noHost.hostId, null);
+  assert.throws(() => run.executorReady(noHost, {}),
+    (e) => e.code === 'AUDIT_IDENTITY_MISMATCH' && e.field === 'HOST_ID');
+  assert.equal(run.s.state, 'EXECUTING');
+  assert.equal(run.s.pendingRemoteSync, null);
+});
+
 await ok('identity mismatch on marker (bad iteration) → fail closed', () => {
   const { run } = newRun();
   const bad = parseExecutorMarker(buildExecutorMarkerText({
-    runId: run.runId, stage: 'T1', iteration: 7, head: 'c1',
+    runId: run.runId, hostId: 'h1', stage: 'T1', iteration: 7, head: 'c1',
   }));
   assert.throws(() => run.executorReady(bad, {}), (e) => e.code === 'AUDIT_IDENTITY_MISMATCH' && e.field === 'ITERATION');
   assert.equal(run.s.state, 'EXECUTING');
@@ -439,7 +471,7 @@ await ok('stop from WAIT_GIT_PUSH / WAIT_DSH_QUOTA also legal', () => {
 
   const { run: r2 } = newRun();
   const marker = parseExecutorMarker(buildExecutorMarkerText({
-    runId: r2.runId, stage: 'T1', iteration: 1, head: 'c1',
+    runId: r2.runId, hostId: 'h1', stage: 'T1', iteration: 1, head: 'c1',
   }));
   r2.executorReady(marker, {});
   r2.remoteSyncResult({ ok: false, kind: 'transient' });

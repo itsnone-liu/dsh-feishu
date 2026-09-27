@@ -157,18 +157,23 @@ export function parseAuditorVerdict(text) {
 }
 
 /**
- * 身份校验（§11.1 / G3）：claimed 必须匹配 expected。
- * runId/stage/iteration 总是比较；hostId 仅当两侧都提供时比较（§10 协议块未列 HOST_ID，
- * 按 §11.1 意图实现为可选字段 —— 见 v0.3 报告「实现决策」）。
+ * 身份校验（§11.1 / G3，A1.1 收紧）：claimed 必须匹配 expected。
+ * runId/stage/iteration 总是比较。
+ * hostId（A1.1 P0-1 fail-closed）：expected 提供时（正式 manifest 必填 hostId，
+ * 因此正式 executor marker / auditor verdict 全部受此约束），claimed 缺失或不一致
+ * 都抛 AUDIT_IDENTITY_MISMATCH —— 防止漏带 HOST_ID 的 verdict 串入其他 host 的 run。
  * @throws {IdentityMismatchError}
  */
 export function validateIdentity(expected, claimed) {
+  if (expected.hostId != null && claimed.hostId == null) {
+    throw new IdentityMismatchError('HOST_ID', expected.hostId, null);
+  }
   const pairs = [
     ['RUN_ID', expected.runId, claimed.runId],
     ['STAGE', expected.stage, claimed.stage],
     ['ITERATION', expected.iteration, claimed.iteration],
   ];
-  if (expected.hostId != null && claimed.hostId != null) {
+  if (expected.hostId != null) {
     pairs.push(['HOST_ID', expected.hostId, claimed.hostId]);
   }
   for (const [field, exp, got] of pairs) {

@@ -16,6 +16,8 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import { loadManifest } from './manifest.js';
+import { STATES } from './state-machine.js';
 import { AuditError, StoreCorruptionError } from './errors.js';
 
 const REQUIRED_EVENT_FIELDS = ['runId', 'stage', 'iteration', 'headCommit', 'event', 'timestamp', 'elapsedMs', 'dedupeKey'];
@@ -87,12 +89,14 @@ export class AuditStore {
 
   // ---------- run 生命周期 ----------
 
-  /** 创建 run：manifest + 初始 state 落盘。runId 重复 → AUDIT_RUN_EXISTS。 */
-  createRun(manifest, initialState) {
+  /** 创建 run：manifest 经完整 schema 校验后落盘（存前校验，与 loadRun 对称）。runId 重复 → AUDIT_RUN_EXISTS。 */
+  createRun(manifestInput, initialState) {
+    const manifest = loadManifest(manifestInput, this.now);
     const dir = this.#runDir(manifest.runId);
     if (fs.existsSync(dir)) {
       throw new AuditError('AUDIT_RUN_EXISTS', `run directory already exists: ${dir}`);
     }
+    AuditStore.validatePersistedState(initialState, manifest, manifest.runId, this.#stateFile(manifest.runId));
     this.#atomicWrite(this.#manifestFile(manifest.runId), `${JSON.stringify(manifest, null, 2)}\n`);
     this.#atomicWrite(this.#stateFile(manifest.runId), `${JSON.stringify(initialState, null, 2)}\n`);
     this.#seenKeys.set(manifest.runId, new Set());
@@ -162,10 +166,13 @@ export class AuditStore {
   // ---------- 读取 / 恢复 ----------
 
   /**
-   * 加载 run（§22 崩溃恢复路径）。
+   * 加载 run（§22 崩溃恢复路径，A1.1 P0-3 完整校验）。
+   *  - manifest：loadManifest() 全量 schema 校验（不只是 JSON 可解析）；
+   *  - state：结构 + STATES 枚举 + 关键字段一致性（runId 三方一致 / currentStage 一致性规则）；
+   *  - events：逐行 normalizeEvent 必填结构校验（dedupeKey 非空等）。
    * @returns {{manifest: object, state: object, events: object[], seenKeys: Set<string>,
    *            eventsTruncated: boolean}|null} 目录不存在 → null
-   * @throws {StoreCorruptionError} manifest/state 损坏、events 中间行损坏
+   * @throws {StoreCorruptionError} manifest/state/events 任何结构损坏
    */
   loadRun(runId) {
     const dir = this.#runDir(runId);
@@ -174,26 +181,55 @@ export class AuditStore {
 
     let manifest, state;
     try {
-      manifest = JSON.parse(fs.readFileSync(this.#manifestFile(runId), 'utf8'));
+      manifest = loadManifest(JSON.parse(fs.readFileSync(this.#manifestFile(runId), 'utf8')));
     } catch (e) {
       throw new StoreCorruptionError(this.#manifestFile(runId), e.message);
-    }
-    if (manifest == null || typeof manifest !== 'object' || Array.isArray(manifest)) {
-      throw new StoreCorruptionError(this.#manifestFile(runId), 'manifest is not an object');
     }
     try {
       state = JSON.parse(fs.readFileSync(this.#stateFile(runId), 'utf8'));
     } catch (e) {
       throw new StoreCorruptionError(this.#stateFile(runId), e.message);
     }
-    if (state == null || typeof state !== 'object' || Array.isArray(state)) {
-      throw new StoreCorruptionError(this.#stateFile(runId), 'state is not an object');
-    }
+    AuditStore.validatePersistedState(state, manifest, runId, this.#stateFile(runId));
 
     const { events, truncated } = this.#readEvents(runId);
     const seenKeys = new Set(events.map((e) => e.dedupeKey));
     this.#seenKeys.set(runId, seenKeys);
     return { manifest, state, events, seenKeys, eventsTruncated: truncated };
+  }
+
+  /**
+   * 持久化 state 结构校验（A1.1 P0-3）：语法合法但结构非法的 state 不得进入内核。
+   * 一致性规则：runId 目录=manifest=state 三方一致；
+   * manifest.currentStage == state.currentStage（豁免 NEXT_STAGE —— 两段式推进的
+   * crash 窗口内 manifest 可能领先，由 AuditRun.recoverTransientState() 收敛）。
+   */
+  static validatePersistedState(state, manifest, runId, file) {
+    const bad = (msg) => { throw new StoreCorruptionError(file, msg); };
+    if (state == null || typeof state !== 'object' || Array.isArray(state)) bad('state is not an object');
+    if (state.schemaVersion !== 1) bad(`state schemaVersion ${state.schemaVersion} !== 1`);
+    if (state.runId !== manifest.runId || state.runId !== runId) {
+      bad(`runId mismatch: dir="${runId}" manifest="${manifest.runId}" state="${state.runId}"`);
+    }
+    if (!STATES.includes(state.state)) bad(`unknown state "${state.state}"`);
+    if (!manifest.stages.includes(state.currentStage)) {
+      bad(`state.currentStage "${state.currentStage}" not in manifest.stages`);
+    }
+    if (!manifest.stages.includes(state.stopAfter)) {
+      bad(`state.stopAfter "${state.stopAfter}" not in manifest.stages`);
+    }
+    if (!Number.isInteger(state.iteration) || state.iteration < 1) {
+      bad(`iteration must be an integer >= 1, got ${state.iteration}`);
+    }
+    if (!Number.isInteger(state.revisionCount) || state.revisionCount < 0) {
+      bad(`revisionCount must be an integer >= 0, got ${state.revisionCount}`);
+    }
+    if (typeof state.startedAt !== 'number') bad('startedAt must be a number');
+    if (state.state !== 'NEXT_STAGE' && manifest.currentStage !== state.currentStage) {
+      bad(`manifest.currentStage "${manifest.currentStage}" != state.currentStage `
+        + `"${state.currentStage}" in state ${state.state} (only NEXT_STAGE may diverge mid-advance)`);
+    }
+    return true;
   }
 
   #readEvents(runId) {
@@ -214,6 +250,11 @@ export class AuditStore {
         obj = JSON.parse(ln);
       } catch {
         throw new StoreCorruptionError(file, `corrupt event line ${i + 1} (not the trailing partial line)`);
+      }
+      try {
+        AuditStore.normalizeEvent(obj); // A1.1 P0-3：必填结构/dedupeKey 校验，不只 JSON 可解析
+      } catch (e) {
+        throw new StoreCorruptionError(file, `event line ${i + 1} fails event schema: ${e.message}`);
       }
       events.push(obj);
     }

@@ -145,13 +145,22 @@ for (const [field, claimed] of [['RUN_ID', { runId: 'r2' }], ['STAGE', { stage: 
   }, 'AUDIT_IDENTITY_MISMATCH');
 }
 
-await ok('hostId only compared when both sides have it', () => {
-  // expected 无 hostId → 不比较（§10 协议块未列 HOST_ID 的实现决策）
+await ok('expected without hostId: comparison skipped (bare-call boundary; formal paths always pass hostId)', () => {
+  // 边界文档化：只有直接调用 validateIdentity 且 expected 未带 hostId 时才跳过比较。
+  // 正式路径（executorReady / auditorVerdict）的 expected.hostId 来自 manifest（必填），
+  // 因此正式 marker/verdict 一律受 HOST_ID 约束 —— 见 state-machine 测试的 omitted 用例。
   assert.equal(validateIdentity(
     { runId: 'r', stage: 'T1', iteration: 1 },
     { runId: 'r', stage: 'T1', iteration: 1, hostId: 'whatever' },
   ), true);
 });
+
+await throws('hostId omitted while expected has one → HOST_ID mismatch (A1.1 P0-1 fail closed)', async () => {
+  validateIdentity(
+    { runId: 'r', stage: 'T1', iteration: 1, hostId: 'h1' },
+    { runId: 'r', stage: 'T1', iteration: 1 }, // 无 hostId
+  );
+}, 'AUDIT_IDENTITY_MISMATCH');
 
 await throws('hostId mismatch when both present', async () => {
   validateIdentity(

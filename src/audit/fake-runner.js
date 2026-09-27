@@ -55,7 +55,7 @@ export class FakeExecutor {
         stage: el.badStage ?? ctx.stage,
         iteration: el.badIteration ?? ctx.iteration,
         head,
-        hostId: el.hostId ?? null,
+        hostId: el.hostId ?? ctx.hostId, // A1.1 P0-1：正式 marker 必带 HOST_ID（ctx 来自 manifest）
         summary: el.summary, tests: el.tests,
       });
       const pushAll = el.pushAll ?? [el.push ?? { ok: true, tipMatches: true }];
@@ -89,7 +89,7 @@ export class FakeAuditor {
         runId: el.badRunId ?? ctx.runId,
         stage: el.badStage ?? ctx.stage,
         iteration: el.badIteration ?? ctx.iteration,
-        hostId: el.hostId ?? null,
+        hostId: el.hostId ?? ctx.hostId, // A1.1 P0-1：正式 verdict 必带 HOST_ID
         summary: el.summary, evidence: el.evidence,
         p0: el.p0, p1: el.p1, testsRequired: el.testsRequired,
         reason: el.reason, question: el.question,
@@ -160,7 +160,10 @@ export function runAuditScenario(p) {
 
   let steps = 0;
   while (steps++ < maxSteps) {
-    const ctx = { runId: run.runId, stage: run.s.currentStage, iteration: run.s.iteration };
+    const ctx = {
+      runId: run.runId, stage: run.s.currentStage, iteration: run.s.iteration,
+      hostId: run.manifest.hostId, // A1.1 P0-1：身份四元组全程参与
+    };
 
     if (run.state === 'PAUSED_NEEDS_USER' || run.isTerminal) {
       return { run };

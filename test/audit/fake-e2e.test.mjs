@@ -163,6 +163,17 @@ await ok('executor badIteration (stale turn) → aborted', () => {
   assert.equal(r.mismatch.field, 'ITERATION');
 });
 
+await ok('executor marker without HOST_ID (empty string) → full-pipeline rejection (A1.1 P0-1)', () => {
+  const store = newStore();
+  // hostId: '' → builder 不输出 HOST_ID 头行 → validateIdentity 拒绝（fail closed）
+  const r = scenario(store, 'e20',
+    [{ type: 'READY', hostId: '' }], []);
+  assert.equal(r.aborted, 'IDENTITY_MISMATCH');
+  assert.equal(r.mismatch.field, 'HOST_ID');
+  assert.equal(r.run.s.state, 'EXECUTING');
+  assert.equal(r.run.s.pendingRemoteSync, null); // 未留下推进依据
+});
+
 // ---------- 协议缺失路径 ----------
 await ok('MISSING_MARKER ×1 → retry, executor re-asked, run continues', () => {
   const store = newStore();

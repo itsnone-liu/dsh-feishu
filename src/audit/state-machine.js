@@ -109,13 +109,19 @@ export class AuditRun {
     return run;
   }
 
-  /** 从 store 恢复（§22 / G8）。参数接受 runId 字符串或 {runId}。 */
+  /**
+   * 从 store 恢复（§22 / G8，A1.1 P0-2）：加载后自动收敛持久化中间态，
+   * 恢复逻辑内置于内核 —— A2 Controller 无需感知瞬态。
+   * 参数接受 runId 字符串或 {runId}。
+   */
   static open(store, { now = Date.now } = {}) {
     return (runIdOrObj) => {
       const runId = typeof runIdOrObj === 'string' ? runIdOrObj : runIdOrObj?.runId;
       const loaded = store.loadRun(runId);
       if (!loaded) return null;
-      return new AuditRun(store, loaded.manifest, loaded.state, { now });
+      const run = new AuditRun(store, loaded.manifest, loaded.state, { now });
+      run.recoverTransientState();
+      return run;
     };
   }
 
@@ -129,6 +135,31 @@ export class AuditRun {
   get runId() { return this.s.runId; }
   get state() { return this.s.state; }
   get isTerminal() { return TERMINAL_STATES.includes(this.s.state); }
+
+  /**
+   * 持久化中间态确定性收敛（A1.1 P0-2）。覆盖三类两段式转移的 crash 窗口：
+   *  - NEXT_STAGE 已落盘、阶段推进未完成 → 补完推进（幂等：STAGE_ADVANCED 已发则被 dedupe 吞）；
+   *  - REVISE_LOOP_EXHAUSTED / HISTORY_REWRITTEN 已落盘、PAUSED_NEEDS_USER 未转 → 补转。
+   * 稳态调用为 no-op。不得把瞬态恢复留给上层猜测。
+   */
+  recoverTransientState() {
+    const st = this.s.state;
+    if (st === 'NEXT_STAGE') {
+      this.#completeStageAdvance();
+      return { recovered: 'EXECUTING' };
+    }
+    if (st === 'REVISE_LOOP_EXHAUSTED') {
+      this.#emit('REVISE_LOOP_EXHAUSTED');
+      this.#transition('PAUSED_NEEDS_USER', { cause: 'REVISE_LOOP_EXHAUSTED', pausedFrom: 'EXECUTING' });
+      return { recovered: 'PAUSED_NEEDS_USER' };
+    }
+    if (st === 'HISTORY_REWRITTEN') {
+      this.#emit('HISTORY_REWRITTEN');
+      this.#transition('PAUSED_NEEDS_USER', { cause: 'HISTORY_REWRITTEN', pausedFrom: 'EXECUTING' });
+      return { recovered: 'PAUSED_NEEDS_USER' };
+    }
+    return { recovered: null };
+  }
 
   #touch() { this.s.updatedAt = this.now(); }
 
@@ -196,7 +227,7 @@ export class AuditRun {
     this.#assertNotTerminal();
     if (this.s.state !== 'EXECUTING') throw new IllegalTransitionError(this.s.state, 'REMOTE_SYNC');
     validateIdentity(
-      { runId: this.runId, stage: this.s.currentStage, iteration: this.s.iteration },
+      { runId: this.runId, stage: this.s.currentStage, iteration: this.s.iteration, hostId: this.manifest.hostId },
       parsed,
     );
     if (!ancestryOk) {
@@ -223,14 +254,17 @@ export class AuditRun {
     const sync = this.s.pendingRemoteSync;
 
     if (r.ok && r.tipMatches !== false) {
-      // AUDIT_REMOTE_READY → 进入正式审计；commit 进入 G11 保护链。
+      // AUDIT_REMOTE_READY → 进入正式审计；commit 进入 G11 保护链（集合语义：crash 后
+      // 重放同一 gate 成功不重复 append —— A1.1 P1）。
       this.#emit('AUDIT_REMOTE_READY');
-      this.manifest = {
-        ...this.manifest,
-        auditedCommits: [...this.manifest.auditedCommits, sync.head],
-        updatedAt: this.now(),
-      };
-      this.store.saveManifest(this.manifest);
+      if (!this.manifest.auditedCommits.includes(sync.head)) {
+        this.manifest = {
+          ...this.manifest,
+          auditedCommits: [...this.manifest.auditedCommits, sync.head],
+          updatedAt: this.now(),
+        };
+        this.store.saveManifest(this.manifest);
+      }
       this.s.pendingRemoteSync = null;
       this.s.auditInFlight = { stage: sync.stage, iteration: sync.iteration, headCommit: sync.head };
       this.#transition('AUDITING');
@@ -286,6 +320,30 @@ export class AuditRun {
     return { failed: true };
   }
 
+  /**
+   * NEXT_STAGE 后半段推进体（主路径与 recoverTransientState 共用，全幂等：
+   * 重复 saveManifest 同值、STAGE_ADVANCED/STAGE_STARTED 事件按 dedupeKey 去重）。
+   */
+  #completeStageAdvance() {
+    const idx = this.manifest.stages.indexOf(this.s.currentStage);
+    const nextStage = this.manifest.stages[idx + 1];
+    if (nextStage == null) {
+      // NEXT_STAGE 只可能由 AUDITING 的 APPROVE 非目标分支进入；最后 stage 的 APPROVE 走
+      // STOPPED_TARGET_REACHED。到达这里说明磁盘状态被外部篡改 → fail loud。
+      throw new AuditError('AUDIT_STORE_CORRUPTION',
+        `NEXT_STAGE persisted at last stage "${this.s.currentStage}" — unrecoverable`);
+    }
+    this.s.currentStage = nextStage;
+    this.s.iteration = 1;
+    this.s.revisionCount = 0;
+    this.s.stageBaseCommit = this.s.headCommit;
+    this.manifest = { ...this.manifest, currentStage: nextStage, stageBaseCommit: this.s.headCommit, updatedAt: this.now() };
+    this.store.saveManifest(this.manifest);
+    this.#emit('STAGE_ADVANCED', { stage: nextStage });
+    this.#transition('EXECUTING'); // NEXT_STAGE → EXECUTING（表内唯一出边）
+    this.#emit('STAGE_STARTED', { stage: nextStage });
+  }
+
   // ---------- Auditor 侧（§10 / §16 / G6 / G7 / G9） ----------
 
   /**
@@ -305,7 +363,7 @@ export class AuditRun {
       throw new IllegalTransitionError(this.s.state, 'VERDICT');
     }
     validateIdentity(
-      { runId: this.runId, stage: this.s.currentStage, iteration: this.s.iteration },
+      { runId: this.runId, stage: this.s.currentStage, iteration: this.s.iteration, hostId: this.manifest.hostId },
       parsed,
     );
     this.s.lastVerdict = { ...parsed, headCommit: this.s.auditInFlight.headCommit };
@@ -320,18 +378,8 @@ export class AuditRun {
         return { stopped: true };
       }
       // NEXT_STAGE（瞬态）→ EXECUTING；阶段字段推进，revisionCount 仅在此处归零（新 stage）。
-      const idx = this.manifest.stages.indexOf(this.s.currentStage);
-      const nextStage = this.manifest.stages[idx + 1];
       this.#transition('NEXT_STAGE');
-      this.s.currentStage = nextStage;
-      this.s.iteration = 1;
-      this.s.revisionCount = 0;
-      this.s.stageBaseCommit = this.s.headCommit;
-      this.manifest = { ...this.manifest, currentStage: nextStage, stageBaseCommit: this.s.headCommit, updatedAt: this.now() };
-      this.store.saveManifest(this.manifest);
-      this.#emit('STAGE_ADVANCED', { stage: nextStage });
-      this.#transition('EXECUTING');
-      this.#emit('STAGE_STARTED', { stage: nextStage });
+      this.#completeStageAdvance();
       return { advanced: true };
     }
 
@@ -418,6 +466,7 @@ export class AuditRun {
     this.manifest = manifest;
     this.s.stopAfter = target;
     this.store.saveManifest(manifest);
+    this.#touch(); this.store.saveState(this.s); // A1.1：state.stopAfter 同步落盘
     this.#emit('STOP_TARGET_CHANGED', { stage: this.s.currentStage });
     return { changed: true };
   }
