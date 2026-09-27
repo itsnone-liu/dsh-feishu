@@ -31,6 +31,8 @@ import { AutoContinue } from './autocontinue.js';
 import { createTransport } from './transport/index.js';
 import { installSelfGuard } from './selfguard.js';
 import { installVisionTool } from './vision-tool.js';
+import { AuditController } from './audit/controller.js';
+import { AuditLifecycle } from './audit/lifecycle.js';
 
 const name = 'feishu-bridge';
 
@@ -94,7 +96,15 @@ function apply(ctx, config) {
       // A2：/audit 命令面 —— AuditController 只包装 A1 冻结内核，不驱动执行端（A3/A5 接线）。
       // store 根目录 $DSH_HOME/feishu/audit，与 bindings/运行态同区。
       const { AuditController } = await import('./audit/controller.js');
-      commands.auditController = new AuditController();
+      commands.auditController = new AuditController({
+        hostId: process.env.HOST_ID,
+      });
+      commands.auditLifecycle = new AuditLifecycle({
+        controller: commands.auditController,
+        driver,
+        bindings: store,
+      });
+      commands.auditController.lifecycle = commands.auditLifecycle;
       const router = new ChatRouter({ config: cfg, store, driver, renderer, transport, interactions, commands, visionReady, autoContinue });
 
       // ---- outbound seams ----
@@ -125,6 +135,10 @@ function apply(ctx, config) {
         } catch (e) {
           log.error(`auto-continue event ${event?.type} failed (contained): ${e?.stack ?? e}`);
         }
+        // A3 executor observer: never throw through synchronous DSH append.
+        Promise.resolve(commands.auditLifecycle?.onEvent(session, event)).catch((e) => {
+          log.error(`audit executor event ${event?.type} failed (contained): ${e?.stack ?? e}`);
+        });
       });
 
       // ---- inbound transport ----

@@ -1,5 +1,5 @@
 /**
- * audit/commands.js — /audit 子命令解析与文案（A2）。
+ * audit/commands.js — /audit 子命令解析与文案（A2/A3）。
  *
  * 纯函数层：解析 → 调 AuditController → 生成回复文本。
  * 不 import transport（发卡片由外层 Commands 负责），便于离线测试。
@@ -21,13 +21,13 @@ const USAGE = [
   '- `/audit status` — 查看状态 · `/audit pause` 暂停 · `/audit resume` 恢复',
   '- `/audit stop` — 终止 · `/audit until <阶段>` — 修改停止点',
   '',
-  '当前为 A2 阶段：外部执行端（DSH lifecycle / git push / 审核员）尚未接线，',
-  '运行会停在 EXECUTING 等待 —— 这是预期行为，不代表卡死。',
+  'A3 已接入真实 DSH session 与 Git remote gate；审核员仍是 A5 范围。',
+  '运行会在等待 Executor marker 或审核裁决时停留 —— 这是预期行为，不代表卡死。',
 ].join('\n');
 
 /** 状态中文速览（A1 十四态）。 */
 const STATE_HINTS = {
-  EXECUTING: '执行中（等待 executor 标记 —— A3 接线前停在这是预期的）',
+  EXECUTING: '执行中（等待 DSH Executor marker；A3 会继续驱动）',
   AUDITING: '审计中（等待审核员裁决）',
   PAUSED: '已暂停（/audit resume 恢复）',
   PAUSED_NEEDS_USER: '需要人工介入（见原因行）',

@@ -1,23 +1,23 @@
 /**
- * audit/controller.js — AuditController（A2）：Feishu /audit 命令 ↔ A1 冻结内核。
+ * audit/controller.js — AuditController（A2/A3）：Feishu /audit 命令 ↔ A1 冻结内核。
  *
  * 职责边界（A2 验收目标）：
  *  - 用户从飞书能安全创建、查看、暂停、恢复、修改停止点、终止 AuditRun；
  *  - 全部语义决策仍在 A1 内核（state-machine）—— Controller 只做定位 run、
  *    调用内核方法、把结果/异常翻译成可读文案，绝不重写转移规则或事件语义；
- *  - 外部执行端（DSH lifecycle / git push / Web GPT）A2 一律不接：run 停在
- *    EXECUTING 是预期行为（A3/A5 接线后才有驱动）。
+ *  - A3 的真实 session/git 生命周期通过可选 lifecycle 注入；Controller 仍只做
+ *    定位、调用和错误翻译，不重写 A1 转移语义；Web GPT 审核仍留 A5。
  *
- * A2 stub 披露（A3 替换为真实值）：
- *  - repo/branch/startingCommit 用 stub —— 真实 git 事实源在 A3 REMOTE_SYNC_GATE
- *    接线时由启动流程探测提供；
- *  - stages 默认表（T1/T2/T3）来自设计 §5 的示例任务书，真实 stages 属 A3 冻结计划。
+ * A2 stub 披露（未注入 lifecycle 时的兼容路径）：
+ *  - repo/branch/startingCommit 用 stub；正式 A3 run 通过 AuditLifecycle 探测真实 Git；
+ *  - stages 默认表（T1/T2/T3）仍是设计 §5 示例，真实 A3 任务书可注入阶段表。
  */
 import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
 import { AuditStore } from './store.js';
 import { AuditRun, TERMINAL_STATES } from './state-machine.js';
+import { GitRemoteGate } from './git-gate.js';
 
 /** A2 默认阶段表（设计 §5 示例；A3 起由冻结任务书提供）。 */
 export const DEFAULT_STAGES = ['T1', 'T2', 'T3'];
@@ -47,6 +47,14 @@ export class AuditController {
     this.branch = p.branch ?? 'main';
     this.stages = p.stages ?? DEFAULT_STAGES;
     this.maxReviewIterations = p.maxReviewIterations ?? 8;
+    this.lifecycle = p.lifecycle ?? null; // A3 real session/git starter, injected by bridge assembly
+  }
+
+  async createRealRun({ stopAfter, chatId, stages, goal, approvedPlan } = {}) {
+    if (!this.lifecycle) {
+      throw Object.assign(new Error('A3 lifecycle is not attached'), { code: 'AUDIT_LIFECYCLE_UNAVAILABLE' });
+    }
+    return this.lifecycle.start({ stopAfter, chatId, stages, goal, approvedPlan });
   }
 
   /** 大小写不敏感解析阶段名 → 阶段表原名（canonical）；未命中返回 null。create/until 共用。 */

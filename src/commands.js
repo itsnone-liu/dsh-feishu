@@ -67,7 +67,8 @@ export class Commands {
     this.agentPresets = agentPresets;
     this.visionReady = visionReady;
     this.autoContinue = autoContinue;
-    this.auditController = auditController; // A2：/audit 命令面（注入可选，测试/旧装配不炸）
+    this.auditController = auditController; // A2：/audit 命令面
+    this.auditLifecycle = null; // A3：真实 session/git 启动器（可选，旧装配兼容）
   }
 
 
@@ -148,8 +149,25 @@ export class Commands {
     }
     let card;
     try {
-      const { title, body, template } = handleAuditCommand(this.auditController, arg ?? '', chatId);
-      card = buildInfoCard(title, body, template ? { template } : undefined);
+      const raw = (arg ?? '').trim();
+      const first = raw.split(/\s+/)[0]?.toLowerCase();
+      const management = new Set(['', 'status', 'pause', 'resume', 'stop', 'until']);
+      if (raw && !management.has(first) && this.auditLifecycle) {
+        const result = await this.auditController.createRealRun({ stopAfter: raw, chatId });
+        card = buildInfoCard('🧾 审计运行已启动', [
+          `run：\`${result.run.runId}\``,
+          `session：\`${result.agent.id}\``,
+          `状态：**${result.run.s.state}**`,
+          `阶段：**${result.run.s.currentStage}**`,
+          `停止点：**${result.run.s.stopAfter}**`,
+          `HEAD：\`${result.git.head}\``,
+          '',
+          'A3：已绑定现有 DSH session，等待 Executor 输出 READY_FOR_AUDIT。',
+        ].join('\n'));
+      } else {
+        const { title, body, template } = handleAuditCommand(this.auditController, arg ?? '', chatId);
+        card = buildInfoCard(title, body, template ? { template } : undefined);
+      }
     } catch (e) {
       log.error(`/audit handler crashed: ${e?.stack ?? e}`);
       card = buildErrorCard(e);
