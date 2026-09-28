@@ -44,14 +44,21 @@ export function parseAuditBlock(text, opts) {
   const lines = text.split('\n');
 
   // 1. 定位 marker 行：严格全等（trim 后），恰好一个。
+  //    容忍唯一一种多标签形态：块体之后紧跟一个尾随闭合标签（最后一非空行）——
+  //    这是审核模型常见的「开+闭标签」书写习惯，语义无歧义；其余多标签仍判歧义。
   const tagIdx = [];
   for (let i = 0; i < lines.length; i++) {
     if (lines[i].trim() === MARKER_TAG) tagIdx.push(i);
   }
   if (tagIdx.length === 0) throw new ProtocolParseError(`missing ${MARKER_TAG} block`, { text: text.slice(0, 80) });
-  if (tagIdx.length > 1) throw new ProtocolParseError(`ambiguous: ${tagIdx.length} ${MARKER_TAG} blocks`, { positions: tagIdx });
+  let lastContentLine = lines.length - 1;
+  while (lastContentLine >= 0 && lines[lastContentLine].trim() === '') lastContentLine -= 1;
+  const trailingClosing = tagIdx.length === 2 && tagIdx[1] === lastContentLine;
+  if (tagIdx.length > 1 && !trailingClosing) {
+    throw new ProtocolParseError(`ambiguous: ${tagIdx.length} ${MARKER_TAG} blocks`, { positions: tagIdx });
+  }
 
-  const body = lines.slice(tagIdx[0] + 1);
+  const body = lines.slice(tagIdx[0] + 1, trailingClosing ? tagIdx[1] : lines.length);
 
   // 2. 头段：连续 HEADER_KEYS 键行；遇到非头段键行（含段落键）即转入段落区。
   const headers = new Map();

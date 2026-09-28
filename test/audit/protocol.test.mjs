@@ -75,6 +75,24 @@ await throws('double tag = ambiguous', async () => {
   await parseExecutorMarker(`${marker()}\n\n${marker()}`);
 }, 'AUDIT_PROTOCOL_PARSE');
 
+// 尾随闭合标签：块体后紧跟最后一个 [DSH-AUDIT] 行（开+闭书写习惯）→ 唯一被容忍的形态。
+await ok('trailing closing tag tolerated (executor marker + verdict)', () => {
+  const m = parseExecutorMarker(`${marker()}\n${MARKER_TAG}\n`);
+  assert.equal(m.state, 'READY_FOR_AUDIT');
+  assert.equal(m.head, 'fke0001');
+  const v = parseAuditorVerdict(`${verdict({ state: 'REVISE', p0: ['fix X'] })}\n${MARKER_TAG}`);
+  assert.equal(v.state, 'REVISE');
+  assert.deepEqual(v.p0, ['fix X']);
+});
+
+await throws('trailing tag followed by more body still ambiguous', async () => {
+  await parseExecutorMarker(`${marker()}\n${MARKER_TAG}\nSTATE: READY_FOR_AUDIT\n`);
+}, 'AUDIT_PROTOCOL_PARSE');
+
+await throws('three tags still ambiguous', async () => {
+  await parseExecutorMarker(`${marker()}\n${MARKER_TAG}\n${MARKER_TAG}`);
+}, 'AUDIT_PROTOCOL_PARSE');
+
 for (const key of ['RUN_ID', 'STAGE', 'ITERATION', 'HEAD']) {
   await throws(`missing required key ${key}`, async () => {
     const lines = marker().split('\n').filter((l) => !l.startsWith(`${key}:`));
