@@ -41,7 +41,11 @@ export class AuditExecutor {
       stage: run.s.currentStage,
       iteration: run.s.iteration,
     });
-    return `${lead}请只执行当前阶段：完成代码修改后必须创建本地 commit；确认 HEAD 与该 commit 完全一致，然后只输出严格 READY_FOR_AUDIT marker——除 HEAD 与可选的 SUMMARY/TESTS 外，字段值必须与下面模板中给出的值完全一致（HEAD 填写该 commit 哈希）。不要进入下一阶段，不要输出 marker 以外的说明。\n\n${tpl}`;
+    const reqs = run.manifest.stageRequirements?.[run.s.currentStage];
+    const taskBlock = reqs
+      ? `\n\n【本阶段要求（冻结任务书${run.manifest.taskPacketHash ? ` hash ${run.manifest.taskPacketHash.slice(0, 12)}` : ''}，逐条满足）】\n${reqs}`
+      : '';
+    return `${lead}请只执行当前阶段：完成代码修改后必须创建本地 commit；确认 HEAD 与该 commit 完全一致，然后只输出严格 READY_FOR_AUDIT marker——除 HEAD 与可选的 SUMMARY/TESTS 外，字段值必须与下面模板中给出的值完全一致（HEAD 填写该 commit 哈希）。不要进入下一阶段，不要输出 marker 以外的说明。${taskBlock}\n\n${tpl}`;
   }
 
   async start({ run, agent, gitGate = this.gitGate, sendPrompt = true } = {}) {

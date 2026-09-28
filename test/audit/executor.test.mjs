@@ -43,6 +43,17 @@ await ok('A5.4 stage prompt carries exact marker template with real identity val
   assert.ok(p.indexOf('STAGE: T1') < p.indexOf('ITERATION: 1'));
 });
 
+await ok('A5.4 stage prompt carries the frozen stage requirements text', async () => {
+  const f = runFixture();
+  // manifest fixture 不带 stageRequirements —— 用带需求的 manifest 重建 run
+  const m = manifest('r9'); m.stageRequirements = { T1: 'REQ-T1-ALPHA: 必须新增模块 X 并覆盖边界。', T2: 'REQ-T2' };
+  const run = AuditRun.create(f.store, m, { now: () => 10 });
+  const ex = new AuditExecutor({ driver: f.driver, gitGate: {} });
+  await ex.start({ run, agent: f.agent, gitGate: {} });
+  assert.ok(f.submitted[0].includes('REQ-T1-ALPHA'), 'current-stage requirements must be inlined');
+  assert.ok(!f.submitted[0].includes('REQ-T2'), 'other stages must not leak');
+});
+
 await ok('A5.4 REVISE feedback re-carries template with advanced iteration; startStage with next stage', async () => {
   const f = runFixture();
   const gate = { isAncestor: async () => true, pushAndVerify: async ({ head }) => ({ ok: true, tipMatches: true, tip: head }) };
