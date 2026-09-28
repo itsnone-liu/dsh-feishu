@@ -231,6 +231,16 @@ export class AuditLifecycle {
     this.executors.set(runId, executor);
     this.liveRuns.set(runId, run);
     await executor.start({ run, agent, gitGate: gate, sendPrompt: false });
+    // A5.5 recovery: REVISE 已将状态交还 EXECUTING，但 feedback prompt
+    // 可能在桥重启前尚未被 executor session 消费。此时必须补发同一
+    // iteration 的修复 prompt；普通 EXECUTING 恢复仍不重复发送。
+    const reviseRecovery = run.s.state === 'EXECUTING'
+      && run.s.lastVerdict?.state === 'REVISE'
+      && run.s.iteration > (run.s.lastVerdict.iteration ?? 0)
+      && run.s.headCommit === run.s.lastVerdict.headCommit;
+    if (reviseRecovery) {
+      executor.startStage(runId);
+    }
     if (run.s.state === 'WAIT_GIT_PUSH' && run.s.pendingRemoteSync) {
       this.#scheduleRetry(runId, run.s.retry.pushAttempts);
     }
