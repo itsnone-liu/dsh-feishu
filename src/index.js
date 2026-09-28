@@ -118,6 +118,7 @@ function apply(ctx, config) {
             provider: new GitEvidenceProvider(),
             resolve: (runId) => commands.auditController.resolveRunContext(runId),
           },
+          execTest: cfg.audit.execTest ?? null,
         });
         log.info(`audit reviewer: web (${cfg.audit.web.baseUrl}, model=${cfg.audit.web.model}, evidence=verified-git)`);
       }

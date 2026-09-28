@@ -46,7 +46,7 @@ export class AuditController {
     this.repo = p.repo ?? 'stub://local/audit-a2';
     this.branch = p.branch ?? 'main';
     this.stages = p.stages ?? DEFAULT_STAGES;
-    this.maxReviewIterations = p.maxReviewIterations ?? 8;
+    this.maxReviewIterations = p.maxReviewIterations ?? 16;
     this.lifecycle = p.lifecycle ?? null; // A3 real session/git starter, injected by bridge assembly
   }
 
@@ -258,7 +258,7 @@ export class AuditController {
    * /audit resume：PAUSED → 回 pausedFrom；PAUSED_NEEDS_USER → resumeFromHuman。
    * HISTORY_REWRITTEN 需要显式 newBaseline —— A2 无该命令通道，明确报错指引发 A3 接线。
    */
-  resume(chatId) {
+  resume(chatId, { bumpReviewIterations = null } = {}) {
     const t = this.#target(chatId);
     if (t.error) return t.error;
     const id = t.id;
@@ -272,13 +272,13 @@ export class AuditController {
       }
       if (run.s.state === 'PAUSED_NEEDS_USER') {
         if (run.s.cause === 'HISTORY_REWRITTEN') { const e = new Error('历史被改写后的恢复需要显式新 baseline（G11）；A2 命令面未提供该操作，请等待 A3 接线或人工处理 store。'); e.code = 'AUDIT_BASELINE_REQUIRED'; throw e; }
-        const r = run.resumeFromHuman({}); return { state: run.s.state, resumed: r.resumed };
+        const r = run.resumeFromHuman({ bumpReviewIterations }); return { state: run.s.state, resumed: r.resumed, maxReviewIterations: run.s.runOptions.maxReviewIterations };
       }
       const r = run.resume(); return { state: run.s.state, resumed: r.resumed };
     }, 'resume');
     if (this.lifecycle) {
-      return this.lifecycle.resume(id, { human: true })
-        .then(({ run }) => ({ ok: true, runId: id, result: { state: run.s.state, resumed: true } }))
+      return this.lifecycle.resume(id, { human: true, bumpReviewIterations })
+        .then(({ run }) => ({ ok: true, runId: id, result: { state: run.s.state, resumed: true, maxReviewIterations: run.s.runOptions.maxReviewIterations } }))
         .catch((e) => ({ ok: false, runId: id, code: e.code ?? 'AUDIT_ERROR', message: e.message }));
     }
     return this.#call(id, (run) => {
@@ -288,8 +288,8 @@ export class AuditController {
           err.code = 'AUDIT_BASELINE_REQUIRED';
           throw err;
         }
-        const r = run.resumeFromHuman({});
-        return { state: run.s.state, resumed: r.resumed };
+        const r = run.resumeFromHuman({ bumpReviewIterations });
+        return { state: run.s.state, resumed: r.resumed, maxReviewIterations: run.s.runOptions.maxReviewIterations };
       }
       const r = run.resume();
       return { state: run.s.state, resumed: r.resumed };

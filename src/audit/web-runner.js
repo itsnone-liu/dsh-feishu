@@ -23,6 +23,7 @@
  */
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { runExecutorTests } from './exec-test.js';
 import { parseAuditorVerdict, buildHandoff } from './protocol.js';
 import { ProtocolParseError } from './errors.js';
 
@@ -198,6 +199,7 @@ export class WebAuditRunner {
     transport = null,  // 可注入：({url,method,headers,body,timeoutMs}) => {status,json,text}
     evidence = null,   // A5.5（A′）：{ provider, resolve(runId)→{cwd} } verified git evidence
     rawDumpDirFor = null, // 可注入：(packet) => dir|null（测试用）；默认 audit store 的 run 目录
+    execTest = null,      // v0.4.2：桥侧目标提交测试执行 { cmd, timeoutMs }（config.audit.execTest）
     sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   } = {}) {
     this.baseUrl = String(baseUrl).replace(/\/+$/, '');
@@ -214,6 +216,8 @@ export class WebAuditRunner {
     // resolve 为只读 resolver（生产装配用 controller.resolveRunContext）。
     // 缺省 null = 无 evidence 通道（测试/降级路径，行为同 A5.3）。
     this.evidence = evidence ?? null;
+    // v0.4.2：桥侧在精确 TARGET_COMMIT 上执行测试并把结构化记录注入评审包。
+    this.execTest = execTest ?? null;
     // 观测性（不改任何冻结语义）：评审文本缺失/不可解析时把原始文本落盘，便于事后诊断。
     // DSH_AUDIT_RAW_DUMP=0 可整体关闭；注入 rawDumpDirFor 覆盖落盘位置（测试用）。
     this.rawDumpDirFor = rawDumpDirFor ?? ((p) => (
@@ -254,8 +258,10 @@ export class WebAuditRunner {
     // A5.5（A′）：调用模型前动态生成 verified evidence bundle。
     // remote tip ≠ TARGET_COMMIT → AUDIT_EVIDENCE_UNVERIFIED fail-closed（不重试）。
     let evidenceBlock = '';
+    let evidenceContext = null;
     if (this.evidence) {
       const ctx = await this.evidence.resolve(packet.runId);
+      evidenceContext = ctx;
       if (!ctx?.cwd) {
         throw webError('AUDIT_EVIDENCE_UNVERIFIED', `evidence resolver returned no cwd for run ${packet.runId}`);
       }
@@ -263,6 +269,18 @@ export class WebAuditRunner {
         cwd: ctx.cwd, repo: packet.repo, branch: packet.branch,
         baseCommit: packet.baseCommit, targetCommit: packet.targetCommit,
       })}`;
+    }
+    // v0.4.2：桥侧测试执行记录 —— 评审要求"精确 TARGET_COMMIT 上的可信测试执行"。
+    // 在 targetCommit 的隔离 worktree 上真实执行；任何错误记录进 record.error，绝不阻塞评审。
+    let execTestBlock = '';
+    if (this.execTest && evidenceContext?.cwd) {
+      const record = await runExecutorTests({
+        cwd: evidenceContext.cwd, repo: packet.repo, targetCommit: packet.targetCommit,
+        cfg: this.execTest,
+        dumpDir: this.rawDumpDirFor(packet),
+        iteration: packet.iteration,
+      });
+      execTestBlock = `\n\n## BRIDGE-EXECUTED TEST RECORD\n(executed by the audit bridge at the exact TARGET_COMMIT \`${packet.targetCommit}\` in an isolated detached worktree; NOT authored by the executor. This is the machine-verified post-commit test evidence.)\n\n\`\`\`json\n${JSON.stringify(record, null, 2)}\n\`\`\`\n`;
     }
     const handoff = buildHandoff({
       runId: packet.runId,
@@ -277,7 +295,7 @@ export class WebAuditRunner {
       stageRequirement: packet.stageRequirement,
       completed: packet.completed,
     });
-    const userText = `${handoff}${evidenceBlock}\n\n${verdictTemplate(packet)}`;
+    const userText = `${handoff}${evidenceBlock}${execTestBlock}\n\n${verdictTemplate(packet)}`;
     const body = {
       model: this.model,
       reasoning: { effort: this.reasoningEffort },

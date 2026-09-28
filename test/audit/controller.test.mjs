@@ -98,7 +98,7 @@ await ok('status：无 run / 有 run / 终态后回看最近 run', () => {
   assert.equal(s.ok, true);
   assert.equal(s.result.state, 'EXECUTING');
   assert.equal(s.result.currentStage, 'T1');
-  assert.equal(s.result.maxReviewIterations, 8);
+  assert.equal(s.result.maxReviewIterations, 16);
   ctrl.stop('oc_A');
   const after = ctrl.status('oc_A'); // 终态 run 仍可查看（allowFinished 回退）
   assert.equal(after.ok, true);

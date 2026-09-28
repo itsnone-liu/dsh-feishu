@@ -218,7 +218,7 @@ export class AuditLifecycle {
     return restored;
   }
 
-  async resume(runId, { human = false } = {}) {
+  async resume(runId, { human = false, bumpReviewIterations = null } = {}) {
     const run = AuditRun.open(this.controller.store, { now: this.controller.now })(runId);
     if (!run) throw Object.assign(new Error(`run not found: ${runId}`), { code: 'AUDIT_RUN_NOT_FOUND' });
     const binding = this.bindings?.get(run.manifest.chatId);
@@ -230,7 +230,7 @@ export class AuditLifecycle {
       if (run.s.cause === 'HISTORY_REWRITTEN') {
         throw Object.assign(new Error('history was rewritten: explicit new baseline required'), { code: 'AUDIT_BASELINE_REQUIRED' });
       }
-      run.resumeFromHuman({});
+      run.resumeFromHuman({ bumpReviewIterations });
     }
     const gate = this.gitGateFactory({ cwd: run.manifest.cwd });
     const executor = this.executorFactory({ driver: this.driver, gitGate: gate });

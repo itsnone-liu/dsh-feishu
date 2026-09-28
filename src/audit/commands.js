@@ -104,9 +104,13 @@ export async function handleAuditCommand(controller, arg, chatId) {
       return { title: '⏸ 已暂停', body: `run \`${r.runId}\` 状态 **${r.result.state}**。\n/audit resume 恢复。` };
     }
     case 'resume': {
-      const r = await controller.resume(chatId);
+      const bumpReviewIterations = rest.length === 1 ? Number(rest[0]) : null;
+      if (rest.length > 1 || (rest.length === 1 && (!Number.isInteger(bumpReviewIterations) || bumpReviewIterations <= 0))) {
+        return { title: '❌ 恢复失败', body: '用法：`/audit resume` 或 `/audit resume <新的REVISE上限>`（只能提高上限）。', template: 'red' };
+      }
+      const r = await controller.resume(chatId, { bumpReviewIterations });
       if (!r.ok) return { title: '❌ 恢复失败', body: r.message, template: 'red' };
-      return { title: '▶️ 已恢复', body: `run \`${r.runId}\` 状态 **${r.result.state}**。` };
+      return { title: '▶️ 已恢复', body: `run \`${r.runId}\` 状态 **${r.result.state}**${r.result.maxReviewIterations ? `，REVISE上限 ${r.result.maxReviewIterations}` : ''}。` };
     }
     case 'stop': {
       const r = await controller.stop(chatId);
