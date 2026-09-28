@@ -16,12 +16,15 @@
  */
 
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { CERTIFIED_MANIFEST_PATH, materializeCertifiedInputs } from './certified-inputs.js';
 
 const git = (cwd, args) => new Promise((resolve, reject) => {
-  execFile('git', args, { cwd }, (err, stdout, stderr) => {
+  // maxBuffer: 认证清单 blob 可达数 MB，默认 1MB 会让 cat-file 中途爆掉。
+  execFile('git', args, { cwd, maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
     if (err) {
       err.stderr = stderr;
       reject(err);
@@ -84,6 +87,7 @@ export async function runExecutorTests({ cwd, repo, targetCommit, cfg, dumpDir, 
     stdoutTail: null,
     stderrTail: null,
     error: null,
+    certifiedInputs: null,
   };
   if (!cfg?.cmd || typeof cfg.cmd !== 'string' || !cfg.cmd.includes('{junit}')) {
     record.error = 'config audit.execTest.cmd missing or lacks {junit} placeholder';
@@ -95,6 +99,29 @@ export async function runExecutorTests({ cwd, repo, targetCommit, cfg, dumpDir, 
     // 注意：mkdtemp 目录已存在，git worktree add 要求目标不存在——先删再让 git 建。
     rmSync(worktree, { recursive: true, force: true });
     await git(cwd, ['worktree', 'add', '--detach', worktree, targetCommit]);
+    // 认证 live 输入（v0.4.3）：清单从 TARGET COMMIT 的 object db 读出，
+    // 绝不读执行者工作树里的副本；核验通过才物化进 worktree。
+    try {
+      const blob = await git(cwd, ['cat-file', 'blob', `${targetCommit}:${CERTIFIED_MANIFEST_PATH}`]);
+      const manifest = JSON.parse(blob);
+      const m = await materializeCertifiedInputs({
+        sourceRepo: cwd,
+        targetRepo: worktree,
+        manifest,
+      });
+      record.certifiedInputs = {
+        manifestPath: CERTIFIED_MANIFEST_PATH,
+        manifestSha256: createHash('sha256').update(blob).digest('hex'),
+        ...m,
+      };
+    } catch (e) {
+      if (typeof e?.stderr === 'string' && e.stderr.includes('does not exist')) {
+        // cat-file: 目标提交未声明认证清单 —— 该仓库未启用此协议。
+        record.certifiedInputs = null;
+      } else {
+        record.certifiedInputs = { manifestPath: CERTIFIED_MANIFEST_PATH, error: String(e?.message ?? e) };
+      }
+    }
     const junitPath = join(worktree, 'bridge-junit.xml');
     const cmd = cfg.cmd.replaceAll('{junit}', junitPath);
     const res = await runShell(cmd, worktree, cfg.timeoutMs ?? 900_000);
