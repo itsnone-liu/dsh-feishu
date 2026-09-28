@@ -27,6 +27,44 @@ await ok('start submits exactly one executor prompt to bound session', async () 
   assert.equal(r.sessionId, 's-a'); assert.equal(f.submitted.length, 1);
 });
 
+await ok('A5.4 stage prompt carries exact marker template with real identity values', async () => {
+  const f = runFixture(); const ex = new AuditExecutor({ driver: f.driver, gitGate: {} });
+  await ex.start({ run: f.run, agent: f.agent, gitGate: {} });
+  const p = f.submitted[0];
+  assert.ok(p.includes('[DSH-AUDIT]'), 'marker tag must be in prompt');
+  assert.ok(p.includes('RUN_ID: r1'));
+  assert.ok(p.includes('HOST_ID: h1'), 'HOST_ID value must be explicit (fail-closed identity)');
+  assert.ok(p.includes('STAGE: T1'));
+  assert.ok(p.includes('ITERATION: 1'));
+  assert.ok(p.includes('STATE: READY_FOR_AUDIT'));
+  assert.ok(p.includes('HEAD:'));
+  // 模板字段顺序与 buildExecutorMarkerText 双向一致：RUN_ID 在 HOST_ID 前，STAGE 在 ITERATION 前
+  assert.ok(p.indexOf('RUN_ID: r1') < p.indexOf('HOST_ID: h1'));
+  assert.ok(p.indexOf('STAGE: T1') < p.indexOf('ITERATION: 1'));
+});
+
+await ok('A5.4 REVISE feedback re-carries template with advanced iteration; startStage with next stage', async () => {
+  const f = runFixture();
+  const gate = { isAncestor: async () => true, pushAndVerify: async ({ head }) => ({ ok: true, tipMatches: true, tip: head }) };
+  const ex = new AuditExecutor({ driver: f.driver, gitGate: gate });
+  await ex.start({ run: f.run, agent: f.agent });
+  const text = buildExecutorMarkerText({ runId: 'r1', hostId: 'h1', stage: 'T1', iteration: 1, head: 'a'.repeat(40) });
+  await ex.onEvent({ id: 's-a' }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text }] } } });
+  ex.applyVerdict('r1', { state: 'REVISE', runId: 'r1', hostId: 'h1', stage: 'T1', iteration: 1, reason: ['missing test'] });
+  const revisePrompt = f.submitted.at(-1);
+  assert.ok(revisePrompt.includes('missing test'), 'REVISE reason reaches executor');
+  assert.ok(revisePrompt.includes('ITERATION: 2'), 'feedback template carries the ADVANCED iteration');
+  assert.ok(revisePrompt.includes('HOST_ID: h1'));
+  // 第二轮：executor 按 iteration 2 重新输出 marker -> 再次 AUDITING
+  const text2 = buildExecutorMarkerText({ runId: 'r1', hostId: 'h1', stage: 'T1', iteration: 2, head: 'b'.repeat(40) });
+  await ex.onEvent({ id: 's-a' }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: text2 }] } } });
+  assert.equal(f.run.s.state, 'AUDITING');
+  ex.applyVerdict('r1', { state: 'APPROVE', runId: 'r1', hostId: 'h1', stage: 'T1', iteration: 2 });
+  const stagePrompt = f.submitted.at(-1);
+  assert.ok(stagePrompt.includes('STAGE: T2'), 'startStage template carries next stage');
+  assert.ok(stagePrompt.includes('ITERATION: 1'), 'new stage restarts at iteration 1');
+});
+
 await ok('READY marker + verified gate enters AUDITING, then REVISE feedback uses same agent', async () => {
   const f = runFixture();
   const gate = { isAncestor: async () => true, pushAndVerify: async ({ head }) => ({ ok: true, tipMatches: true, tip: head }) };

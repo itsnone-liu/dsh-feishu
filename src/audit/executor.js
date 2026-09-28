@@ -6,7 +6,7 @@
  * executor path at the remote gate; REVISE feedback is injected into the same
  * bound session.
  */
-import { parseExecutorMarker } from './protocol.js';
+import { parseExecutorMarker, executorMarkerTemplate } from './protocol.js';
 
 const textFromMessage = (message) => {
   const content = message?.content ?? message?.message?.content ?? [];
@@ -18,7 +18,7 @@ const textFromMessage = (message) => {
 };
 
 export class AuditExecutor {
-  constructor({ driver, gitGate, prompt = '请只执行当前阶段。完成代码修改后必须创建本地 commit；确认 HEAD 与 commit 完全一致，然后只输出严格 READY_FOR_AUDIT marker（HEAD 必须填写该 commit 哈希）。不要进入下一阶段。', onTransient = null } = {}) {
+  constructor({ driver, gitGate, prompt = '开始执行冻结任务书中的当前阶段。', onTransient = null } = {}) {
     this.driver = driver;
     this.gitGate = gitGate;
     this.prompt = prompt;
@@ -26,10 +26,28 @@ export class AuditExecutor {
     this.runs = new Map(); // runId -> { run, agent, gate, waiting }
   }
 
+  /**
+   * A5.4（真实 E2E 前的已知接线缺口修复）：stage prompt 必须携带与
+   * buildExecutorMarkerText 双向一致的 marker 模板，并填入当前 run 的
+   * RUN_ID/HOST_ID/STAGE/ITERATION 真实值——否则真实 DSH executor 无从得知
+   * identity 字段该填什么（validateIdentity 对 HOST_ID fail-closed）。
+   * 仅改 prompt 文本，不改编排。
+   */
+  #promptWithMarker(entry, lead) {
+    const { run } = entry;
+    const tpl = executorMarkerTemplate({
+      runId: run.runId,
+      hostId: run.manifest.hostId,
+      stage: run.s.currentStage,
+      iteration: run.s.iteration,
+    });
+    return `${lead}请只执行当前阶段：完成代码修改后必须创建本地 commit；确认 HEAD 与该 commit 完全一致，然后只输出严格 READY_FOR_AUDIT marker——除 HEAD 与可选的 SUMMARY/TESTS 外，字段值必须与下面模板中给出的值完全一致（HEAD 填写该 commit 哈希）。不要进入下一阶段，不要输出 marker 以外的说明。\n\n${tpl}`;
+  }
+
   async start({ run, agent, gitGate = this.gitGate, sendPrompt = true } = {}) {
     if (!run || !agent || !gitGate) throw Object.assign(new Error('executor requires run, agent and git gate'), { code: 'AUDIT_EXECUTOR_CONFIG_INVALID' });
     this.runs.set(run.runId, { run, agent, gitGate, waiting: false, turn: 0, markerTurn: null });
-    if (sendPrompt) this.driver.submit(agent, this.prompt);
+    if (sendPrompt) this.driver.submit(agent, this.#promptWithMarker({ run }, this.prompt));
     else if (agent.status !== 'idle') throw Object.assign(new Error('cannot reattach executor while session is busy'), { code: 'AUDIT_SESSION_OCCUPIED' });
     return { started: true, sessionId: agent.id };
   }
@@ -62,7 +80,7 @@ export class AuditExecutor {
     if (event?.type === 'turn/end') {
       if (data.reason?.kind === 'completed' && entry.markerTurn !== entry.turn) {
         const missing = entry.run.markerMissing();
-        if (missing.retry) this.driver.submit(entry.agent, '请在同一阶段重新严格输出 READY_FOR_AUDIT marker，不要输出普通说明。');
+        if (missing.retry) this.driver.submit(entry.agent, `请在同一阶段重新严格输出 READY_FOR_AUDIT marker，不要输出普通说明。\n\n${executorMarkerTemplate({ runId: entry.run.runId, hostId: entry.run.manifest.hostId, stage: entry.run.s.currentStage, iteration: entry.run.s.iteration })}`);
         return { ...missing, turnEnded: true };
       }
       return { turnEnded: true };
@@ -115,14 +133,17 @@ export class AuditExecutor {
   startStage(runId) {
     const entry = this.runs.get(runId);
     if (!entry) throw Object.assign(new Error(`executor run not found: ${runId}`), { code: 'AUDIT_EXECUTOR_NOT_FOUND' });
-    this.driver.submit(entry.agent, `开始执行冻结任务书中的当前阶段 ${entry.run.s.currentStage}；完成后提交并输出 READY_FOR_AUDIT。`);
+    this.driver.submit(entry.agent, this.#promptWithMarker(entry, `开始执行冻结任务书中的当前阶段 ${entry.run.s.currentStage}；完成后提交并输出 READY_FOR_AUDIT。\n\n`));
     return { started: true, sessionId: entry.agent.id, stage: entry.run.s.currentStage };
   }
 
   feedback(runId, text) {
     const entry = this.runs.get(runId);
     if (!entry) throw Object.assign(new Error(`executor run not found: ${runId}`), { code: 'AUDIT_EXECUTOR_NOT_FOUND' });
-    this.driver.submit(entry.agent, text);
+    // A5.4: 反馈后 executor 必须按当前（已推进的）iteration 重新输出 marker，
+    // 因此反馈文本末尾同样携带填好真实值的模板。
+    const tpl = executorMarkerTemplate({ runId: entry.run.runId, hostId: entry.run.manifest.hostId, stage: entry.run.s.currentStage, iteration: entry.run.s.iteration });
+    this.driver.submit(entry.agent, `${text}\n\n修复完成后，请按以下模板重新输出 READY_FOR_AUDIT marker：\n\n${tpl}`);
     return { injected: true, sessionId: entry.agent.id };
   }
 }

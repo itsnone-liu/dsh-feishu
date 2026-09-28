@@ -199,6 +199,26 @@ export function buildExecutorMarkerText(f) {
   return out.join('\n');
 }
 
+/**
+ * A5.4 executor stage prompt 携带的 marker 模板（真实 E2E 前的已知接线缺口修复）。
+ * 字段顺序/格式与 buildExecutorMarkerText 双向一致；RUN_ID/HOST_ID/STAGE/ITERATION
+ * 填入当前 run 的真实值，HEAD 为占位符（executor 填其新创建 commit 的哈希）。
+ * SUMMARY/TESTS 为可选段（缺省也合法）。
+ */
+export function executorMarkerTemplate(f) {
+  const out = [MARKER_TAG,
+    `STATE: READY_FOR_AUDIT`,
+    `RUN_ID: ${f.runId}`,
+    f.hostId ? `HOST_ID: ${f.hostId}` : null,
+    `STAGE: ${f.stage}`,
+    `ITERATION: ${f.iteration}`,
+    `HEAD: <本阶段新创建 commit 的完整哈希>`,
+  ].filter(Boolean);
+  out.push('SUMMARY: <可选：一行本阶段完成内容>');
+  out.push('TESTS: <可选：一行测试结果>');
+  return out.join('\n');
+}
+
 /** 构造 auditor verdict 文本。 */
 export function buildVerdictText(f) {
   const out = [MARKER_TAG,
