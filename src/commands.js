@@ -153,7 +153,27 @@ export class Commands {
       const first = raw.split(/\s+/)[0]?.toLowerCase();
       const second = raw.split(/\s+/)[1] ?? null;
       const management = new Set(['', 'status', 'pause', 'resume', 'stop', 'until', 'next']);
-      if (first === 'next' && this.auditLifecycle) {
+      if (!raw && this.auditLifecycle) {
+        // 裸 /audit 也必须走真实 A3 lifecycle；不得回落到 A2 stub。
+        // 停止点由冻结 task packet 的最后阶段解析，避免 DEFAULT_STAGES 漂移。
+        const packet = this.auditLifecycle.taskPacketLoader(
+          this.auditLifecycle.bindings?.get(chatId)?.cwd,
+        );
+        const result = await this.auditController.createRealRun({
+          stopAfter: packet.stages.at(-1), chatId,
+        });
+        card = buildInfoCard('🧾 审计运行已启动', [
+          `run：\`${result.run.runId}\``,
+          `session：\`${result.agent.id}\``,
+          `状态：**${result.run.s.state}**`,
+          `阶段：**${result.run.s.currentStage}**`,
+          `停止点：**${result.run.s.stopAfter}**`,
+          `HEAD：\`${result.git.head}\``,
+          `任务包：\`${result.run.manifest.taskPacketHash}\``,
+          '',
+          'A3：已绑定现有 DSH session，等待 Executor 输出 READY_FOR_AUDIT。',
+        ].join('\n'));
+      } else if (first === 'next' && this.auditLifecycle) {
         // /audit next [阶段]：真实 continuation —— 继承父链已完成阶段，从下一阶段起步。
         const result = await this.auditLifecycle.startContinuation({ chatId, stopAfter: second });
         card = buildInfoCard('⏭ 审计链已延续', [

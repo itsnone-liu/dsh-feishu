@@ -30,6 +30,9 @@ await ok('空参数 → 创建完整审计运行至最后阶段', async () => {
   assert.match(r.body, /连续运行全部阶段/);
 });
 
+// 裸 /audit 的真实路由由 src/commands.js 负责；这里锁住 A2 纯函数兼容路径，
+// 防止未来把 task-packet 读取逻辑误塞进纯函数层。真实装配测试见 lifecycle tests。
+
 await ok('/audit T2 → 创建卡（EXECUTING + 停止点 + A2 披露）', async () => {
   const r = await handleAuditCommand(newCtrl(), 'T2', 'oc_A');
   assert.equal(r.title, '🧾 审计运行已创建');
