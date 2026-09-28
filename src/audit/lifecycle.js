@@ -218,7 +218,7 @@ export class AuditLifecycle {
     return restored;
   }
 
-  async resume(runId) {
+  async resume(runId, { human = false } = {}) {
     const run = AuditRun.open(this.controller.store, { now: this.controller.now })(runId);
     if (!run) throw Object.assign(new Error(`run not found: ${runId}`), { code: 'AUDIT_RUN_NOT_FOUND' });
     const binding = this.bindings?.get(run.manifest.chatId);
@@ -226,11 +226,20 @@ export class AuditLifecycle {
       throw Object.assign(new Error('persisted dshSessionId does not match the owner chat binding'), { code: 'AUDIT_SESSION_BINDING_MISMATCH' });
     }
     const agent = await this.driver.ensure({ ...binding }, { allowCreate: false });
+    if (human && run.s.state === 'PAUSED_NEEDS_USER') {
+      if (run.s.cause === 'HISTORY_REWRITTEN') {
+        throw Object.assign(new Error('history was rewritten: explicit new baseline required'), { code: 'AUDIT_BASELINE_REQUIRED' });
+      }
+      run.resumeFromHuman({});
+    }
     const gate = this.gitGateFactory({ cwd: run.manifest.cwd });
     const executor = this.executorFactory({ driver: this.driver, gitGate: gate });
     this.executors.set(runId, executor);
     this.liveRuns.set(runId, run);
     await executor.start({ run, agent, gitGate: gate, sendPrompt: false });
+    if (human && run.s.state === 'AUDITING' && run.s.auditInFlight) {
+      this.reviewRounds.delete(runId);
+    }
     // A5.5 recovery: REVISE 已将状态交还 EXECUTING，但 feedback prompt
     // 可能在桥重启前尚未被 executor session 消费。此时必须补发同一
     // iteration 的修复 prompt；普通 EXECUTING 恢复仍不重复发送。

@@ -276,10 +276,15 @@ export class AuditController {
       }
       const r = run.resume(); return { state: run.s.state, resumed: r.resumed };
     }, 'resume');
+    if (this.lifecycle) {
+      return this.lifecycle.resume(id, { human: true })
+        .then(({ run }) => ({ ok: true, runId: id, result: { state: run.s.state, resumed: true } }))
+        .catch((e) => ({ ok: false, runId: id, code: e.code ?? 'AUDIT_ERROR', message: e.message }));
+    }
     return this.#call(id, (run) => {
       if (run.s.state === 'PAUSED_NEEDS_USER') {
         if (run.s.cause === 'HISTORY_REWRITTEN') {
-          const err = new (run.constructor && Error)('历史被改写后的恢复需要显式新 baseline（G11）；A2 命令面未提供该操作，请等待 A3 接线或人工处理 store。');
+          const err = new Error('历史被改写后的恢复需要显式新 baseline（G11）；A2 命令面未提供该操作，请等待 A3 接线或人工处理 store。');
           err.code = 'AUDIT_BASELINE_REQUIRED';
           throw err;
         }
