@@ -109,8 +109,17 @@ function apply(ctx, config) {
       // 默认（audit.reviewer=''）关闭时，桥行为与 A4 完全一致。
       if (cfg.audit?.reviewer === 'web') {
         const { WebAuditRunner } = await import('./audit/web-runner.js');
-        commands.auditLifecycle.reviewer = new WebAuditRunner({ ...cfg.audit.web });
-        log.info(`audit reviewer: web (${cfg.audit.web.baseUrl}, model=${cfg.audit.web.model})`);
+        const { GitEvidenceProvider } = await import('./audit/git-evidence.js');
+        commands.auditLifecycle.reviewer = new WebAuditRunner({
+          ...cfg.audit.web,
+          // A5.5（A′）：verified git evidence bundle —— fact source 仍是 GitHub
+          // @TARGET_COMMIT，transport 改为桥生成的 object-db 证据包。
+          evidence: {
+            provider: new GitEvidenceProvider(),
+            resolve: (runId) => commands.auditController.resolveRunContext(runId),
+          },
+        });
+        log.info(`audit reviewer: web (${cfg.audit.web.baseUrl}, model=${cfg.audit.web.model}, evidence=verified-git)`);
       }
       // A3.1：桥启动时恢复所有非终态 audit run 的 executor 监听；不重复发送 stage prompt。
       commands.auditLifecycle.restoreActive().catch((e) => {

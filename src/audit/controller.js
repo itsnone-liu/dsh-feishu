@@ -63,6 +63,21 @@ export class AuditController {
     return this.stages.find((x) => x.toLowerCase() === s) ?? null;
   }
 
+  /**
+   * A5.5（A′）只读 resolver：runId → { cwd, repo, branch }。
+   * 供 WebAuditRunner 的 evidence provider 定位 run 的 git 仓库；绝不写状态。
+   * liveRuns 优先（同进程内存态），回落 store.loadRun（磁盘 manifest）。
+   */
+  resolveRunContext(runId) {
+    const live = this.lifecycle?.liveRuns?.get(runId);
+    if (live) {
+      return { cwd: live.manifest.cwd, repo: live.manifest.repo, branch: live.manifest.branch };
+    }
+    const loaded = this.store.loadRun(String(runId));
+    if (!loaded) return null;
+    return { cwd: loaded.manifest.cwd, repo: loaded.manifest.repo, branch: loaded.manifest.branch };
+  }
+
   /** 当前活跃 run（非终态）。@returns {{id, state, chatId}|null} */
   activeRun() {
     // listRuns 索引可能滞后（saveState 才更新），以磁盘 state.json 为准逐个 open。

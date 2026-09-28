@@ -268,9 +268,10 @@ export function buildHandoff(f) {
     `BASE_COMMIT: ${f.baseCommit}`,
     '',
     'INSTRUCTION:',
-    'Independently inspect the GitHub repo at TARGET_COMMIT',
-    '(diff BASE_COMMIT..TARGET_COMMIT, files, committed test reports).',
-    'Do not trust executor claims.',
+    'Audit the VERIFIED-GIT-EVIDENCE bundle appended below: it is machine-generated',
+    'from git objects for BASE_COMMIT..TARGET_COMMIT after the bridge verified the',
+    'remote GitHub branch tip equals TARGET_COMMIT.',
+    'Do not trust executor claims outside the bundle.',
     'Return APPROVE / REVISE / NEED_USER.',
   ].join('\n');
 }

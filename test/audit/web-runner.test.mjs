@@ -85,6 +85,44 @@ await ok('request shape: model/stream/store/input + bearer from injected auth', 
   }
 });
 
+await ok('verified git evidence bundle is generated before transport and included in reviewer input', async () => {
+  let resolved = null; let built = null; let transportCalls = 0;
+  const r = new WebAuditRunner({
+    readAuth: () => 'tok-evidence',
+    evidence: {
+      resolve: async (runId) => { resolved = runId; return { cwd: '/verified/repo' }; },
+      provider: { build: async (args) => { built = args; return '[VERIFIED-GIT-EVIDENCE]\nREMOTE_TIP_VERIFIED: true\nTARGET_TREE: tree'; } },
+    },
+    transport: async (req) => {
+      transportCalls++;
+      const user = req.body.input.find((m) => m.role === 'user').content;
+      assert.ok(user.includes('[VERIFIED-GIT-EVIDENCE]'));
+      assert.ok(user.includes('REMOTE_TIP_VERIFIED: true'));
+      return { status: 200, json: responsesBody(verdictText('APPROVE')), text: '' };
+    },
+  });
+  const v = await r.review(packet);
+  assert.equal(v.state, 'APPROVE');
+  assert.equal(resolved, packet.runId);
+  assert.deepEqual(built, { cwd: '/verified/repo', repo: packet.repo, branch: packet.branch, baseCommit: packet.baseCommit, targetCommit: packet.targetCommit });
+  assert.equal(transportCalls, 1);
+});
+
+await ok('verified evidence resolver/provider failure is fail-closed before transport', async () => {
+  let transportCalls = 0;
+  const r = new WebAuditRunner({
+    readAuth: () => 'tok-evidence',
+    evidence: {
+      resolve: async () => ({ cwd: '/verified/repo' }),
+      provider: { build: async () => { throw Object.assign(new Error('remote tip mismatch'), { code: 'AUDIT_EVIDENCE_UNVERIFIED' }); } },
+    },
+    transport: async () => { transportCalls++; throw new Error('must not call transport'); },
+  });
+  await assert.rejects(() => r.review(packet), (e) => e.code === 'AUDIT_EVIDENCE_UNVERIFIED');
+  assert.equal(transportCalls, 0);
+});
+
+
 await ok('empty output → AUDIT_VERDICT_MISSING (lifecycle verdictMissing path)', async () => {
   const r = mk({ responses: [responsesBody('')] });
   await assert.rejects(() => r.review(packet), (e) => e.code === 'AUDIT_VERDICT_MISSING');

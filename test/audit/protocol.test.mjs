@@ -180,7 +180,8 @@ await ok('handoff carries GitHub fact source', () => {
   assert.ok(h.includes('REPO: https://github.com/itsnone-liu/x.git'));
   assert.ok(h.includes('BRANCH: main'));
   assert.ok(h.includes('TARGET_COMMIT: def456'));
-  assert.ok(h.includes('inspect the GitHub repo at TARGET_COMMIT'));
+  assert.ok(h.includes('VERIFIED-GIT-EVIDENCE bundle'));
+  assert.ok(h.includes('remote GitHub branch tip equals TARGET_COMMIT'));
   assert.ok(!h.includes('inspect the workspace'));
 });
 
