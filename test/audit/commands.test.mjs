@@ -23,11 +23,11 @@ const newCtrl = (over = {}) => new AuditController({
   now: () => (tick += 1), ...over,
 });
 
-await ok('空参数 → usage 卡', async () => {
+await ok('空参数 → 创建完整审计运行至最后阶段', async () => {
   const r = await handleAuditCommand(newCtrl(), '', 'oc_A');
-  assert.equal(r.title, '/audit 用法');
-  assert.match(r.body, /audit <阶段>/);
-  assert.match(r.body, /A3 已接入/);
+  assert.equal(r.title, '🧾 完整审计运行已创建');
+  assert.match(r.body, /停止点：\*\*T3\*\*/);
+  assert.match(r.body, /连续运行全部阶段/);
 });
 
 await ok('/audit T2 → 创建卡（EXECUTING + 停止点 + A2 披露）', async () => {

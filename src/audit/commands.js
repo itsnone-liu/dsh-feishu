@@ -5,7 +5,8 @@
  * 不 import transport（发卡片由外层 Commands 负责），便于离线测试。
  *
  * 语法：
- *   /audit T2         创建审计运行（stopAfter=T2）
+ *   /audit             创建完整审计运行（stopAfter=阶段表最后阶段）
+ *   /audit T2          创建审计运行（stopAfter=T2）
  *   /audit status     查看状态
  *   /audit pause      暂停（活跃态 → PAUSED）
  *   /audit resume     恢复（PAUSED/PAUSED_NEEDS_USER）
@@ -17,11 +18,13 @@ import { DEFAULT_STAGES } from './controller.js';
 const USAGE = [
   '**/audit 用法**',
   '',
-  '- `/audit <阶段>` — 创建审计运行（如 `/audit T2`，阶段表：' + DEFAULT_STAGES.join(' · ') + '）',
+  '- `/audit` — 一次性运行全部阶段（停止点：' + DEFAULT_STAGES.at(-1) + '）',
+  '- `/audit <阶段>` — 运行至指定阶段（如 `/audit T2`，阶段表：' + DEFAULT_STAGES.join(' · ') + '）',
   '- `/audit status` — 查看状态 · `/audit pause` 暂停 · `/audit resume` 恢复',
   '- `/audit stop` — 终止 · `/audit until <阶段>` — 修改停止点',
   '',
   'A3 已接入真实 DSH session 与 Git remote gate；审核员仍是 A5 范围。',
+  '阶段 APPROVE 后自动推进下一阶段；每阶段独立计 REVISE 上限（默认 16），`/audit resume <N>` 可提高当前阶段上限。',
   '运行会在等待 Executor marker 或审核裁决时停留 —— 这是预期行为，不代表卡死。',
 ].join('\n');
 
@@ -52,8 +55,17 @@ export async function handleAuditCommand(controller, arg, chatId) {
   const word = (first ?? '').toLowerCase();
   const management = new Set(['status', 'pause', 'resume', 'stop', 'until']);
 
-  // 除保留管理词外，非空参数整体都是 stage candidate（允许 C4-D/phase-b/T5.6B 等）。
-  if (raw && !management.has(word)) {
+  // 无参数默认跑完整阶段表；显式阶段仍允许设置停止点。
+  if (!raw) {
+    const stopAfter = controller.stages.at(-1);
+    const r = await controller.createRun({ stopAfter, chatId });
+    if (!r.ok) return { title: '❌ 创建失败', body: `${r.message}`, template: 'red' };
+    return {
+      title: '🧾 完整审计运行已创建',
+      body: [`run：\`${r.runId}\``, '状态：**EXECUTING**（执行中）', `停止点：**${stopAfter}**（将连续运行全部阶段）`].join('\n'),
+    };
+  }
+  if (!management.has(word)) {
     const r = await controller.createRun({ stopAfter: raw, chatId });
     if (!r.ok) {
       return { title: '❌ 创建失败', body: `${r.message}`, template: 'red' };
