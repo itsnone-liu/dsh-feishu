@@ -99,6 +99,16 @@ await ok('completed turn without marker retries once, then pauses on second comp
   assert.equal(second.failed, true); assert.equal(f.run.s.state, 'PAUSED_NEEDS_USER');
 });
 
+await ok('late completion after NEED_USER pause is stale, not marker-retry', async () => {
+  const f = runFixture(); const ex = new AuditExecutor({ driver: f.driver, gitGate: {} });
+  await ex.start({ run: f.run, agent: f.agent });
+  f.run.s.state = 'PAUSED_NEEDS_USER'; f.run.s.cause = 'NEED_USER';
+  const r = await ex.onEvent({ id: 's-a' }, { type: 'turn/end', data: { reason: { kind: 'completed' } } });
+  assert.deepEqual(r, { turnEnded: true, stale: true });
+  assert.equal(f.run.s.state, 'PAUSED_NEEDS_USER');
+  assert.equal(f.submitted.length, 1, 'must not submit a retry into the paused run');
+});
+
 await ok('malformed assistant prose does not become READY', async () => {
   const f = runFixture(); const ex = new AuditExecutor({ driver: f.driver, gitGate: {} });
   const r = await ex.onEvent({ id: 's-a' }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '完成了，下一阶段开始。' }] } } });

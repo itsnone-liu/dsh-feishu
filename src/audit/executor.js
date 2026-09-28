@@ -82,6 +82,12 @@ export class AuditExecutor {
     const data = event?.data ?? event;
     if (event?.type === 'turn/start') { entry.turn = data.turn ?? (entry.turn + 1); entry.markerTurn = null; return { turnStarted: entry.turn }; }
     if (event?.type === 'turn/end') {
+      // A late completion event can arrive after a NEED_USER/manual pause has
+      // already been persisted.  It belongs to the old executor turn and must
+      // not be interpreted as a new marker-retry cycle: markerMissing() is only
+      // legal while the run is EXECUTING.  Treat it as stale and let the
+      // explicit /audit resume path start the next cycle.
+      if (entry.run.s.state !== 'EXECUTING') return { turnEnded: true, stale: true };
       if (data.reason?.kind === 'completed' && entry.markerTurn !== entry.turn) {
         const missing = entry.run.markerMissing();
         if (missing.retry) this.driver.submit(entry.agent, `请在同一阶段重新严格输出 READY_FOR_AUDIT marker，不要输出普通说明。\n\n${executorMarkerTemplate({ runId: entry.run.runId, hostId: entry.run.manifest.hostId, stage: entry.run.s.currentStage, iteration: entry.run.s.iteration })}`);
