@@ -151,8 +151,23 @@ export class Commands {
     try {
       const raw = (arg ?? '').trim();
       const first = raw.split(/\s+/)[0]?.toLowerCase();
-      const management = new Set(['', 'status', 'pause', 'resume', 'stop', 'until']);
-      if (raw && !management.has(first) && this.auditLifecycle) {
+      const second = raw.split(/\s+/)[1] ?? null;
+      const management = new Set(['', 'status', 'pause', 'resume', 'stop', 'until', 'next']);
+      if (first === 'next' && this.auditLifecycle) {
+        // /audit next [阶段]：真实 continuation —— 继承父链已完成阶段，从下一阶段起步。
+        const result = await this.auditLifecycle.startContinuation({ chatId, stopAfter: second });
+        card = buildInfoCard('⏭ 审计链已延续', [
+          `run：\`${result.run.runId}\``,
+          `父运行：\`${result.parentRunId}\`（已完成阶段继承，不重审）`,
+          `session：\`${result.agent.id}\``,
+          `状态：**${result.run.s.state}**`,
+          `阶段：**${result.run.s.currentStage}**（iteration 1 起）`,
+          `停止点：**${result.run.s.stopAfter}**`,
+          `HEAD：\`${result.git.head}\``,
+          '',
+          'A3：已绑定现有 DSH session，等待 Executor 输出 READY_FOR_AUDIT。',
+        ].join('\n'));
+      } else if (raw && !management.has(first) && this.auditLifecycle) {
         const result = await this.auditController.createRealRun({ stopAfter: raw, chatId });
         card = buildInfoCard('🧾 审计运行已启动', [
           `run：\`${result.run.runId}\``,

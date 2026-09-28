@@ -94,6 +94,105 @@ export class AuditLifecycle {
     return { run, executor, agent, git };
   }
 
+  /**
+   * /audit next（真实 A3 路径）：延续最近一条 STOPPED_TARGET_REACHED 的任务链。
+   * - 自动定位父 run（无需人工给 runId）：owner 匹配 + 终态 STOPPED_TARGET_REACHED；
+   * - lineage 校验：工作区任务书 taskPacketHash 必须与父链一致（任务书被改 → 拒绝，
+   *   避免"重做任务书"悄悄换审计范围）；下一阶段 = 父阶段表中已完成阶段的下一格；
+   * - 继承 goal/approvedPlan/stageRequirements/completedStages，从下一阶段 iteration 1 起步；
+   * - 与 start() 同一套 session 绑定与 executor 接线（发送阶段 prompt，驱动执行端）。
+   */
+  async startContinuation({ chatId, stopAfter = null } = {}) {
+    if (!chatId) throw Object.assign(new Error('chatId is required'), { code: 'AUDIT_ARG_INVALID' });
+    const active = this.controller.activeRun();
+    if (active) {
+      const owned = active.chatId === chatId;
+      throw Object.assign(new Error(owned
+        ? `已有活跃审计运行 ${active.id}；/audit next 仅在无活跃运行时可用`
+        : '本机已有审计运行中，但不是本聊天发起的'), {
+        code: owned ? 'AUDIT_RUN_ACTIVE' : 'AUDIT_RUN_OWNED_BY_OTHER_CHAT',
+      });
+    }
+    // 定位父 run：最近一条 owner 的 STOPPED_TARGET_REACHED。
+    let parent = null;
+    for (const r of this.controller.store.listRuns().slice().reverse()) {
+      const loaded = this.controller.store.loadRun(r.runId);
+      if (loaded
+        && (loaded.manifest.chatId ?? null) === chatId
+        && loaded.state.state === 'STOPPED_TARGET_REACHED') {
+        parent = loaded;
+        break;
+      }
+    }
+    if (!parent) {
+      throw Object.assign(new Error('没有已到达停止点的审计运行可延续；先 /audit <阶段> 或 /audit 创建。'), { code: 'AUDIT_NO_CONTINUATION' });
+    }
+    const pm = parent.manifest;
+    const lastDoneIdx = pm.stages.indexOf(parent.state.stopAfter ?? pm.stopAfter);
+    const nextStage = pm.stages[lastDoneIdx + 1];
+    if (nextStage == null) {
+      throw Object.assign(new Error(`任务链 \`${pm.rootRunId ?? pm.runId}\` 最后阶段 ${pm.stopAfter} 已 APPROVE，没有后续阶段。`), { code: 'AUDIT_ALREADY_COMPLETE' });
+    }
+    let stopAfterStage = nextStage;
+    if (stopAfter != null) {
+      const resolved = pm.stages.includes(stopAfter) ? stopAfter : null;
+      if (!resolved) {
+        throw Object.assign(new Error(`停止点 ${stopAfter} 不在阶段表 [${pm.stages.join(', ')}] 中`), { code: 'AUDIT_MANIFEST_INVALID' });
+      }
+      if (pm.stages.indexOf(resolved) < pm.stages.indexOf(nextStage)) {
+        throw Object.assign(new Error(`延续运行不能停在已完成阶段之前：下一起点为 ${nextStage}，请求停止点 ${resolved} 早于它。`), { code: 'AUDIT_CONTINUATION_STAGE_INVALID' });
+      }
+      stopAfterStage = resolved;
+    }
+    // 绑定 session 与真实 git（与 start() 同一套边界：不创建新 session、不并发）。
+    const binding = this.bindings?.get(chatId);
+    if (!binding?.sessionId || !binding?.cwd) {
+      throw Object.assign(new Error('当前聊天必须已有绑定的 DSH session 和 workspace；/audit next 不会偷偷创建新 session'), { code: 'AUDIT_SESSION_REQUIRED' });
+    }
+    if (!this.driver?.ensure) throw Object.assign(new Error('DSH driver unavailable'), { code: 'AUDIT_EXECUTOR_CONFIG_INVALID' });
+    let agent;
+    try {
+      agent = await this.driver.ensure({ ...binding }, { allowCreate: false });
+    } catch (e) {
+      if (e?.occupied) throw Object.assign(e, { code: 'AUDIT_SESSION_OCCUPIED' });
+      throw Object.assign(e, { code: e.code ?? 'AUDIT_SESSION_RESUME_FAILED' });
+    }
+    if (agent.status !== 'idle') {
+      throw Object.assign(new Error('绑定的 DSH session 当前正在运行；/audit next 不会并发或偷偷 fork'), { code: 'AUDIT_SESSION_OCCUPIED' });
+    }
+    const gate = this.gitGateFactory({ cwd: binding.cwd });
+    const packet = this.taskPacketLoader(binding.cwd);
+    // 任务链一致性：工作区任务书哈希必须与父链一致（改了任务书 → 显式拒绝，fail closed）。
+    if (pm.taskPacketHash && packet.taskPacketHash !== pm.taskPacketHash) {
+      throw Object.assign(new Error(
+        `工作区任务书哈希 \`${packet.taskPacketHash}\` 与父链 \`${pm.taskPacketHash}\` 不一致；延续运行不得更换任务书。`,
+      ), { code: 'AUDIT_PACKET_MISMATCH' });
+    }
+    const git = await gate.inspect({});
+    const stamp = new Date(this.controller.now()).toISOString().replace(/[-:TZ.]/g, '').slice(0, 17);
+    let runId = `audit_${stamp}`;
+    for (let n = 2; this.controller.store.loadRun(runId); n += 1) runId = `audit_${stamp}_${n}`;
+    const completedStages = [...(pm.completedStages ?? []), pm.stages[lastDoneIdx]];
+    const run = AuditRun.create(this.controller.store, {
+      runId, hostId: this.controller.hostId, chatId, dshSessionId: agent.id,
+      cwd: git.cwd, repo: git.repo, branch: git.branch,
+      stages: pm.stages, stopAfter: stopAfterStage, currentStage: nextStage,
+      startingCommit: git.head, stageBaseCommit: parent.state.headCommit,
+      goal: pm.goal, approvedPlan: pm.approvedPlan,
+      taskPacketHash: pm.taskPacketHash, stageRequirements: pm.stageRequirements,
+      parentRunId: pm.runId, rootRunId: pm.rootRunId ?? pm.runId, completedStages,
+      ignorePaths: pm.ignorePaths,
+    }, { maxReviewIterations: this.controller.maxReviewIterations, now: this.controller.now });
+    const executor = this.executorFactory({
+      driver: this.driver, gitGate: gate,
+      onTransient: this.retryScheduler ? (entry, _result, attempt) => this.#scheduleRetry(entry.run.runId, attempt) : null,
+    });
+    this.executors.set(runId, executor);
+    this.liveRuns.set(runId, run);
+    await executor.start({ run, agent, gitGate: gate });
+    return { run, executor, agent, git, parentRunId: pm.runId };
+  }
+
   async review(runId, reviewer = this.reviewer) {
     return this.#serial(runId, () => this.#reviewLocked(runId, reviewer));
   }
