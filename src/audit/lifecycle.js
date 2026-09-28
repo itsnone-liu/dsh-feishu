@@ -166,6 +166,7 @@ export class AuditLifecycle {
         this.retryScheduler.cancel(runId);
       }
       const result = await operation(run);
+      if (action === 'resume' && result?.ignored) return result;
       if (action === 'resume') {
         if (run.s.state === 'WAIT_GIT_PUSH' && run.s.pendingRemoteSync) {
           this.#scheduleRetry(runId, run.s.retry.pushAttempts);

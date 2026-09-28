@@ -54,6 +54,7 @@ export const EVENTS = Object.freeze([
   'MARKER_RETRY', 'MARKER_PARSE_FAILED', 'VERDICT_RETRY', 'VERDICT_PARSE_FAILED', 'IDENTITY_MISMATCH',
   'DSH_QUOTA_WAIT', 'DSH_QUOTA_RECOVER', 'WEB_QUOTA_WAIT', 'WEB_QUOTA_RECOVER',
   'NEED_USER', 'HISTORY_REWRITTEN', 'HUMAN_RESUME', 'PAUSED_BY_USER', 'RESUMED_BY_USER',
+  'RECOVERED_REVISE_EXECUTING',
   'STAGE_ADVANCED', 'TARGET_REACHED', 'RUN_STOPPED', 'STOP_TARGET_CHANGED',
 ]);
 
@@ -165,6 +166,19 @@ export class AuditRun {
       this.#emit('HISTORY_REWRITTEN');
       this.#transition('PAUSED_NEEDS_USER', { cause: 'HISTORY_REWRITTEN', pausedFrom: 'EXECUTING' });
       return { recovered: 'PAUSED_NEEDS_USER' };
+    }
+    // A5.5 recovery guard: a duplicate /audit resume raced with the synchronous
+    // REVISE feedback path and persisted AUDITING without an auditInFlight.
+    // REVISE is authoritative here: the next iteration must be executor-owned.
+    if (st === 'AUDITING'
+      && this.s.auditInFlight == null
+      && this.s.lastVerdict?.state === 'REVISE'
+      && Number.isInteger(this.s.iteration)
+      && Number.isInteger(this.s.lastVerdict.iteration)
+      && this.s.iteration > this.s.lastVerdict.iteration) {
+      this.#emit('RECOVERED_REVISE_EXECUTING');
+      this.#transition('EXECUTING');
+      return { recovered: 'EXECUTING' };
     }
     return { recovered: null };
   }

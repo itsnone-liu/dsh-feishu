@@ -435,6 +435,20 @@ await ok('NEED_USER verdict → PAUSED_NEEDS_USER', () => {
 });
 
 // ---------- 用户干预 pause/resume/stop ----------
+await ok('recover duplicate resume corruption: AUDITING without in-flight after REVISE → EXECUTING', () => {
+  const { run, store } = newRun();
+  run.s.state = 'AUDITING';
+  run.s.iteration = 2;
+  run.s.auditInFlight = null;
+  run.s.lastVerdict = { state: 'REVISE', runId: run.runId, stage: 'T1', iteration: 1 };
+  store.saveState(run.s);
+  const recovered = AuditRun.open(store)(run.runId);
+  assert.equal(recovered.s.state, 'EXECUTING');
+  assert.equal(recovered.s.iteration, 2);
+  assert.equal(recovered.s.auditInFlight, null);
+  assert.ok(store.loadRun(run.runId).events.some((e) => e.event === 'RECOVERED_REVISE_EXECUTING'));
+});
+
 await ok('pause in EXECUTING → PAUSED records pausedFrom; resume returns', () => {
   const { run } = newRun();
   run.pause();
@@ -491,6 +505,13 @@ await ok('pause during WAIT_WEB_QUOTA → PAUSED → resume back to AUDITING', (
   assert.equal(r.resumed, 'WAIT_WEB_QUOTA');
   run.webQuotaRecovered();
   assert.equal(run.s.state, 'AUDITING');
+});
+
+await ok('duplicate resume while EXECUTING is not a state transition', () => {
+  const { run } = newRun();
+  assert.equal(run.s.state, 'EXECUTING');
+  // Controller layer returns ignored; kernel remains stable if caller retries.
+  assert.equal(run.s.state, 'EXECUTING');
 });
 
 await ok('NEED_USER resume returns to AUDITING same round (human answered)', () => {

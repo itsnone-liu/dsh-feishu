@@ -81,7 +81,8 @@ await ok('remote divergence is reported as tip mismatch', async () => {
   const f = repoFixture();
   const gate = new GitRemoteGate({ cwd: f.work, allowNonGithubRemote: true });
   const info = await gate.inspect({ branch: 'main', repo: f.bare });
-  await assert.rejects(() => gate.pushAndVerify({ branch: 'main', head: `${info.head.slice(0, 39)}0` }),
+  const divergentHead = `${info.head.slice(0, 39)}${info.head.endsWith('0') ? '1' : '0'}`;
+  await assert.rejects(() => gate.pushAndVerify({ branch: 'main', head: divergentHead }),
     (e) => e.code === 'AUDIT_GIT_COMMAND_FAILED' || e.code === 'AUDIT_GIT_TIP_DIVERGED' || e.code === 'AUDIT_GIT_HEAD_MISMATCH');
 });
 
