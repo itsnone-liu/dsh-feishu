@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // A5.1 WebAuditRunner 单元测试 —— 全部确定性，无网络依赖（transport 注入）。
 import assert from 'node:assert';
+import { join } from 'node:path';
 import { WebAuditRunner, extractReviewerText, consumeSseStream } from '../../src/audit/web-runner.js';
 import { buildVerdictText } from '../../src/audit/protocol.js';
 
@@ -132,6 +133,30 @@ await ok('empty output → AUDIT_VERDICT_MISSING (lifecycle verdictMissing path)
 await ok('malformed text → AUDIT_VERDICT_MALFORMED with protocol cause', async () => {
   const r = mk({ responses: [responsesBody('looks good, ship it')] });
   await assert.rejects(() => r.review(packet), (e) => e.code === 'AUDIT_VERDICT_MALFORMED' && !!e.cause);
+});
+
+await ok('malformed/missing verdict dumps raw reviewer text for diagnosis (best-effort)', async () => {
+  const { mkdtempSync, readdirSync, readFileSync: rd } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const dir = mkdtempSync(join(tmpdir(), 'audit-raw-'));
+  const r = new WebAuditRunner({
+    readAuth: () => 't', transport: async () => ({ status: 200, json: responsesBody('I quote the template:\n[DSH-AUDIT]\nSTATE: APPROVE\n...then my own:\n[DSH-AUDIT]\nSTATE: REVISE'), text: '' }),
+    rawDumpDirFor: () => dir, sleep: async () => {},
+  });
+  await assert.rejects(() => r.review(packet), (e) => e.code === 'AUDIT_VERDICT_MALFORMED');
+  const files = readdirSync(dir).filter((f) => f.startsWith('reviewer-raw-i1-'));
+  assert.equal(files.length, 1);
+  const dumped = rd(join(dir, files[0]), 'utf8');
+  assert.ok(dumped.startsWith('# AUDIT_VERDICT_MALFORMED'));
+  assert.ok(dumped.includes('bytes='));
+  assert.ok(dumped.includes('I quote the template'));
+
+  // rawDumpDirFor 返回 null（或 DSH_AUDIT_RAW_DUMP=0 语义）→ 静默不落盘、不抛错
+  const r2 = new WebAuditRunner({
+    readAuth: () => 't', transport: async () => ({ status: 200, json: responsesBody('no marker'), text: '' }),
+    rawDumpDirFor: () => null, sleep: async () => {},
+  });
+  await assert.rejects(() => r2.review(packet), (e) => e.code === 'AUDIT_VERDICT_MALFORMED');
 });
 
 await ok('401/403 → AUDIT_WEB_LOGIN_EXPIRED, single attempt, no retry', async () => {

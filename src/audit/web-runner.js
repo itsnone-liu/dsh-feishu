@@ -21,7 +21,8 @@
  *   - 模型无文本输出              → AUDIT_VERDICT_MISSING     （lifecycle verdictMissing 重试）
  *   - 文本不符合冻结协议          → AUDIT_VERDICT_MALFORMED   （lifecycle verdictMissing 重试）
  */
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { parseAuditorVerdict, buildHandoff } from './protocol.js';
 import { ProtocolParseError } from './errors.js';
 
@@ -36,6 +37,8 @@ const SYSTEM_PROMPT = [
   '',
   'Output contract (MANDATORY):',
   '- End your reply with exactly ONE [DSH-AUDIT] verdict block as the very last thing in your message.',
+  '- Your reply must contain exactly ONE line reading "[DSH-AUDIT]" — if you discuss or reference',
+  '  the verdict format, describe it in words; never reproduce its marker line outside the final block.',
   '- Use the frozen line format below; section content may be written in Simplified Chinese.',
   '- STATE must be exactly one of APPROVE, REVISE, NEED_USER.',
   '- Echo RUN_ID / HOST_ID / STAGE / ITERATION exactly as given in the task, on their own header lines.',
@@ -194,6 +197,7 @@ export class WebAuditRunner {
     readAuth = null,   // 可注入：() => token（测试用）；默认读 auth.json
     transport = null,  // 可注入：({url,method,headers,body,timeoutMs}) => {status,json,text}
     evidence = null,   // A5.5（A′）：{ provider, resolve(runId)→{cwd} } verified git evidence
+    rawDumpDirFor = null, // 可注入：(packet) => dir|null（测试用）；默认 audit store 的 run 目录
     sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   } = {}) {
     this.baseUrl = String(baseUrl).replace(/\/+$/, '');
@@ -210,7 +214,25 @@ export class WebAuditRunner {
     // resolve 为只读 resolver（生产装配用 controller.resolveRunContext）。
     // 缺省 null = 无 evidence 通道（测试/降级路径，行为同 A5.3）。
     this.evidence = evidence ?? null;
+    // 观测性（不改任何冻结语义）：评审文本缺失/不可解析时把原始文本落盘，便于事后诊断。
+    // DSH_AUDIT_RAW_DUMP=0 可整体关闭；注入 rawDumpDirFor 覆盖落盘位置（测试用）。
+    this.rawDumpDirFor = rawDumpDirFor ?? ((p) => (
+      process.env.DSH_AUDIT_RAW_DUMP === '0' ? null
+        : join(process.env.HOME ?? '/root', '.dsh/feishu/audit/runs', p.runId)
+    ));
     this.calls = []; // 可观测性：{ packet, attempts, outcome }
+  }
+
+  /** best-effort 原始文本落盘：任何失败静默（诊断通道绝不能影响主流程）。 */
+  #dumpRaw(packet, text, why) {
+    try {
+      const dir = this.rawDumpDirFor(packet);
+      if (!dir) return;
+      mkdirSync(dir, { recursive: true });
+      const file = join(dir, `reviewer-raw-i${packet.iteration}-${Date.now()}.txt`);
+      writeFileSync(file, `# ${why}\n# model=${this.model} effort=${this.reasoningEffort} bytes=${text.length}\n${text}`);
+      console.warn(`[audit][web-runner] ${why} — raw reviewer text (${text.length} bytes) dumped to ${file}`);
+    } catch { /* 诊断失败不影响主流程 */ }
   }
 
   #readTokenFromFile() {
@@ -271,11 +293,18 @@ export class WebAuditRunner {
     const res = await this.#postWithRetries(body, token, record);
     // SSE 应答：模型文本在 outputText（delta 累积）；JSON 应答：从 json 提取。
     const text = res.outputText ?? extractReviewerText(res.json);
-    if (!text) throw webError('AUDIT_VERDICT_MISSING', 'web reviewer returned no output text');
+    if (!text) {
+      this.#dumpRaw(packet, '', 'AUDIT_VERDICT_MISSING: reviewer returned no output text');
+      throw webError('AUDIT_VERDICT_MISSING', 'web reviewer returned no output text');
+    }
     let verdict;
     try { verdict = parseAuditorVerdict(text); }
     catch (e) {
-      if (e instanceof ProtocolParseError) throw webError('AUDIT_VERDICT_MALFORMED', 'web reviewer returned malformed verdict', { cause: e });
+      if (e instanceof ProtocolParseError) {
+        this.#dumpRaw(packet, text, `AUDIT_VERDICT_MALFORMED: ${e.message}`);
+        throw webError('AUDIT_VERDICT_MALFORMED', 'web reviewer returned malformed verdict', { cause: e });
+      }
+      this.#dumpRaw(packet, text, `parse error: ${e?.message ?? e}`);
       throw e;
     }
     record.outcome = verdict.state;
