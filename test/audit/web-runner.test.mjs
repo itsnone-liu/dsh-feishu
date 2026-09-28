@@ -71,7 +71,8 @@ await ok('request shape: model/stream/store/input + bearer from injected auth', 
   assert.equal(seen.url, 'http://127.0.0.1:8787/v1/responses');
   assert.equal(seen.method, 'POST');
   assert.equal(seen.headers.Authorization, 'Bearer tok-test');
-  assert.equal(seen.body.model, 'gpt-5.6-luna');
+  assert.equal(seen.body.model, 'gpt-5.6-sol');
+  assert.equal(seen.body.reasoning.effort, 'high');
   assert.equal(seen.body.stream, true);
   assert.equal(seen.body.store, false);
   const dev = seen.body.input.find((m) => m.role === 'developer');

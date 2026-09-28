@@ -185,7 +185,8 @@ function classifyStreamError(se) {
 export class WebAuditRunner {
   constructor({
     baseUrl = process.env.DSH_AUDIT_WEB_BASE_URL ?? 'http://127.0.0.1:8787',
-    model = process.env.DSH_AUDIT_WEB_MODEL ?? 'gpt-5.6-luna',
+    model = process.env.DSH_AUDIT_WEB_MODEL ?? 'gpt-5.6-sol',
+    reasoningEffort = process.env.DSH_AUDIT_WEB_REASONING_EFFORT ?? 'high',
     authJsonPath = process.env.DSH_AUDIT_WEB_AUTH ?? `${process.env.HOME ?? '/root'}/.codex/auth.json`,
     timeoutMs = 300_000,
     transientRetries = 2,
@@ -197,6 +198,7 @@ export class WebAuditRunner {
   } = {}) {
     this.baseUrl = String(baseUrl).replace(/\/+$/, '');
     this.model = model;
+    this.reasoningEffort = reasoningEffort;
     this.authJsonPath = authJsonPath;
     this.timeoutMs = timeoutMs;
     this.transientRetries = Math.max(0, transientRetries);
@@ -256,6 +258,7 @@ export class WebAuditRunner {
     const userText = `${handoff}${evidenceBlock}\n\n${verdictTemplate(packet)}`;
     const body = {
       model: this.model,
+      reasoning: { effort: this.reasoningEffort },
       input: [
         { type: 'message', role: 'developer', content: SYSTEM_PROMPT },
         { type: 'message', role: 'user', content: userText },
