@@ -106,6 +106,89 @@ export class AuditController {
   }
 
   /**
+   * /audit next：找最近一条 STOPPED_TARGET_REACHED 的 run，从其 stopAfter 的
+   * 下一阶段创建 continuation run（同一冻结任务链，不重审已完成阶段）。
+   * lineage 校验：taskPacketHash 必须与父 run 一致；下一阶段必须存在于父阶段表。
+   */
+  next(chatId, { stopAfter = null } = {}) {
+    if (typeof chatId !== 'string' || chatId.length === 0) {
+      return { ok: false, code: 'AUDIT_ARG_INVALID', message: '缺少 chat 上下文（owner 校验 fail closed）。' };
+    }
+    const active = this.activeRun();
+    if (active) {
+      return {
+        ok: false, code: 'AUDIT_RUN_ACTIVE',
+        message: `已有活跃的审计运行 \`${active.id}\`（状态 ${active.state}）；/audit next 仅在无活跃运行时可用。`,
+      };
+    }
+    // 找最近一条 owner 的 STOPPED_TARGET_REACHED run（任务链尾）。
+    const runs = this.store.listRuns();
+    let parent = null;
+    for (let i = runs.length - 1; i >= 0 && !parent; i -= 1) {
+      const loaded = this.store.loadRun(runs[i].runId);
+      if (loaded
+        && (loaded.manifest.chatId ?? null) === chatId
+        && loaded.state.state === 'STOPPED_TARGET_REACHED') {
+        parent = loaded;
+      }
+    }
+    if (!parent) {
+      return { ok: false, code: 'AUDIT_NO_CONTINUATION', message: '没有已到达停止点的审计运行可延续。' };
+    }
+    const pm = parent.manifest;
+    const stages = pm.stages;
+    const lastDoneIdx = stages.indexOf(parent.state.stopAfter ?? pm.stopAfter);
+    const nextStage = stages[lastDoneIdx + 1];
+    if (nextStage == null) {
+      return {
+        ok: false, code: 'AUDIT_ALREADY_COMPLETE',
+        message: `任务链 \`${pm.rootRunId ?? pm.runId}\` 的最后阶段 **${pm.stopAfter}** 已 APPROVE，没有后续阶段。`,
+      };
+    }
+    let stopAfterStage = nextStage;
+    if (stopAfter != null) {
+      const resolved = stages.includes(stopAfter) ? stopAfter : null;
+      if (!resolved) {
+        return { ok: false, code: 'AUDIT_MANIFEST_INVALID', message: `停止点 \`${stopAfter}\` 不在阶段表 [${stages.join(', ')}] 中。` };
+      }
+      if (stages.indexOf(resolved) < stages.indexOf(nextStage)) {
+        return {
+          ok: false, code: 'AUDIT_CONTINUATION_STAGE_INVALID',
+          message: `延续运行不能停在已完成阶段之前的阶段：下一起点为 **${nextStage}**，请求停止点 \`${resolved}\` 早于它。`,
+        };
+      }
+      stopAfterStage = resolved;
+    }
+    const stamp = new Date(this.now()).toISOString().replace(/[-:TZ.]/g, '').slice(0, 17);
+    let runId = `audit_${stamp}`;
+    for (let n = 2; fs.existsSync(path.join(this.store.root, 'runs', runId)); n += 1) {
+      runId = `audit_${stamp}_${n}`;
+    }
+    const completed = [...(pm.completedStages ?? []), stages[lastDoneIdx]];
+    const input = {
+      runId, hostId: pm.hostId, chatId, dshSessionId: pm.dshSessionId,
+      cwd: pm.cwd, repo: pm.repo, branch: pm.branch,
+      stages, stopAfter: stopAfterStage, currentStage: nextStage,
+      startingCommit: parent.state.headCommit, stageBaseCommit: parent.state.headCommit,
+      goal: pm.goal, approvedPlan: pm.approvedPlan,
+      taskPacketHash: pm.taskPacketHash, stageRequirements: pm.stageRequirements,
+      parentRunId: pm.runId, rootRunId: pm.rootRunId ?? pm.runId, completedStages: completed,
+      ignorePaths: pm.ignorePaths,
+    };
+    try {
+      const run = AuditRun.create(this.store, input, {
+        maxReviewIterations: this.maxReviewIterations, now: this.now,
+      });
+      return {
+        ok: true, runId,
+        result: { state: run.s.state, currentStage: nextStage, stopAfter: stopAfterStage, parentRunId: pm.runId },
+      };
+    } catch (e) {
+      return { ok: false, runId, code: e.code ?? 'AUDIT_ERROR', message: e.message };
+    }
+  }
+
+  /**
    * 定位命令目标 run 并做 owner 校验（A2.1 P0-1）。
    * 冻结语义：单 host 一个 active run（auditConcurrencyPerHost=1）+ run 归属发起 chat。
    * 非 owner 只知道「本机有审计在跑」，不暴露 stage/commit/事件。

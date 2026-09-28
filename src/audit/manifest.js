@@ -55,6 +55,20 @@ export function createManifest(raw, now = Date.now) {
   if (stages.indexOf(currentStage) > stages.indexOf(stopAfter)) {
     throw new ManifestValidationError(`currentStage "${currentStage}" is past stopAfter "${stopAfter}"`);
   }
+  // continuation lineage 校验：带 parentRunId 的 manifest（/audit next 产物）
+  // 必须从父链已完成阶段的下一阶段开始，且不得回退到更早阶段。
+  if (raw.parentRunId != null) {
+    const completed = raw.completedStages ?? [];
+    const lastDone = completed.at(-1);
+    if (lastDone == null) {
+      throw new ManifestValidationError('continuation requires at least one completed stage in completedStages');
+    }
+    if (stages.indexOf(currentStage) !== stages.indexOf(lastDone) + 1) {
+      throw new ManifestValidationError(
+        `continuation currentStage "${currentStage}" must be the stage immediately after the last completed stage "${lastDone}"`,
+      );
+    }
+  }
 
   const startingCommit = req('startingCommit');
   if (!isNonEmptyStr(startingCommit)) throw new ManifestValidationError('startingCommit must be a non-empty string');
@@ -92,6 +106,13 @@ export function createManifest(raw, now = Date.now) {
     stages: [...stages],
     currentStage,
     stopAfter,
+
+    // v0.4 continuation lineage：/audit next 创建的 run 继承父 run 的任务链。
+    // parentRunId = 直接父 run；rootRunId = 链首（自身为链首时等于 runId）；
+    // completedStages = 父链已 APPROVE 的阶段（含父 run 的 stopAfter）。
+    parentRunId: raw.parentRunId ?? null,
+    rootRunId: raw.rootRunId ?? raw.runId,
+    completedStages: arr(raw.completedStages, 'completedStages'),
 
     // v0.3：GitHub 审计事实源。
     repo: raw.repo,

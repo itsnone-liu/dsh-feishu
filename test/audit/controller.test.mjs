@@ -207,5 +207,93 @@ await ok('Controller 不产生内核外的状态：状态枚举完整覆盖', ()
   assert.equal(typeof s.startedAt, 'number');
 });
 
+// ---- /audit next：任务链延续（continuation lineage）----
+
+/** 把一条 run 推到 STOPPED_TARGET_REACHED（stopAfter 阶段 APPROVE）。 */
+const finishRun = (ctrl, runId) => {
+  const run = pushToAuditing(ctrl, runId);
+  const v = parseAuditorVerdict(buildVerdictText({
+    state: 'APPROVE', runId, hostId: 'h1', stage: run.s.currentStage, iteration: run.s.iteration,
+  }));
+  run.auditorVerdict(v);
+  return run;
+};
+
+await ok('next：T2 完成的链 → 从 T3 起步，继承 lineage 不重审 T1/T2', () => {
+  const ctrl = newCtrl({ stages: ['T1', 'T2', 'T3', 'T4'] });
+  const first = ctrl.createRun({ stopAfter: 'T2', chatId: 'oc_A' });
+  finishRun(ctrl, first.runId, 'T1');
+  const opened = AuditRun.open(ctrl.store, { now: ctrl.now })(first.runId);
+  // 推 T1→T2 再 T2 APPROVE 到达停止点
+  const r2 = pushToAuditing(ctrl, first.runId);
+  const v2 = parseAuditorVerdict(buildVerdictText({
+    state: 'APPROVE', runId: first.runId, hostId: 'h1', stage: 'T2', iteration: 1,
+  }));
+  r2.auditorVerdict(v2);
+  assert.equal(r2.s.state, 'STOPPED_TARGET_REACHED');
+
+  const nx = ctrl.next('oc_A');
+  assert.equal(nx.ok, true);
+  assert.equal(nx.result.currentStage, 'T3');
+  assert.equal(nx.result.stopAfter, 'T3'); // 默认只跑下一阶段，需继续用 /audit next T4
+  assert.equal(nx.result.parentRunId, first.runId);
+  const loaded = ctrl.store.loadRun(nx.runId);
+  assert.equal(loaded.manifest.currentStage, 'T3');
+  assert.deepEqual(loaded.manifest.completedStages, ['T1', 'T2']);
+  assert.equal(loaded.manifest.rootRunId, first.runId);
+  assert.equal(loaded.state.iteration, 1);
+  assert.equal(loaded.state.state, 'EXECUTING');
+});
+
+await ok('next：任务链已完成最后阶段 → 明确拒绝（无后续阶段）', () => {
+  const ctrl = newCtrl({ stages: ['T1', 'T2'] });
+  const r = ctrl.createRun({ stopAfter: 'T2', chatId: 'oc_A' });
+  const run = pushToAuditing(ctrl, r.runId);
+  run.auditorVerdict(parseAuditorVerdict(buildVerdictText({
+    state: 'APPROVE', runId: r.runId, hostId: 'h1', stage: 'T1', iteration: 1,
+  })));
+  const run2 = pushToAuditing(ctrl, r.runId);
+  run2.auditorVerdict(parseAuditorVerdict(buildVerdictText({
+    state: 'APPROVE', runId: r.runId, hostId: 'h1', stage: 'T2', iteration: 1,
+  })));
+  const nx = ctrl.next('oc_A');
+  assert.equal(nx.ok, false);
+  assert.equal(nx.code, 'AUDIT_ALREADY_COMPLETE');
+});
+
+await ok('next：无已完成链 → 明确拒绝', () => {
+  const ctrl = newCtrl();
+  const nx = ctrl.next('oc_A');
+  assert.equal(nx.ok, false);
+  assert.equal(nx.code, 'AUDIT_NO_CONTINUATION');
+});
+
+await ok('next：指定早于起点的停止阶段 → 拒绝（不能回到已完成阶段）', () => {
+  const ctrl = newCtrl({ stages: ['T1', 'T2', 'T3'] });
+  const r = ctrl.createRun({ stopAfter: 'T2', chatId: 'oc_A' });
+  const run = pushToAuditing(ctrl, r.runId);
+  run.auditorVerdict(parseAuditorVerdict(buildVerdictText({
+    state: 'APPROVE', runId: r.runId, hostId: 'h1', stage: 'T1', iteration: 1,
+  })));
+  const run2 = pushToAuditing(ctrl, r.runId);
+  run2.auditorVerdict(parseAuditorVerdict(buildVerdictText({
+    state: 'APPROVE', runId: r.runId, hostId: 'h1', stage: 'T2', iteration: 1,
+  })));
+  const bad = ctrl.next('oc_A', { stopAfter: 'T2' });
+  assert.equal(bad.ok, false);
+  assert.equal(bad.code, 'AUDIT_CONTINUATION_STAGE_INVALID');
+  const good = ctrl.next('oc_A', { stopAfter: 'T3' });
+  assert.equal(good.ok, true);
+  assert.equal(good.result.currentStage, 'T3');
+});
+
+await ok('next：有活跃 run → 拒绝', () => {
+  const ctrl = newCtrl();
+  ctrl.createRun({ stopAfter: 'T2', chatId: 'oc_A' });
+  const nx = ctrl.next('oc_A');
+  assert.equal(nx.ok, false);
+  assert.equal(nx.code, 'AUDIT_RUN_ACTIVE');
+});
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exitCode = fail ? 1 : 0;

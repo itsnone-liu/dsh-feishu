@@ -364,7 +364,13 @@ export class AuditRun {
     this.s.iteration = 1;
     this.s.revisionCount = 0;
     this.s.stageBaseCommit = this.s.headCommit;
-    this.manifest = { ...this.manifest, currentStage: nextStage, stageBaseCommit: this.s.headCommit, updatedAt: this.now() };
+    // v0.4 lineage：刚 APPROVE 的阶段（推进前的 currentStage）记入 completedStages，
+    // 供 /audit next 延续链时继承"已通过阶段，不重审"。
+    const completedStages = [...(this.manifest.completedStages ?? []), this.manifest.stages[idx]];
+    this.manifest = {
+      ...this.manifest, currentStage: nextStage, stageBaseCommit: this.s.headCommit,
+      completedStages, updatedAt: this.now(),
+    };
     this.store.saveManifest(this.manifest);
     this.#emit('STAGE_ADVANCED', { stage: nextStage });
     this.#transition('EXECUTING'); // NEXT_STAGE → EXECUTING（表内唯一出边）
