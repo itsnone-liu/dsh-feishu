@@ -77,7 +77,10 @@ export class AuditExecutor {
 
   async onEvent(session, event) {
     const id = session?.id;
-    const entry = [...this.runs.values()].find((x) => x.agent.id === id);
+    // 同一 session 可先后绑定多个 run（续链 / /audit next 新 run）。终态 run 的
+    // 残留 entry 不得拦截新 run 的 marker 事件：优先匹配非终态 entry。
+    const matches = [...this.runs.values()].filter((x) => x.agent.id === id);
+    const entry = matches.find((x) => !x.run.isTerminal) ?? matches[0];
     if (!entry) return { ignored: true };
     const data = event?.data ?? event;
     if (event?.type === 'turn/start') { entry.turn = data.turn ?? (entry.turn + 1); entry.markerTurn = null; return { turnStarted: entry.turn }; }
@@ -105,6 +108,12 @@ export class AuditExecutor {
       return { ignored: true };
     }
     const { run, gitGate } = entry;
+    if (run.isTerminal) {
+      // 残留的终态 entry 收到了（属于新 run 的）marker：自清理让位，
+      // 不得继续 ancestry/executorReady（终态 run 上必抛 AUDIT_RUN_FROZEN）。
+      this.runs.delete(run.runId);
+      return { ignored: true };
+    }
     try {
       const ancestryOk = await Promise.all([
         run.manifest.stageBaseCommit,
@@ -118,6 +127,12 @@ export class AuditExecutor {
       });
       return run.remoteSyncResult(result);
     } catch (e) {
+      if (e.code === 'AUDIT_RUN_FROZEN') {
+        // 残留的终态 entry 收到了（属于新 run 的）marker：清掉自己并让位，
+        // 不得让异常中断 lifecycle 对其余 run 的分发。
+        this.runs.delete(run.runId);
+        return { ignored: true };
+      }
       if (e.code === 'AUDIT_GIT_COMMAND_FAILED') {
         const result = run.remoteSyncResult({ ok: false, kind: 'transient' });
         if (result.waiting && this.onTransient) await this.onTransient(entry, result, entry.run.s.retry.pushAttempts);

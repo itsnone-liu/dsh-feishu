@@ -117,3 +117,37 @@ await ok('malformed assistant prose does not become READY', async () => {
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exitCode = fail ? 1 : 0;
+
+await ok('stale terminal entry never starves a live run on the same session (marker reaches active run)', async () => {
+  const dead = runFixture(); const live = runFixture();
+  const ex = new AuditExecutor({ driver: dead.driver, gitGate: {} });
+  // 残留：终态 run 的 entry 先注册（同一 session id 's-a'）
+  await ex.start({ run: dead.run, agent: dead.agent, gitGate: {} });
+  dead.run.stop('测试终结'); // → STOPPED（terminal），entry 不清理（旧 bug 场景）
+  // 活跃：新 run 同 session 注册在后
+  let isAncestor = async () => true;
+  const gate = { isAncestor: (c) => isAncestor(c), pushAndVerify: async () => ({ ok: true, head: 'c2', remote: 'origin', branch: 'main' }) };
+  await ex.start({ run: live.run, agent: { id: 's-a', status: 'idle' }, gitGate: gate });
+  const text = buildExecutorMarkerText({ runId: 'r1', hostId: 'h1', stage: 'T1', iteration: 1, head: 'c2', summary: '', tests: '' });
+  // 修复点1：find 优先非终态 entry → marker 送进 live run，而非撞上终态 run 抛 AUDIT_RUN_FROZEN
+  let threw = null;
+  try {
+    const r = await ex.onEvent({ id: 's-a' }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text }] } } });
+    assert.ok(!r?.ignored, 'active run must consume the marker');
+  } catch (e) { threw = e; }
+  assert.equal(threw, null, 'stale terminal entry must not leak AUDIT_RUN_FROZEN to caller');
+  assert.ok(['AUDIT_REMOTE_READY', 'AUDIT_STARTED', 'AUDITING'].includes(live.run.s.state), `live run must accept the marker, got ${live.run.s.state}`);
+  assert.equal(dead.run.s.state, 'STOPPED', 'terminal run must stay untouched');
+});
+
+await ok('frozen cleanup: executor self-removes stale entry instead of throwing', async () => {
+  const dead = runFixture();
+  const ex = new AuditExecutor({ driver: dead.driver, gitGate: {} });
+  await ex.start({ run: dead.run, agent: dead.agent, gitGate: {} });
+  dead.run.stop('测试终结');
+  const text = buildExecutorMarkerText({ runId: 'r1', hostId: 'h1', stage: 'T1', iteration: 1, head: 'c9', summary: '', tests: '' });
+  // 强制走终态 entry（唯一 entry）验证 catch 分支自清理
+  const r = await ex.onEvent({ id: 's-a' }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text }] } } });
+  assert.ok(r?.ignored, 'frozen entry yields by returning ignored');
+  assert.equal(ex.runs.size, 0, 'stale entry must be removed from runs map');
+});

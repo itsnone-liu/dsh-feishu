@@ -291,7 +291,11 @@ export class AuditLifecycle {
   }
 
   async onEvent(session, event) {
+    // 先为每个 run 建好任务再逐个 await，且单个 executor 的异常只计入本 run 的
+    // 结果、不中断循环——否则终态 run 的残留 executor 抛错会饿死同 session 的
+    // 活跃 run（marker 永远到不了目标 run，表现为 MARKER_PARSE_FAILED 假阳性）。
     const results = [];
+    const tasks = [];
     for (const [runId, executor] of this.executors) {
       const prior = this.eventQueues.get(runId) ?? Promise.resolve();
       const task = prior.then(async () => {
@@ -302,8 +306,20 @@ export class AuditLifecycle {
         return r;
       });
       this.eventQueues.set(runId, task.catch(() => undefined));
-      results.push(await task);
+      tasks.push(task);
     }
+    let firstError = null;
+    for (const task of tasks) {
+      try {
+        results.push(await task);
+      } catch (e) {
+        if (!firstError) firstError = e;
+        results.push({ ignored: true, error: String(e?.message ?? e) });
+      }
+    }
+    // 错误契约保留：全部分发完毕后再冒泡首个错误（原实现首个任务抛错即中断，
+    // 会饿死同 session 其余 run 的分发）。
+    if (firstError) throw firstError;
     return results;
   }
 
