@@ -555,7 +555,14 @@ export class AuditRun {
     }
     this.#emit('HUMAN_RESUME');
     const target = this.s.pausedFrom ?? 'EXECUTING';
+    const previousCause = this.s.cause;
     this.#transition(target);
+    // Preserve the historical reason separately; an active run must not be
+    // presented as currently paused after a successful human resume.
+    this.s.lastPauseCause = previousCause;
+    this.s.cause = null;
+    this.#touch();
+    this.store.saveState(this.s);
     return { resumed: target };
   }
 }

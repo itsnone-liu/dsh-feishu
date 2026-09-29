@@ -126,13 +126,14 @@ export async function handleAuditCommand(controller, arg, chatId) {
         `停止点：**${s.stopAfter}**`,
       ];
       if (s.cause) lines.push(`暂停原因：\`${s.cause}\``);
+      else if (s.lastPauseCause) lines.push(`上次暂停原因：\`${s.lastPauseCause}\``);
       if (s.auditedCommits.length > 0) {
         lines.push(`已审 commits：${s.auditedCommits.map((c) => `\`${c}\``).join(', ')}`);
       }
       if (s.recentEvents.length > 0) {
         lines.push('', `最近事件：${s.recentEvents.map((e) => `\`${e}\``).join(' → ')}`);
       }
-      lines.push('', `仓库（A2 stub）：\`${s.repo}@${s.branch}\``);
+      lines.push('', `仓库：\`${s.repo}@${s.branch}\``);
       return { title: '📊 审计状态', body: lines.join('\n') };
     }
     case 'pause': {

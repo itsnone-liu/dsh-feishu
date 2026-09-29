@@ -70,7 +70,7 @@ await ok('/audit status → 状态卡（无 run / 有 run 两态）', async () =
   const s = await handleAuditCommand(ctrl, 'status', 'oc_A');
   assert.equal(s.title, '📊 审计状态');
   assert.match(s.body, /EXECUTING/);
-  assert.match(s.body, /A2 stub/);
+  assert.match(s.body, /仓库：/);
   assert.match(s.body, /停止点：\*\*T2\*\*/);
 });
 

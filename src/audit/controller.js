@@ -324,6 +324,7 @@ export class AuditController {
           revisionCount: run.s.revisionCount,
           maxReviewIterations: run.s.runOptions.maxReviewIterations,
           cause: run.s.cause,
+          lastPauseCause: run.s.lastPauseCause ?? null,
           auditedCommits: run.manifest.auditedCommits,
           repo: run.manifest.repo,
           branch: run.manifest.branch,
