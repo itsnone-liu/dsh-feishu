@@ -95,6 +95,9 @@ export class AuditRun {
       lastPauseCause: null,
       waitingForHuman: false,
       waitingReason: null,
+      lastExecutorEventAt: null,
+      lastExecutorEvent: null,
+      lastExecutorTurn: null,
       markerRetries: 0,
       verdictRetries: 0,
       retry: { pushAttempts: 0, pushMax: 4 },
@@ -229,6 +232,13 @@ export class AuditRun {
    * 第 1 次 → MARKER_RETRY（状态不变，等待重问）；第 2 次 → PAUSED_NEEDS_USER。
    * @returns {{retry: boolean}|{failed: boolean}}
    */
+  recordExecutorEvent(event, turn = null) {
+    this.s.lastExecutorEventAt = this.now();
+    this.s.lastExecutorEvent = event;
+    this.s.lastExecutorTurn = turn;
+    this.#touch(); this.store.saveState(this.s);
+  }
+
   clearHumanWait() {
     this.s.waitingForHuman = false;
     this.s.waitingReason = null;

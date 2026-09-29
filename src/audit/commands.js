@@ -128,6 +128,7 @@ export async function handleAuditCommand(controller, arg, chatId) {
       if (s.waitingForHuman) lines.push(`等待人工：\`${s.waitingReason}\``);
       else if (s.cause) lines.push(`暂停原因：\`${s.cause}\``);
       else if (s.lastPauseCause) lines.push(`上次暂停原因：\`${s.lastPauseCause}\``);
+      if (s.lastExecutorEventAt) lines.push(`最后 executor 事件：\`${s.lastExecutorEvent}\`（turn ${s.lastExecutorTurn ?? '-'}）`);
       if (s.observerSessionId) lines.push(`观察 session：\`${s.observerSessionId}\``);
       if (s.auditSessionId) lines.push(`审计 session：\`${s.auditSessionId}\``);
       if (s.auditedCommits.length > 0) {

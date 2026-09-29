@@ -94,6 +94,7 @@ export class AuditExecutor {
     const entry = matches.find((x) => !x.run.isTerminal) ?? matches[0];
     if (!entry) return { ignored: true };
     const data = event?.data ?? event;
+    entry.run.recordExecutorEvent(event?.type ?? 'unknown', data.turn ?? entry.turn);
     if (event?.type === 'turn/start') {
       entry.turn = data.turn ?? (entry.turn + 1);
       entry.markerTurn = null;
@@ -175,6 +176,9 @@ export class AuditExecutor {
   submitHumanResponse(text) {
     const entry = [...this.runs.values()].find((x) => x.run.s.waitingForHuman);
     if (!entry) return { ignored: true };
+    if (!/SEAL_ANNOTATION_ONLY|receipt exact hash|receipt_sha256/i.test(String(text))) {
+      return { ignored: true, invalidApproval: true, reason: 'approval text does not match B4 fixed protocol' };
+    }
     this.driver.submit(entry.agent, text);
     entry.run.clearHumanWait();
     return { submitted: true, sessionId: entry.agent.id };
