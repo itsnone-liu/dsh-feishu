@@ -50,7 +50,12 @@ export class AuditExecutor {
 
   async start({ run, agent, gitGate = this.gitGate, sendPrompt = true } = {}) {
     if (!run || !agent || !gitGate) throw Object.assign(new Error('executor requires run, agent and git gate'), { code: 'AUDIT_EXECUTOR_CONFIG_INVALID' });
-    this.runs.set(run.runId, { run, agent, gitGate, waiting: false, turn: 0, markerTurn: null });
+    this.runs.set(run.runId, {
+      run, agent, gitGate, waiting: false, turn: 0, markerTurn: null,
+      // On reattach, ignore late assistant output from the failed turn until
+      // the fresh turn/start event arrives.
+      awaitingFreshTurn: !sendPrompt,
+    });
     if (sendPrompt) this.driver.submit(agent, this.#promptWithMarker({ run }, this.prompt));
     else if (agent.status !== 'idle') throw Object.assign(new Error('cannot reattach executor while session is busy'), { code: 'AUDIT_SESSION_OCCUPIED' });
     return { started: true, sessionId: agent.id };
@@ -83,7 +88,12 @@ export class AuditExecutor {
     const entry = matches.find((x) => !x.run.isTerminal) ?? matches[0];
     if (!entry) return { ignored: true };
     const data = event?.data ?? event;
-    if (event?.type === 'turn/start') { entry.turn = data.turn ?? (entry.turn + 1); entry.markerTurn = null; return { turnStarted: entry.turn }; }
+    if (event?.type === 'turn/start') {
+      entry.turn = data.turn ?? (entry.turn + 1);
+      entry.markerTurn = null;
+      entry.awaitingFreshTurn = false;
+      return { turnStarted: entry.turn };
+    }
     if (event?.type === 'turn/end') {
       // A late completion event can arrive after a NEED_USER/manual pause has
       // already been persisted.  It belongs to the old executor turn and must
@@ -99,6 +109,10 @@ export class AuditExecutor {
       return { turnEnded: true };
     }
     if (event?.type !== 'assistant/message') return { ignored: true };
+    // A stale assistant message can be delivered after resume and before the
+    // new turn/start. It must never be parsed as the current marker.
+    if (entry.awaitingFreshTurn) return { ignored: true, stale: true };
+    if (entry.run.s.state !== 'EXECUTING') return { ignored: true, stale: true };
     const text = textFromMessage(data);
     if (!text) return { ignored: true };
     let marker;
