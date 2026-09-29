@@ -117,7 +117,7 @@ export class FakeAuditor {
 export function runAuditScenario(p) {
   const {
     store, manifestInput, executorScript, auditorScript,
-    maxReviewIterations = 8, crashOnEvent = null, maxSteps = 300,
+    maxReviewIterations = 0, crashOnEvent = null, maxSteps = 300,
   } = p;
 
   const eventCounts = new Map();

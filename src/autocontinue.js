@@ -347,16 +347,17 @@ export class AutoContinue {
 
   #schedule(sessionId, chatId, kind, message) {
     const cfg = this.config;
+    const maxWaitMs = Number(cfg.autoContinueMaxMs) > 0 ? Number(cfg.autoContinueMaxMs) : Infinity;
     const prev = this.watchers.get(sessionId);
     const firstAt = prev?.firstAt ?? Date.now();
     const attempts = (prev?.attempts ?? 0) + 1;
     this.#clearTimer(sessionId);
 
     // —— 放弃判定
-    if (Date.now() - firstAt > (cfg.autoContinueMaxMs ?? 6 * 3_600_000)) {
+    if (Date.now() - firstAt > maxWaitMs) {
       this.watchers.delete(sessionId);
       this.#send(chatId, buildInfoCard('⏹ 自动继续已放弃', [
-        `等待超过上限（${Math.round((cfg.autoContinueMaxMs ?? 6 * 3_600_000) / 3_600_000)} 小时）仍未恢复。`,
+        `等待超过上限（${Math.round(((Number(cfg.autoContinueMaxMs) > 0 ? Number(cfg.autoContinueMaxMs) : Infinity)) / 3_600_000)} 小时）仍未恢复。`,
         '', '窗口可能已重置但探测仍失败，请手动发一条消息接续。',
         '', `\`\`\`\n${String(message).slice(0, 300)}\n\`\`\``,
       ].join('\n'), { template: 'grey' }));
@@ -376,7 +377,7 @@ export class AutoContinue {
           `瞬时限流连续重试 ${attempts - 1} 次未恢复，可能是订阅额度窗口用满。`,
           '', recoverAt
             ? `按${wlenH}小时滚动窗口推算，${new Date(recoverAt).toLocaleString('zh-CN', { hour12: false })} 定点自动继续；届时仍受限则每 ${Math.round((cfg.autoContinuePollMs ?? 10 * 60_000) / 60_000)} 分钟再探。`
-            : `未给出重置时间，每 ${Math.round((cfg.autoContinuePollMs ?? 10 * 60_000) / 60_000)} 分钟探测一次，最长等 ${Math.round((cfg.autoContinueMaxMs ?? 6 * 3_600_000) / 3_600_000)} 小时。`,
+            : `未给出重置时间，每 ${Math.round((cfg.autoContinuePollMs ?? 10 * 60_000) / 60_000)} 分钟探测一次，最长等 ${Math.round(((Number(cfg.autoContinueMaxMs) > 0 ? Number(cfg.autoContinueMaxMs) : Infinity)) / 3_600_000)} 小时。`,
           '期间你发消息即取消。', '',
           `\`\`\`\n${String(message).slice(0, 300)}\n\`\`\``,
         ].join('\n'), { template: 'grey' }));
@@ -396,7 +397,7 @@ export class AutoContinue {
       delayMs = Math.min(10 * 60_000, 30_000 * 2 ** (attempts - 1));
       note = `瞬时限流，${Math.round(delayMs / 1000)}s 后第 ${attempts} 次自动重试`;
     } else if (hint?.inMs !== undefined) {
-      delayMs = Math.max(5_000, Math.min(hint.inMs + 5_000, cfg.autoContinueMaxMs ?? 6 * 3_600_000));
+      delayMs = Math.max(5_000, Math.min(hint.inMs + 5_000, (Number(cfg.autoContinueMaxMs) > 0 ? Number(cfg.autoContinueMaxMs) : Infinity)));
       note = `服务端提示等待 ${Math.round(hint.inMs / 1000)}s，到点自动继续`;
     } else if (hint?.at) {
       delayMs = Math.max(5_000, hint.at.getTime() - Date.now() + 30_000);
@@ -411,7 +412,7 @@ export class AutoContinue {
         : null;
       if (recoverAt) {
         delayMs = Math.max(5_000, Math.min(
-          recoverAt - Date.now(), cfg.autoContinueMaxMs ?? 6 * 3_600_000));
+          recoverAt - Date.now(), (Number(cfg.autoContinueMaxMs) > 0 ? Number(cfg.autoContinueMaxMs) : Infinity)));
         note = `按${wlenH}小时滚动窗口推算恢复点 ${new Date(recoverAt).toLocaleString('zh-CN', { hour12: false })} 定点继续`;
       } else {
         const first = !prev;
@@ -695,10 +696,10 @@ export class AutoContinue {
       const cfg = this.config;
       // maxMs 放弃：不再探，停 fallback 但保持备用模型（别把用户从能用的
       // 模型上切回仍受限的），通知手动处理。
-      if (Date.now() - w.firstAt > (cfg.autoContinueMaxMs ?? 6 * 3_600_000)) {
+      if (Date.now() - w.firstAt > ((Number(cfg.autoContinueMaxMs) > 0 ? Number(cfg.autoContinueMaxMs) : Infinity))) {
         this.#clearAllWatchers();
         this.#send(w.chatId, buildInfoCard('⏹ 恢复探测已放弃', [
-          `超过 ${Math.round((cfg.autoContinueMaxMs ?? 6 * 3_600_000) / 3_600_000)} 小时主模型仍未恢复，探测停止（会话保持在备用模型上可用）。`,
+          `超过 ${Math.round(((Number(cfg.autoContinueMaxMs) > 0 ? Number(cfg.autoContinueMaxMs) : Infinity)) / 3_600_000)} 小时主模型仍未恢复，探测停止（会话保持在备用模型上可用）。`,
           '', '主模型恢复后手动 /glm 切回，或 /auto 恢复自动。',
         ].join('\n'), { template: 'grey' }));
         log.warn('fallback probe gave up after max wait');

@@ -165,6 +165,47 @@ export class AuditStore {
     this.#seenKeys.set(runId, new Set(events.map((e) => e.dedupeKey)));
   }
 
+  // ---------- LLM recovery incident history ----------
+
+  appendRecoveryIncident({ runId, incident }) {
+    if (!runId || !incident || typeof incident !== 'object') throw new AuditError('AUDIT_RECOVERY_INVALID', 'recovery incident is required');
+    fs.appendFileSync(path.join(this.#runDir(runId), 'recovery.jsonl'), `${JSON.stringify({ ts: this.now(), incident })}\n`);
+  }
+
+  listRecoveryIncidents(runId) {
+    const file = path.join(this.#runDir(runId), 'recovery.jsonl');
+    if (!fs.existsSync(file)) return [];
+    return fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  }
+
+  // ---------- P-E 事故状态（incident.json，原子写，跨重启） ----------
+
+  #incidentFile(runId) { return path.join(this.#runDir(runId), 'incident.json'); }
+
+  /** 读取当前事故记录；无/损坏 → null（损坏不猜：当作无事故，让 watchdog 重新发现）。 */
+  readIncident(runId) {
+    const file = this.#incidentFile(runId);
+    if (!fs.existsSync(file)) return null;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+      return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** 原子写入事故状态（open/resolved）。桥重启后 restoreActive 据此重新派出修复。 */
+  writeIncident(runId, incident) {
+    if (!runId || !incident || typeof incident !== 'object') throw new AuditError('AUDIT_INCIDENT_INVALID', 'incident record is required');
+    const dir = this.#runDir(runId);
+    fs.mkdirSync(dir, { recursive: true });
+    const file = this.#incidentFile(runId);
+    const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
+    fs.writeFileSync(tmp, `${JSON.stringify(incident, null, 2)}\n`, 'utf8');
+    fs.renameSync(tmp, file);
+    return true;
+  }
+
   // ---------- 裁决历史（v0.4.4） ----------
 
   /**

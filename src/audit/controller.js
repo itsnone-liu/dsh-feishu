@@ -41,11 +41,14 @@ export class AuditController {
     this.store = p.store ?? new AuditStore(
       p.rootDir ?? path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'feishu', 'audit'));
     this.now = p.now ?? Date.now;
+    this.unattended = p.unattended === true;
     this.hostId = p.hostId ?? os.hostname();
     this.cwd = p.cwd ?? process.cwd();
     this.repo = p.repo ?? 'stub://local/audit-a2';
     this.branch = p.branch ?? 'main';
     this.stages = p.stages ?? DEFAULT_STAGES;
+    // Explicit 0 = unlimited. Keep the legacy constructor default for offline
+    // callers; production wiring passes 0 from the unattended policy.
     this.maxReviewIterations = p.maxReviewIterations ?? 16;
     this.lifecycle = p.lifecycle ?? null; // A3 real session/git starter, injected by bridge assembly
   }
@@ -188,6 +191,10 @@ export class AuditController {
       const run = AuditRun.create(this.store, input, {
         maxReviewIterations: this.maxReviewIterations, now: this.now,
       });
+      if (this.unattended) {
+        run.s.retry.pushMax = 0;
+        this.store.saveState(run.s);
+      }
       return {
         ok: true, runId,
         result: { state: run.s.state, currentStage: nextStage, stopAfter: stopAfterStage, parentRunId: pm.runId },
@@ -298,6 +305,10 @@ export class AuditController {
       const run = AuditRun.create(this.store, input, {
         maxReviewIterations: this.maxReviewIterations, now: this.now,
       });
+      if (this.unattended) {
+        run.s.retry.pushMax = 0;
+        this.store.saveState(run.s);
+      }
       return { ok: true, runId, result: { state: run.s.state, stopAfter: stopAfterStage } };
     } catch (e) {
       return { ok: false, runId, code: e.code ?? 'AUDIT_ERROR', message: e.message };

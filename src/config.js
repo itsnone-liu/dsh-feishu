@@ -80,8 +80,8 @@ const DEFAULTS = {
   autoContinueFirstMs: 60_000,
   /** 之后的轮询间隔（ms）。 */
   autoContinuePollMs: 10 * 60_000,
-  /** 自动等待总上限（ms），超过即放弃并通知。 */
-  autoContinueMaxMs: 6 * 3_600_000,
+  /** 自动等待总上限（ms）；0 = 无限等待，纯无人值守不因额度时间停止。 */
+  autoContinueMaxMs: 0,
   /** 瞬时限流（429/上游负载）的最大短退避重试次数。 */
   autoContinueShortMax: 6,
   /** 追加的额度错误匹配正则（字符串数组，不区分大小写）。 */
@@ -111,6 +111,25 @@ const DEFAULTS = {
     reviewTimeoutMs: 20 * 60_000,
     /** R1 F4：audit 链路 git 子进程硬超时（默认 120s），并禁止凭据交互提示。 */
     gitTimeoutMs: 120_000,
+    // 审计默认纯无人值守：声明的人闸自动通过；需要分步时再显式改为 MANUAL。
+    approvalPolicy: 'AUTO',
+    // P-E「停-报-修-续」：额度/瞬态 git/审核超时等已知类仍确定性等待重试；
+    // 其余异常 → 停止该 run 的自动动作，持久化事故报告，派独立修复 agent
+    // （桥内不再做 LLM 枚举恢复/自动代码修复）。修复完成自动续跑。
+    /** 修复 agent 派出失败或报告 BLOCKED 后的重试退避（ms，末位封顶；无限轮）。 */
+    repairRetryDelaysMs: [60_000, 300_000, 900_000, 1_800_000],
+    /** 修复 session 静默多久算停滞（先提醒一次，再停滞则取消重派）。 */
+    repairWatchdogMs: 30 * 60_000,
+    /** 连续 BLOCKED 达到该次数且执行端仍在跑 → 取消卡死 turn 直接续跑（操作复位）。 */
+    repairResetAfter: 3,
+    /** 审核基础设施失败（非超时/额度）的确定性重试退避（ms，末位封顶）。 */
+    reviewRetryDelaysMs: [30_000, 60_000, 120_000, 240_000],
+    /** 审核基础设施失败重试多少次后升级为事故（停-报-修-续）。 */
+    reviewInfraIncidentAfter: 3,
+    /** 修复 agent 的 cwd（默认桥 repo 根 = 桥进程 cwd）。 */
+    repairBridgeRoot: '',
+    /** 事故报告里指向的桥日志路径（空 = 用 cfg.logFile）。 */
+    repairLogHint: '',
     web: {
       baseUrl: 'http://127.0.0.1:8787',
       model: 'gpt-5.6-luna',

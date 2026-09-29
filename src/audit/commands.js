@@ -128,12 +128,16 @@ export async function handleAuditCommand(controller, arg, chatId, ctx = {}) {
       const lines = [
         `run：\`${r.runId}\``,
         `状态：**${s.state}** — ${stateHint(s.state)}`,
-        `阶段：**${s.currentStage}**（第 ${s.iteration} 轮 · REVISE ${s.revisionCount}/${s.maxReviewIterations}）`,
+        `阶段：**${s.currentStage}**（第 ${s.iteration} 轮 · REVISE ${s.revisionCount}/${s.maxReviewIterations > 0 ? s.maxReviewIterations : '无限'}）`,
+        '运行策略：**纯无人值守**（额度/审核超时/瞬态仓库错误自动等待重试；其余异常停机报告并派修复 agent，修复后自动续跑）',
         `停止点：**${s.stopAfter}**`,
       ];
       if (s.waitingForHuman) lines.push(`等待人工：\`${s.waitingReason}\``);
       else if (s.cause) lines.push(`暂停原因：\`${s.cause}\``);
       else if (s.lastPauseCause) lines.push(`上次暂停原因：\`${s.lastPauseCause}\``);
+      // P-E：未解决事故一览（停-报-修-续进行中）。
+      const inc = controller.lifecycle?.openIncident?.(r.runId);
+      if (inc) lines.push(`⚠️ 事故处理中：\`${inc.trigger}\`（第 ${inc.repairAttempt ?? '?'} 次修复，agent \`${inc.repairSessionId ?? '-'}\`）`);
       if (s.lastExecutorEventAt) lines.push(`最后 executor 事件：\`${s.lastExecutorEvent}\`（turn ${s.lastExecutorTurn ?? '-'}）`);
       if (s.observerSessionId) lines.push(`观察 session：\`${s.observerSessionId}\``);
       if (s.auditSessionId) lines.push(`审计 session：\`${s.auditSessionId}\``);
@@ -152,9 +156,9 @@ export async function handleAuditCommand(controller, arg, chatId, ctx = {}) {
       return { title: '⏸ 已暂停', body: `run \`${r.runId}\` 状态 **${r.result.state}**。\n/audit resume 恢复。` };
     }
     case 'resume': {
-      const bumpReviewIterations = rest.length === 1 ? Number(rest[0]) : null;
-      if (rest.length > 1 || (rest.length === 1 && (!Number.isInteger(bumpReviewIterations) || bumpReviewIterations <= 0))) {
-        return { title: '❌ 恢复失败', body: '用法：`/audit resume` 或 `/audit resume <新的REVISE上限>`（只能提高上限）。', template: 'red' };
+      const bumpReviewIterations = null;
+      if (rest.length > 0) {
+        return { title: '❌ 恢复失败', body: '用法：`/audit resume`（无限轮次由系统自动继续；旧运行也不再因轮次停止）。', template: 'red' };
       }
       const r = await controller.resume(chatId, { bumpReviewIterations });
       if (!r.ok) return { title: '❌ 恢复失败', body: r.message, template: 'red' };

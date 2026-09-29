@@ -94,12 +94,24 @@ function apply(ctx, config) {
       const commands = new Commands({ config: cfg, store, driver, renderer, transport, permissionPresets: ctx.permissionPresets, llm: ctx.llm, agentPresets: ctx.agentPresets, visionReady, autoContinue: null });
       const autoContinue = new AutoContinue({ config: cfg, driver, renderer, transport });
       commands.autoContinue = autoContinue; // 注入（构造顺序：Commands 先建，AutoContinue 需要 transport 就绪）
+      // P-E（2026-09-29 用户拍板）：桥内不再做 LLM 枚举恢复 / 自动代码修复。
+      // 已知瞬态类（额度、审核超时、瞬态 git 错误）保持确定性等待/退避重试；
+      // 其余异常一律「停-报-修-续」：停掉该 run 的自动动作 → 持久化完整事故
+      // 报告 + 飞书汇报 → 派独立修复 agent session 调查修复 → 完成后自动续跑。
+      // 多修几次，常见问题自然收敛（修复都以代码 + 回归测试形式沉淀）。
       // A2：/audit 命令面 —— AuditController 只包装 A1 冻结内核，不驱动执行端（A3/A5 接线）。
       // store 根目录 $DSH_HOME/feishu/audit，与 bindings/运行态同区。
       const { AuditController } = await import('./audit/controller.js');
       commands.auditController = new AuditController({
         hostId: process.env.HOST_ID,
+        // Production audit is pure unattended: 0 means no review-round cap.
+        maxReviewIterations: 0,
+        unattended: true,
       });
+      // Recovery decisions are delegated to the configured audit/recovery LLM
+      // adapter; no fixed retry strategy is selected here.
+      // Production-only unattended repository policy: transient push failures
+      // are retried indefinitely; deterministic test callers retain pushMax=4.
       // R1 止血 F1/F2：人闸等待与裁决结果用专用卡片（问题、hash、可复制批准
       // 话术、退出/下一步提示）；其余事件保持单行进度镜像。
       const auditNoticeCard = (p) => {
@@ -120,7 +132,11 @@ function apply(ctx, config) {
       const AUDIT_NOTICE_EVENTS = new Set([
         'NEED_USER', 'WAITING_FOR_HUMAN', 'REVIEW_TIMEOUT',
         'VERDICT_NEED_USER', 'VERDICT_REVISE_LOOP_EXHAUSTED', 'VERDICT_TARGET_REACHED', 'VERDICT_STAGE_ADVANCED',
-        'GATE_PASSED_BY_PREAUTH', 'GATE_PREAUTH_MISMATCH', // P-B：预授权放行/失配都要可见
+        'GATE_PASSED_BY_PREAUTH', 'GATE_PASSED_BY_POLICY', 'GATE_PREAUTH_MISMATCH', 'DSH_QUOTA_WAIT', 'DSH_QUOTA_RECOVER',
+        'WATCHDOG_TIMEOUT', 'AUDIT_AUTO_RECOVER', 'AUDIT_REVIEW_RETRY', 'WEB_QUOTA_WAIT',
+        'AUDIT_INCIDENT_RAISED', 'AUDIT_INCIDENT_DISPATCH_FAILED',
+        'AUDIT_REPAIR_DISPATCHED', 'AUDIT_REPAIR_RETRY_SCHEDULED', 'AUDIT_REPAIR_STALLED', 'AUDIT_REPAIR_DONE', 'AUDIT_REPAIR_BLOCKED',
+        'AUDIT_RESUMED_AFTER_REPAIR', // P-E 停-报-修-续
       ]);
       // P-B §3：预授权 store 与 AuditStore 同根（<root>/preauth/records.jsonl）。
       const { PreauthStore } = await import('./audit/preauth-store.js');
@@ -133,6 +149,35 @@ function apply(ctx, config) {
         reviewTimeoutMs: cfg.audit?.reviewTimeoutMs, // R1 F4
         gitTimeoutMs: cfg.audit?.gitTimeoutMs,       // R1 F4
         preauthStore,                                 // P-B 门位消费（commands 层同实例登记）
+        approvalPolicy: cfg.audit?.approvalPolicy ?? 'AUTO',
+        // P-E 停-报-修-续参数
+        repairCwd: cfg.audit?.repairBridgeRoot || process.cwd(),
+        repairWatchdogMs: cfg.audit?.repairWatchdogMs,
+        repairRetryDelays: cfg.audit?.repairRetryDelaysMs,
+        repairResetAfter: cfg.audit?.repairResetAfter,
+        reviewRetryDelays: cfg.audit?.reviewRetryDelaysMs,
+        reviewInfraIncidentAfter: cfg.audit?.reviewInfraIncidentAfter,
+        logFileHint: cfg.logFile === 'none' ? '' : cfg.logFile,
+        restartBridge: async (detail) => {
+          log.warn(`audit repair verified; bridge restart requested: ${JSON.stringify(detail)}`);
+          // Reuse the existing external restart path. It launches a detached
+          // restarter, waits for this PID, then reloads the bridge; lifecycle
+          // itself never exits from inside an event callback.
+          if (detail?.chatId && typeof commands.handle === 'function') {
+            await commands.handle(detail.chatId, '/restart');
+          }
+        },
+        gitSnapshotProvider: async (cwd) => {
+          const { execFile } = await import('node:child_process');
+          const { promisify } = await import('node:util');
+          const run = promisify(execFile);
+          const [status, head, branch] = await Promise.all([
+            run('git', ['status', '--short'], { cwd, timeout: 30_000 }),
+            run('git', ['rev-parse', 'HEAD'], { cwd, timeout: 30_000 }),
+            run('git', ['branch', '--show-current'], { cwd, timeout: 30_000 }),
+          ]);
+          return { status: status.stdout, head: head.stdout.trim(), branch: branch.stdout.trim() };
+        },
         onProgress: (p) => {
           const send = AUDIT_NOTICE_EVENTS.has(p.event)
             ? transport.sendCard(p.chatId, auditNoticeCard(p))

@@ -8,6 +8,8 @@
  */
 import { parseExecutorMarker, parseHumanApprovalWait, executorMarkerTemplate, sealApprovalHash, revealApprovalHash, approvalForGateKind } from './protocol.js';
 
+const isQuotaFailure = (reason) => /429|quota|rate.?limit|usage.?limit|额度|配额|限额|exhausted|too many requests/i.test(String(reason ?? ''));
+
 const isHumanApprovalGateText = (text) => /\[DSH-AUDIT WAITING_APPROVAL\]/i.test(text);
 
 /**
@@ -32,7 +34,7 @@ const humanGateFor = (run) => {
 /** 兼容旧 state（waitingReason='B4_SEAL_APPROVAL'）与 P-B 通用 reason。 */
 const isHumanWaitReason = (reason) => /_(SEAL|REVEAL)_APPROVAL$/.test(String(reason ?? ''));
 
-const textFromMessage = (message) => {
+export const textFromMessage = (message) => {
   const content = message?.content ?? message?.message?.content ?? [];
   if (typeof content === 'string') return content;
   return (Array.isArray(content) ? content : [])
@@ -135,12 +137,26 @@ export class AuditExecutor {
     const data = event?.data ?? event;
     entry.run.recordExecutorEvent(event?.type ?? 'unknown', data.turn ?? entry.turn);
     if (event?.type === 'turn/start') {
+      // AutoContinue submits the normal "继续" after the model quota window
+      // recovers. Re-open the durable audit state at that boundary; the
+      // executor prompt itself is the continuation, so no duplicate prompt.
+      if (entry.run.s.state === 'WAIT_DSH_QUOTA') entry.run.dshQuotaRecovered();
       entry.turn = data.turn ?? (entry.turn + 1);
       entry.markerTurn = null;
       entry.awaitingFreshTurn = false;
       return { turnStarted: entry.turn };
     }
     if (event?.type === 'turn/end') {
+      // Quota exhaustion belongs to the bridge AutoContinue state machine. Keep
+      // the audit run durably waiting and let its recovery callback re-drive the
+      // same executor cycle; never turn a temporary 429 into a human stop.
+      if (data.reason?.kind === 'error' && isQuotaFailure(data.reason?.error?.message ?? data.reason?.error?.code)) {
+        if (entry.run.s.state === 'EXECUTING') {
+          entry.run.dshQuotaExhausted();
+          return { turnEnded: true, quota: true, waitingQuota: true };
+        }
+        return { turnEnded: true, quota: true, waitingQuota: true, stale: true };
+      }
       // A late completion event can arrive after a NEED_USER/manual pause has
       // already been persisted.  It belongs to the old executor turn and must
       // not be interpreted as a new marker-retry cycle: markerMissing() is only

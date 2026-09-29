@@ -163,6 +163,17 @@ export class SessionDriver {
   }
 
   /**
+   * P-E 修复 agent 专用 session：与审计 session 同一套 ensure 语义（优先
+   * resume 既有、不可用且 allowCreate 时新建），但绑定键独立 —— 每个审计
+   * run 一个修复 session，互不抢占，也不与执行端/观察端混用。
+   */
+  async ensureRepairSession({ cwd, sessionId = null, preset = null, allowCreate = true } = {}) {
+    if (!cwd) throw new Error('repair session requires cwd');
+    const ephemeralBinding = { cwd, sessionId };
+    return this.ensure(ephemeralBinding, { allowCreate, preset: preset ?? this.config.agentPreset });
+  }
+
+  /**
    * Submit user input: steer when running, followup when idle. Returns which.
    * `images` are durable attachment refs (already committed by admitImages) —
    * they ride the message as image blocks ahead of the optional caption text.

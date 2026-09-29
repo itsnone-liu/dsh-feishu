@@ -77,7 +77,7 @@ const sameVerdict = (a, b) => a && b
  */
 export class AuditRun {
   /** 创建新 run（IDLE→EXECUTING，RUN_STARTED + STAGE_STARTED）。 */
-  static create(store, manifestInput, { maxReviewIterations = 8, now = Date.now } = {}) {
+  static create(store, manifestInput, { maxReviewIterations = 16, now = Date.now } = {}) {
     const manifest = createManifest(manifestInput, now);
     const t = now();
     const state = {
@@ -101,6 +101,8 @@ export class AuditRun {
       lastExecutorTurn: null,
       markerRetries: 0,
       verdictRetries: 0,
+      // 4 is retained as the explicit offline safety default; production
+      // wiring changes it to 0 (unlimited) for unattended operation.
       retry: { pushAttempts: 0, pushMax: 4 },
       pendingRemoteSync: null,   // {stage, iteration, head} — executor ready 后、gate 通过前
       auditInFlight: null,       // {stage, iteration, headCommit} — AUDITING 的幂等键
@@ -368,7 +370,10 @@ export class AuditRun {
     if (r.kind === 'transient') {
       this.s.retry.pushAttempts += 1;
       if (this.s.state === 'WAIT_GIT_PUSH') this.#emit('GIT_PUSH_RETRY', { repeatSeq: this.s.retry.pushAttempts });
-      if (this.s.retry.pushAttempts >= this.s.retry.pushMax) {
+      // A transient repository/network failure is not a human decision. In
+      // unattended mode pushMax=0 (or any non-positive value) means retry
+      // forever; positive values remain an explicit test/safety override.
+      if (this.s.retry.pushMax > 0 && this.s.retry.pushAttempts >= this.s.retry.pushMax) {
         this.#emit('ERROR_GIT_REMOTE');
         this.#transition('PAUSED_NEEDS_USER', { cause: 'ERROR_GIT_REMOTE', pausedFrom: 'EXECUTING' });
         return { fatal: 'ERROR_GIT_REMOTE' };
@@ -490,7 +495,10 @@ export class AuditRun {
       this.#emit('AUDIT_REVISE');
       this.s.auditInFlight = null;
       this.s.revisionCount += 1;
-      if (this.s.revisionCount >= this.s.runOptions.maxReviewIterations) {
+      // maxReviewIterations=0 means unlimited. A positive value remains an
+      // explicit opt-in safety budget, never an implicit quota stop.
+      if (this.s.runOptions.maxReviewIterations > 0
+        && this.s.revisionCount >= this.s.runOptions.maxReviewIterations) {
         this.#transition('REVISE_LOOP_EXHAUSTED');
         this.#emit('REVISE_LOOP_EXHAUSTED');
         this.#transition('PAUSED_NEEDS_USER', { cause: 'REVISE_LOOP_EXHAUSTED', pausedFrom: 'EXECUTING' });
