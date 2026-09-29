@@ -332,7 +332,12 @@ export class AuditLifecycle {
       onTransient: this.retryScheduler ? (entry, _result, attempt) => this.#scheduleRetry(entry.run.runId, attempt) : null,
     });
     this.executors.set(runId, executor);
-    await executor.start({ run: old, agent, gitGate: gate, sendPrompt: old.s.state === 'EXECUTING' });
+    await executor.start({
+      run: old,
+      agent,
+      gitGate: gate,
+      sendPrompt: old.s.state === 'EXECUTING' && !old.s.waitingForHuman,
+    });
     this.#notify(old, 'AUDIT_SESSION_REBOUND', { auditSessionId: agent.id, observerSessionId: binding.sessionId });
     return { run: old, agent, executor };
     });
