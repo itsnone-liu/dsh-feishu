@@ -315,7 +315,7 @@ export class AuditLifecycle {
     if (!binding?.sessionId || binding.sessionId !== (old.manifest.observerSessionId ?? binding.sessionId)) {
       throw Object.assign(new Error('observer session binding mismatch'), { code: 'AUDIT_SESSION_BINDING_MISMATCH' });
     }
-    const agent = await this.driver.ensureAuditSession({ cwd: old.manifest.cwd });
+    const agent = await this.driver.ensureAuditSession({ cwd: old.manifest.cwd, allowCreate: true });
     if (agent.status !== 'idle') throw Object.assign(new Error('dedicated audit session is busy'), { code: 'AUDIT_SESSION_OCCUPIED' });
     old.rebindAuditSession(binding.sessionId, agent.id);
     // Migration is also the explicit recovery boundary for a marker failure:
@@ -328,7 +328,7 @@ export class AuditLifecycle {
       onTransient: this.retryScheduler ? (entry, _result, attempt) => this.#scheduleRetry(entry.run.runId, attempt) : null,
     });
     this.executors.set(runId, executor);
-    await executor.start({ run: old, agent, gitGate: gate });
+    await executor.start({ run: old, agent, gitGate: gate, sendPrompt: old.s.state === 'EXECUTING' });
     this.#notify(old, 'AUDIT_SESSION_REBOUND', { auditSessionId: agent.id, observerSessionId: binding.sessionId });
     return { run: old, agent, executor };
   }
@@ -394,12 +394,14 @@ export class AuditLifecycle {
 
   async restoreActive() {
     const restored = [];
+    const errors = [];
     for (const item of this.controller.store.listRuns()) {
       const loaded = this.controller.store.loadRun(item.runId);
       if (!loaded || ['STOPPED', 'STOPPED_TARGET_REACHED', 'ERROR'].includes(loaded.state.state)) continue;
-      restored.push(await this.resume(item.runId));
+      try { restored.push(await this.resume(item.runId)); }
+      catch (error) { errors.push({ runId: item.runId, code: error.code ?? 'AUDIT_RESTORE_FAILED', message: error.message }); this.onError?.(error, item.runId); }
     }
-    return restored;
+    return { restored, errors };
   }
 
   async resume(runId, { human = false, bumpReviewIterations = null } = {}) {
@@ -410,7 +412,7 @@ export class AuditLifecycle {
       throw Object.assign(new Error('persisted observerSessionId does not match the owner chat binding'), { code: 'AUDIT_SESSION_BINDING_MISMATCH' });
     }
     const agent = this.driver.ensureAuditSession
-      ? await this.driver.ensureAuditSession({ cwd: run.manifest.cwd, sessionId: run.manifest.dshSessionId })
+      ? await this.driver.ensureAuditSession({ cwd: run.manifest.cwd, sessionId: run.manifest.dshSessionId, allowCreate: false })
       : await this.driver.ensure({ sessionId: run.manifest.dshSessionId, cwd: run.manifest.cwd }, { allowCreate: false });
     // MARKER_PARSE_FAILED is a recoverable executor-turn loss.  Human resume
     // changes the durable state back to EXECUTING, but the failed turn's

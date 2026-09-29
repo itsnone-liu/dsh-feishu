@@ -156,10 +156,10 @@ export class SessionDriver {
   }
 
   /** Create/resume a session for a subsystem that must not mutate a chat binding. */
-  async ensureAuditSession({ cwd, sessionId = null, preset = null } = {}) {
+  async ensureAuditSession({ cwd, sessionId = null, preset = null, allowCreate = true } = {}) {
     if (!cwd) throw new Error('audit session requires cwd');
     const ephemeralBinding = { cwd, sessionId };
-    return this.ensure(ephemeralBinding, { allowCreate: true, preset: preset ?? this.config.agentPreset });
+    return this.ensure(ephemeralBinding, { allowCreate, preset: preset ?? this.config.agentPreset });
   }
 
   /**
