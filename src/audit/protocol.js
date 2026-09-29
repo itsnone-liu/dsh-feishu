@@ -13,6 +13,8 @@ import { ProtocolParseError, IdentityMismatchError } from './errors.js';
 
 export const MARKER_TAG = '[DSH-AUDIT]';
 export const HANDOFF_TAG = '[DSH-AUDIT HANDOFF]';
+export const SEAL_APPROVAL_RE = /^我明确批准 SEAL_ANNOTATION_ONLY receipt exact hash:\n([0-9a-f]{64})\n\n该批准仅授权当前 session \/ reveal \/ attempt 所绑定的\n这一份 exact receipt bytes，不授权任何其他 receipt、REVEAL、\noutcome 或 next ordinal。$/i;
+export const sealApprovalHash = (text) => String(text ?? '').trim().match(SEAL_APPROVAL_RE)?.[1] ?? null;
 
 export const EXECUTOR_MARKER_STATES = ['READY_FOR_AUDIT'];
 export const VERDICT_STATES = ['APPROVE', 'REVISE', 'NEED_USER'];

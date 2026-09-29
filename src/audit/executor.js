@@ -6,11 +6,9 @@
  * executor path at the remote gate; REVISE feedback is injected into the same
  * bound session.
  */
-import { parseExecutorMarker, executorMarkerTemplate } from './protocol.js';
+import { parseExecutorMarker, executorMarkerTemplate, sealApprovalHash } from './protocol.js';
 
-const isHumanApprovalGateText = (text) => /receipt_sha256|SEAL_ANNOTATION_ONLY|固定措辞|人类批准|等待.*批准/i.test(text);
-const sealApprovalHash = (text) => String(text).trim().match(/^我明确批准 SEAL_ANNOTATION_ONLY receipt exact hash:\n([0-9a-f]{64})\n\n该批准仅授权当前 session \/ reveal \/ attempt 所绑定的\n这一份 exact receipt bytes，不授权任何其他 receipt、REVEAL、\noutcome 或 next ordinal。$/i)?.[1] ?? null;
-const isFixedSealApproval = (text) => Boolean(sealApprovalHash(text));
+const isHumanApprovalGateText = (text) => /\[DSH-AUDIT WAITING_APPROVAL\]/i.test(text);
 const runStageIsB4 = (run) => /^B4$/i.test(String(run?.s?.currentStage ?? ''));
 
 const textFromMessage = (message) => {
@@ -134,7 +132,7 @@ export class AuditExecutor {
     // the receipt hash and waiting for the fixed human approval phrase. This
     // is not a missing marker and must not consume marker retries.
     if (runStageIsB4(entry.run) && isHumanApprovalGateText(text)) {
-      const result = entry.run.markWaitingForHuman('B4_SEAL_APPROVAL', text.match(/[0-9a-f]{64}/i)?.[0] ?? null);
+      const result = entry.run.markWaitingForHuman('B4_SEAL_APPROVAL', sealApprovalHash(text));
       return { ...result, event: 'WAITING_FOR_HUMAN' };
     }
     let marker;
@@ -184,7 +182,7 @@ export class AuditExecutor {
     const entry = this.runs.get(runId);
     if (!entry || entry.run.isTerminal || !entry.run.s.waitingForHuman) return { ignored: true };
     const value = String(text ?? '').trim();
-    if (!isFixedSealApproval(value) || /拒绝|不同意|不批准|reject|deny/i.test(value)) {
+    if (!sealApprovalHash(value) || /拒绝|不同意|不批准|reject|deny/i.test(value)) {
       return { ignored: true, invalidApproval: true, reason: 'approval was not affirmative' };
     }
     this.driver.submit(entry.agent, value);
