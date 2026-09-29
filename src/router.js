@@ -8,6 +8,7 @@
  */
 import { buildErrorCard, buildInfoCard, buildImageRejectCard } from './cards.js';
 import { isWorkspaceAllowed } from './config.js';
+import { registerPreauthPhrase } from './audit/commands.js';
 import { sniffImageMediaType } from './util.js';
 import { log } from './log.js';
 import fs from 'node:fs';
@@ -198,6 +199,31 @@ export class ChatRouter {
     if (auditResponse?.invalidApproval) {
       await this.transport.sendCard(chatId, buildErrorCard('❌ 审计人工输入未转交', auditResponse.reason));
       return;
+    }
+
+    // P-C §4：无等待中人闸消费的普通文本，若逐字匹配预授权登记话术 → 登记。
+    // （等待中的话术消费已由上面 submitHumanResponse 的 preauth 分支处理。）
+    if (this.commands.auditPreauthStore && norm.length <= 2000) {
+      try {
+        const reg = registerPreauthPhrase(
+          { preauthStore: this.commands.auditPreauthStore, lifecycle: this.commands.auditLifecycle },
+          norm, chatId,
+        );
+        if (reg.ok) {
+          const r = reg.record;
+          await this.transport.sendCard(chatId, buildInfoCard('🔑 预授权已登记', [
+            `记录：\`${r.preauthId}\``,
+            `绑定：**${r.binding}** · ${r.gateKind} @ ${r.stage}`,
+            r.binding === 'EXACT' ? `receipt：\`${String(r.receiptHash).slice(0, 16)}…\`` : `约束：ordinal ≤ ${r.constraints?.maxOrdinal ?? '?'}，门位=blob(${r.constraints?.receiptSource?.commit?.slice(0, 12)}…:${r.constraints?.receiptSource?.path})`,
+            `运行链：\`${r.runScope?.rootRunId ?? '-'}\`（至 ${new Date(r.expiresAt).toISOString().replace(/\.\d{3}Z$/, 'Z')}）`,
+            '',
+            `门位布防时自动尝试消费；\`/audit preauth list\` 查看，\`/audit preauth revoke ${r.preauthId}\` 撤销。`,
+          ].join('\n')));
+          return;
+        }
+      } catch (e) {
+        log.error(`chat ${chatId}: preauth register hook failed: ${e?.stack ?? e}`);
+      }
     }
 
     // normal text traffic → agent

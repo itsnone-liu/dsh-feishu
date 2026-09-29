@@ -301,7 +301,10 @@ export class WebAuditRunner {
       stageRequirement: packet.stageRequirement,
       completed: packet.completed,
     });
-    const userText = `${handoff}${evidenceBlock}${execTestBlock}\n\n${verdictTemplate(packet)}`;
+    const gateProvenanceBlock = packet.gateProvenance
+      ? `\n\n## GATE PROVENANCE (human authorization trace for this stage's human gate)\n(declared gate: ${JSON.stringify(packet.gateProvenance.declaredGate)}${packet.gateProvenance.preauthorizationSemantics ? `\npreauthorization semantics: ${packet.gateProvenance.preauthorizationSemantics}` : ''})\n\n${packet.gateProvenance.note}\n\n\`\`\`json\n${JSON.stringify(packet.gateProvenance.events, null, 2)}\n\`\`\`\n`
+      : '';
+    const userText = `${handoff}${evidenceBlock}${execTestBlock}${gateProvenanceBlock}\n\n${verdictTemplate(packet)}`;
     const body = {
       model: this.model,
       reasoning: { effort: this.reasoningEffort },

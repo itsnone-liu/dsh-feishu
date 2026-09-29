@@ -152,7 +152,7 @@ export class Commands {
       const raw = (arg ?? '').trim();
       const first = raw.split(/\s+/)[0]?.toLowerCase();
       const second = raw.split(/\s+/)[1] ?? null;
-      const management = new Set(['', 'status', 'pause', 'resume', 'stop', 'until', 'next', 'rebind']);
+      const management = new Set(['', 'status', 'pause', 'resume', 'stop', 'until', 'next', 'rebind', 'preauth']);
       if (first === 'rebind' && this.auditLifecycle) {
         const result = await this.auditController.rebind(chatId);
         if (!result.ok) {
@@ -212,7 +212,10 @@ export class Commands {
           'A3：已绑定现有 DSH session，等待 Executor 输出 READY_FOR_AUDIT。',
         ].join('\n'));
       } else {
-        const { title, body, template } = await handleAuditCommand(this.auditController, arg ?? '', chatId);
+        const { title, body, template } = await handleAuditCommand(
+          this.auditController, arg ?? '', chatId,
+          { preauthStore: this.auditPreauthStore ?? null, lifecycle: this.auditLifecycle },
+        );
         card = buildInfoCard(title, body, template ? { template } : undefined);
       }
     } catch (e) {

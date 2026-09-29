@@ -324,6 +324,23 @@ export class AuditLifecycle {
     if (run.s.state !== 'AUDITING' || !inFlight) throw Object.assign(new Error('audit packet unavailable outside AUDITING'), { code: 'AUDIT_REVIEW_NOT_READY' });
     const stage = inFlight.stage ?? run.s.currentStage;
     const packet = { runId, hostId: run.manifest.hostId, stage, iteration: inFlight.iteration ?? run.s.iteration, repo: run.manifest.repo, branch: run.manifest.branch, targetCommit: inFlight.headCommit, baseCommit: run.s.stageBaseCommit, goal: run.manifest.goal, stageRequirement: run.manifest.stageRequirements?.[stage] ?? null };
+    // P-C：人闸溯源注入（评审员据此认证"门已被人类授权"——EXACT/CONSTRAINT
+    // 预授权放行或人工话术放行都留事件；无门阶段不注入）。
+    const gateEvents = this.#chainEvents(run).filter((e) => ['GATE_PASSED', 'GATE_PASSED_BY_PREAUTH', 'GATE_PREAUTH_MISMATCH'].includes(e.event)
+      && String(e.stage).toUpperCase() === String(stage).toUpperCase());
+    const stageGateDecl = run.manifest.stageGates?.[String(stage).toUpperCase()] ?? null;
+    if (stageGateDecl || gateEvents.length > 0) {
+      packet.gateProvenance = {
+        declaredGate: stageGateDecl,
+        preauthorizationSemantics: run.manifest.preauthorization?.semantics ?? null,
+        events: gateEvents.map((e) => ({
+          event: e.event, stage: e.stage, iteration: e.iteration,
+          approvalHash: e.approvalHash ?? null, preauthId: e.preauthId ?? null,
+          binding: e.binding ?? null, detail: e.detail ?? null,
+        })),
+        note: 'GATE_PASSED 携带被批准话术的 receipt sha256（approvalHash）；GATE_PASSED_BY_PREAUTH 为桥经验证的人类预授权记录放行（preauthId 可溯源 PreauthStore 登记话术与消息）；GATE_PREAUTH_MISMATCH 为未放电的失配尝试（审计留痕）。',
+      };
+    }
     for (;;) {
       let verdict;
       try { verdict = await this.#reviewWithTimeout(packet, reviewer); }
@@ -461,20 +478,22 @@ export class AuditLifecycle {
       if (!executor) return { handled: false, reason: 'executor_missing' };
       // P-B §3：预授权先于人工话术尝试（先到先消费，两者并行）。
       const gateHash = run.s.waitingApprovalHash;
-      const pre = this.#tryPreauthPass(run, text);
+      let pre = null;
+      if (this.preauthStore) {
+        let parsed = null;
+        try { parsed = parsePreauthText(text); } catch { parsed = null; }
+        if (parsed) {
+          // §1/§4：用户发出逐字话术本身就是登记行为 —— 先落记录（本 run 链绑定、
+          // 24h 默认窗；EXACT 运行链取自话术），再走消费验证。单条消息即完成
+          // "登记+放行"；若与当前门位失配，记录保留给未来匹配该 hash/约束的布防。
+          this.#registerPreauthRecord(run, parsed, chatId, text);
+          pre = this.#verifyPreauthCandidates(run, { bindingFilter: parsed.binding, gateKindFilter: parsed.gateKind });
+        } else pre = null;
+      }
       if (pre?.passed) {
-        // 消费成功：向绑定 session 注入该门型的规范批准话术（与人工路径同一
-        // 下游语义，executor 侧 seal/reveal_approval.json 逐字符一致可核对），
-        // clearHumanWait → GATE_PASSED 事件由 executor.submitHumanResponse 完成。
-        const gate = run.manifest.stageGates?.[String(run.s.currentStage).toUpperCase()];
-        const phrase = approvalForGateKind(gate?.kind === 'REVEAL' ? 'NEXT_REVEAL_ONLY' : 'SEAL_ANNOTATION_ONLY');
-        const canonical = (gate?.kind === 'REVEAL' ? buildRevealApprovalText : buildSealApprovalText)(gateHash);
-        if (!canonical || !phrase) return { handled: false, reason: 'gate_phrase_unavailable' };
-        const result = executor.submitHumanResponse(runId, canonical);
-        if (!result.submitted) return { handled: false, reason: 'canonical_phrase_rejected', ...result };
-        this.#appendRunEvent(run, 'GATE_PASSED_BY_PREAUTH', { preauthId: pre.record.preauthId, binding: pre.record.binding, stage: run.s.currentStage, receiptHash: gateHash });
-        this.#notify(run, 'GATE_PASSED_BY_PREAUTH', { message: `阶段 ${run.s.currentStage} 人闸已由预授权 ${pre.record.preauthId}（${pre.record.binding}）放行，继续无人值守。` });
-        return { handled: true, runId, byPreauth: true, preauthId: pre.record.preauthId };
+        const injected = this.#injectCanonicalApproval(run, runId, pre.record, gateHash);
+        if (injected) return { handled: true, runId, byPreauth: true, preauthId: pre.record.preauthId };
+        return { handled: false, runId, reason: 'canonical_phrase_rejected' };
       }
       if (pre?.mismatch) {
         this.#appendRunEvent(run, 'GATE_PREAUTH_MISMATCH', { stage: run.s.currentStage, receiptHash: gateHash, detail: pre.detail });
@@ -487,31 +506,87 @@ export class AuditLifecycle {
     return { handled: false };
   }
 
+  /** §4 话术即登记：解析成功的预授权话术在发送瞬间落 PreauthStore 记录。 */
+  #registerPreauthRecord(run, parsed, chatId, text) {
+    const common = {
+      chatId, messageRef: `chat:${chatId}:${Date.now()}`, humanText: String(text ?? '').trim(),
+      binding: parsed.binding, gateKind: parsed.gateKind, stage: parsed.stage,
+      expiresAt: parsed.expiresAt ?? Date.now() + 24 * 3600_000,
+    };
+    try {
+      if (parsed.binding === 'EXACT') {
+        this.preauthStore.append({ ...common, receiptHash: parsed.receiptHash, runScope: parsed.runScope });
+      } else {
+        this.preauthStore.append({
+          ...common, constraints: parsed.constraints,
+          runScope: { rootRunId: run.manifest.rootRunId ?? run.runId },
+        });
+      }
+    } catch (e) {
+      this.onError?.(new Error(`preauth register-from-phrase failed: ${e.message}`), run.runId);
+    }
+  }
+
   /**
-   * P-B §3 门位消费算法（只读候选 + 逐项核验；核验全过才由调用方消费）。
-   * @returns {{passed:true, record}|{mismatch:true, detail}|null}
-   *  null = 不是预授权话术或该门未启用预授权（走人工路径）。
+   * P-B §3 步骤 1-5：WAIT 布防即自动尝试预授权放行（无人值守触发点，不等
+   * 用户消息）。无候选/失配按步骤 5 静默走 NEED_USER 现状路径（通知由
+   * onEvent 的 WAITING_FOR_HUMAN 分支发 R1 卡，不重复失配细节）。
    */
-  #tryPreauthPass(run, text) {
+  async #autoPreauthPass(run, runId) {
+    if (!this.preauthStore || !run.s.waitingForHuman) return null;
+    const gateHash = run.s.waitingApprovalHash;
+    const verified = this.#verifyPreauthCandidates(run, {});
+    if (verified?.passed) {
+      const injected = this.#injectCanonicalApproval(run, runId, verified.record, gateHash);
+      if (injected) return verified;
+    }
+    return null;
+  }
+
+  /** 消费成功后的统一注入：规范批准话术 → executor.submitHumanResponse + 事件 + 通知。 */
+  #injectCanonicalApproval(run, runId, record, gateHash) {
+    const executor = this.executors.get(runId);
+    if (!executor) return false;
+    const gate = run.manifest.stageGates?.[String(run.s.currentStage).toUpperCase()];
+    const phrase = approvalForGateKind(gate?.kind === 'REVEAL' ? 'NEXT_REVEAL_ONLY' : 'SEAL_ANNOTATION_ONLY');
+    const canonical = (gate?.kind === 'REVEAL' ? buildRevealApprovalText : buildSealApprovalText)(gateHash);
+    if (!canonical || !phrase) return false;
+    const result = executor.submitHumanResponse(runId, canonical);
+    if (!result.submitted) return false;
+    this.#appendRunEvent(run, 'GATE_PASSED_BY_PREAUTH', { preauthId: record.preauthId, binding: record.binding, stage: run.s.currentStage, receiptHash: gateHash });
+    this.#notify(run, 'GATE_PASSED_BY_PREAUTH', { message: `阶段 ${run.s.currentStage} 人闸已由预授权 ${record.preauthId}（${record.binding}）放行，继续无人值守。` });
+    return true;
+  }
+
+  /**
+   * P-B §3 门位候选核验（I2/I5/I6/ordinal；只读候选 + 单事务消费）。
+   * @param {object} run 等待中的 run
+   * @param {{bindingFilter?:string, gateKindFilter?:string}} opt 话术驱动路径带
+   *        过滤（话术声明的绑定型/门型必须与记录一致）；自动路径传 {}。
+   * @returns {{passed:true, record}|{mismatch:true, detail}|null}
+   *  null = 该门无可用候选（自动路径静默走 NEED_USER）。
+   */
+  #verifyPreauthCandidates(run, opt = {}) {
     if (!this.preauthStore) return null;
-    let parsed;
-    try { parsed = parsePreauthText(text); } catch { return null; } // 非预授权话术
     const stage = String(run.s.currentStage).toUpperCase();
     const gateDecl = run.manifest.stageGates?.[stage];
-    if (!gateDecl) return { mismatch: true, detail: `阶段 ${stage} 未声明人闸` };
-    if (!gateDecl.bindings?.includes(parsed.binding)) {
-      return { mismatch: true, detail: `阶段 ${stage} 不接受 ${parsed.binding} 预授权（声明：${(gateDecl.bindings ?? []).join('|')}）` };
+    if (!gateDecl) return opt.bindingFilter ? { mismatch: true, detail: `阶段 ${stage} 未声明人闸` } : null;
+    if (opt.bindingFilter && !gateDecl.bindings?.includes(opt.bindingFilter)) {
+      return { mismatch: true, detail: `阶段 ${stage} 不接受 ${opt.bindingFilter} 预授权（声明：${(gateDecl.bindings ?? []).join('|')}）` };
     }
     const rootRunId = run.manifest.rootRunId ?? run.runId;
-    const gateKind = parsed.gateKind;
+    // 自动路径按门声明的 kind 推 gateKind；话术路径用话术声明的 gateKind。
+    const gateKind = opt.gateKindFilter ?? (gateDecl.kind === 'REVEAL' ? 'NEXT_REVEAL_ONLY' : 'SEAL_ANNOTATION_ONLY');
     const candidates = this.preauthStore.findEligible({ stage, gateKind, rootRunId });
-    if (candidates.length === 0) return { mismatch: true, detail: `无可用 ${gateKind}/${stage}@${rootRunId} 预授权记录` };
+    if (candidates.length === 0) {
+      return opt.bindingFilter ? { mismatch: true, detail: `无可用 ${gateKind}/${stage}@${rootRunId} 预授权记录` } : null;
+    }
     const chainEvents = this.#chainEvents(run);
     // ordinal = 本链在该阶段已布防的人闸次数（markWaitingForHuman 同步落
     // NEED_USER 事件，当前等待已计入 —— 首门 ordinal=1）。
     const waitOrdinal = chainEvents.filter((e) => (e.event === 'NEED_USER' || e.event === 'WAITING_FOR_HUMAN') && String(e.stage).toUpperCase() === stage).length;
     for (const rec of candidates) {
-      if (rec.binding !== parsed.binding) continue; // 话术声明的绑定型与记录必须一致
+      if (opt.bindingFilter && rec.binding !== opt.bindingFilter) continue; // 话术声明的绑定型与记录必须一致
       if (rec.binding === 'EXACT') {
         // I2：精确 hash 比对（逐字符，小写归一）。
         if (String(rec.receiptHash).toLowerCase() === String(run.s.waitingApprovalHash).toLowerCase()) {
@@ -622,12 +697,23 @@ export class AuditLifecycle {
         // 非绑定 session 的事件返回 {ignored:true}，不得误触 reviewer。
         if (r?.turnEnded === true) await this.#maybeAutoReviewLocked(runId);
         const current = this.liveRuns.get(runId);
+        // P-B §3 步骤 1-5：WAIT 布防即自动尝试预授权放行（无人值守触发点 ——
+        // 不等用户发话术）。放行成功不落 NEED_USER 通知（门已过）；无候选或
+        // 失配按 §3 步骤 5 走现状 NEED_USER 路径（R1 卡）。
+        if (current && r?.waitingForHuman) await this.#autoPreauthPass(current, runId);
         if (current && (r?.turnEnded || r?.ready || r?.advanced || r?.retry || r?.paused || r?.waitingForHuman)) {
-          const event = r?.ready ? 'READY_FOR_AUDIT' : (r?.waitingForHuman ? 'WAITING_FOR_HUMAN' : (r?.paused ? 'PAUSED' : 'EXECUTOR_EVENT'));
-          this.#notify(current, event, {
-            result: r,
-            ...(event === 'WAITING_FOR_HUMAN' ? this.#humanWaitDetail(current) : {}), // R1 F1
-          });
+          const cur2 = this.liveRuns.get(runId);
+          const stillWaiting = cur2?.s?.waitingForHuman === true;
+          const evName = r?.ready ? 'READY_FOR_AUDIT' : (r?.waitingForHuman ? 'WAITING_FOR_HUMAN' : (r?.paused ? 'PAUSED' : 'EXECUTOR_EVENT'));
+          if (evName === 'WAITING_FOR_HUMAN' && !stillWaiting) {
+            // 门在自动预授权中已放行：结果行改记 GATE_PASSED_BY_PREAUTH，避免误报等待。
+            this.#notify(cur2, 'GATE_PASSED_BY_PREAUTH', { result: r, message: `阶段 ${cur2.s.currentStage} 人闸由预授权自动放行（无人值守）。` });
+          } else {
+            this.#notify(current, evName, {
+              result: r,
+              ...(evName === 'WAITING_FOR_HUMAN' ? this.#humanWaitDetail(current) : {}), // R1 F1
+            });
+          }
         }
         return r;
       });

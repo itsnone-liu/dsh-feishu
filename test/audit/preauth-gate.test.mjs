@@ -230,12 +230,15 @@ await ok('g4 EXACT 预授权：放行+事件+单次消费；hash 不符 → MISM
   // 规范批准话术已注入绑定 session（与人工路径同一下游语义）
   assert.ok(m.prompts.some((t) => sealApprovalHash(t) === hash));
   assert.ok(m.progress.some((p) => p.event === 'GATE_PASSED_BY_PREAUTH'));
-  // 单次消费：重放同一话术 → 失配（已消费）
+  // 话术即登记：首次 submit 除消费预置记录外还落了同 hash 新记录 → re-WAIT
+  // 布防时被自动消费（g7 语义），门再次被预授权放行。
   await assistantText(m, waitBlock(run, 'B4', hash));
-  const replay = await m.life.submitHumanResponse('chat-a', exactText(run.runId, hash));
-  assert.notEqual(replay.byPreauth, true);
-  assert.equal(run.s.waitingForHuman, true, '重放不放行');
-  assert.ok(events(m, run).includes('GATE_PREAUTH_MISMATCH'));
+  assert.equal(run.s.waitingForHuman, false, '重复登记的记录在布防时自动放行');
+  assert.equal(eventFind(m, run, 'GATE_PASSED_BY_PREAUTH').length, 2);
+
+  // 第三次布防：无可用记录 → 正常等待；hash 不符的 EXACT → MISMATCH；人工并行。
+  await assistantText(m, waitBlock(run, 'B4', hash));
+  assert.equal(run.s.waitingForHuman, true);
 
   // hash 不符的 EXACT → MISMATCH；随后人工话术仍可放行（并行原则）
   const wrongHash = '2'.repeat(64);
@@ -362,6 +365,43 @@ await ok('g6 未装配 preauthStore：预授权话术走人工路径被拒，不
   assert.equal(run.s.waitingForHuman, true, '未装配即无人放行，fail-closed');
   const manual = await m.life.submitHumanResponse('chat-a', buildSealApprovalText(hash));
   assert.equal(manual.handled, true);
+});
+
+// ---------------------------------------------------------------- g7
+await ok('g7 无人值守：WAIT 布防即自动尝试预授权（无需用户消息）；无记录则正常 NEED_USER', async () => {
+  const hash = '8'.repeat(64);
+  const ps = new PreauthStore(fs.mkdtempSync(path.join(os.tmpdir(), 'pa-')));
+  const m = makeLife({ stages: ['B4', 'G'], preauthStore: ps });
+  const started = await startRun(m); const run = started.run;
+  appendPreauth(ps, {
+    binding: 'EXACT', gateKind: 'SEAL_ANNOTATION_ONLY', stage: 'B4', receiptHash: hash,
+    runScope: { rootRunId: run.runId },
+  });
+  await assistantText(m, waitBlock(run, 'B4', hash));
+  assert.equal(run.s.waitingForHuman, false, '布防后预授权立即自动放行');
+  assert.equal(run.s.humanGatePassed?.stage, 'B4');
+  assert.ok(events(m, run).includes('GATE_PASSED_BY_PREAUTH'), '事件：GATE_PASSED_BY_PREAUTH');
+  assert.ok(events(m, run).includes('GATE_PASSED'));
+  assert.ok(m.prompts.some((t) => sealApprovalHash(t) === hash), '规范批准话术已注入 session');
+
+  // 无记录 → 正常 NEED_USER 等待（§3 步骤 5），不产生事件噪音
+  const ps2 = new PreauthStore(fs.mkdtempSync(path.join(os.tmpdir(), 'pa-')));
+  const m2 = makeLife({ stages: ['B4', 'G'], preauthStore: ps2 });
+  const s2 = await startRun(m2); const r2 = s2.run;
+  await assistantText(m2, waitBlock(r2, 'B4', hash));
+  assert.equal(r2.s.waitingForHuman, true, '无候选 → 现状 NEED_USER 路径');
+  assert.ok(!events(m2, r2).includes('GATE_PASSED_BY_PREAUTH'));
+
+  // 有记录但 hash 不符 → 布防不被自动放行（自动路径静默，等 NEED_USER 卡）
+  const ps3 = new PreauthStore(fs.mkdtempSync(path.join(os.tmpdir(), 'pa-')));
+  const m3 = makeLife({ stages: ['B4', 'G'], preauthStore: ps3 });
+  const s3 = await startRun(m3); const r3 = s3.run;
+  appendPreauth(ps3, {
+    binding: 'EXACT', gateKind: 'SEAL_ANNOTATION_ONLY', stage: 'B4', receiptHash: '4'.repeat(64),
+    runScope: { rootRunId: r3.runId },
+  });
+  await assistantText(m3, waitBlock(r3, 'B4', hash));
+  assert.equal(r3.s.waitingForHuman, true, 'EXACT hash 不符不放行（fail-closed）');
 });
 
 console.log(`\n${pass} passed, ${fail} failed`); process.exitCode = fail ? 1 : 0;
