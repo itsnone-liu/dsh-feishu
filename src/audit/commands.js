@@ -125,7 +125,8 @@ export async function handleAuditCommand(controller, arg, chatId) {
         `阶段：**${s.currentStage}**（第 ${s.iteration} 轮 · REVISE ${s.revisionCount}/${s.maxReviewIterations}）`,
         `停止点：**${s.stopAfter}**`,
       ];
-      if (s.cause) lines.push(`暂停原因：\`${s.cause}\``);
+      if (s.waitingForHuman) lines.push(`等待人工：\`${s.waitingReason}\``);
+      else if (s.cause) lines.push(`暂停原因：\`${s.cause}\``);
       else if (s.lastPauseCause) lines.push(`上次暂停原因：\`${s.lastPauseCause}\``);
       if (s.auditedCommits.length > 0) {
         lines.push(`已审 commits：${s.auditedCommits.map((c) => `\`${c}\``).join(', ')}`);

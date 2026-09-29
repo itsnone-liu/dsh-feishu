@@ -8,6 +8,9 @@
  */
 import { parseExecutorMarker, executorMarkerTemplate } from './protocol.js';
 
+const isHumanApprovalGateText = (text) => /receipt_sha256|SEAL_ANNOTATION_ONLY|固定措辞|人类批准|等待.*批准/i.test(text);
+const runStageIsB4 = (run) => /^B4$/i.test(String(run?.s?.currentStage ?? ''));
+
 const textFromMessage = (message) => {
   const content = message?.content ?? message?.message?.content ?? [];
   if (typeof content === 'string') return content;
@@ -45,7 +48,10 @@ export class AuditExecutor {
     const taskBlock = reqs
       ? `\n\n【本阶段要求（冻结任务书${run.manifest.taskPacketHash ? ` hash ${run.manifest.taskPacketHash.slice(0, 12)}` : ''}，逐条满足）】\n${reqs}`
       : '';
-    return `${lead}请只执行当前阶段：完成代码修改后必须创建本地 commit；确认 HEAD 与该 commit 完全一致，然后只输出严格 READY_FOR_AUDIT marker——除 HEAD 与可选的 SUMMARY/TESTS 外，字段值必须与下面模板中给出的值完全一致（HEAD 填写该 commit 哈希）。不要进入下一阶段，不要输出 marker 以外的说明。${taskBlock}\n\n${tpl}`;
+    const humanGate = /^B4$/i.test(String(run.s.currentStage))
+      ? '本阶段包含人工授权门：若执行到 B4_SEAL_APPROVAL，请明确说明正在等待人工批准，不要把等待误报为 READY_FOR_AUDIT；收到批准后再继续完成本阶段并输出 marker。'
+      : '';
+    return `${lead}请只执行当前阶段：完成代码修改后必须创建本地 commit；确认 HEAD 与该 commit 完全一致，然后只输出严格 READY_FOR_AUDIT marker——除 HEAD 与可选的 SUMMARY/TESTS 外，字段值必须与下面模板中给出的值完全一致（HEAD 填写该 commit 哈希）。不要进入下一阶段，不要输出 marker 以外的说明。${humanGate}${taskBlock}\n\n${tpl}`;
   }
 
   async start({ run, agent, gitGate = this.gitGate, sendPrompt = true } = {}) {
@@ -102,6 +108,7 @@ export class AuditExecutor {
       // explicit /audit resume path start the next cycle.
       if (entry.run.s.state !== 'EXECUTING') return { turnEnded: true, stale: true };
       if (data.reason?.kind === 'completed' && entry.markerTurn !== entry.turn) {
+        if (entry.run.s.waitingForHuman) return { turnEnded: true, waitingForHuman: true, reason: entry.run.s.waitingReason };
         const missing = entry.run.markerMissing();
         if (missing.retry) this.driver.submit(entry.agent, `请在同一阶段重新严格输出 READY_FOR_AUDIT marker，不要输出普通说明。\n\n${executorMarkerTemplate({ runId: entry.run.runId, hostId: entry.run.manifest.hostId, stage: entry.run.s.currentStage, iteration: entry.run.s.iteration })}`);
         return { ...missing, turnEnded: true };
@@ -113,15 +120,21 @@ export class AuditExecutor {
     // new turn/start. It must never be parsed as the current marker.
     if (entry.awaitingFreshTurn) return { ignored: true, stale: true };
     if (entry.run.s.state !== 'EXECUTING') return { ignored: true, stale: true };
+    const { run, gitGate } = entry;
     const text = textFromMessage(data);
     if (!text) return { ignored: true };
+    // B4 is a deliberate human gate: the executor must stop after presenting
+    // the receipt hash and waiting for the fixed human approval phrase. This
+    // is not a missing marker and must not consume marker retries.
+    if (runStageIsB4(entry.run) && isHumanApprovalGateText(text)) {
+      return entry.run.markWaitingForHuman('B4_SEAL_APPROVAL');
+    }
     let marker;
     try {
       marker = parseExecutorMarker(text);
     } catch {
       return { ignored: true };
     }
-    const { run, gitGate } = entry;
     if (run.isTerminal) {
       // 残留的终态 entry 收到了（属于新 run 的）marker：自清理让位，
       // 不得继续 ancestry/executorReady（终态 run 上必抛 AUDIT_RUN_FROZEN）。

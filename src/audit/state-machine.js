@@ -92,6 +92,9 @@ export class AuditRun {
       stageBaseCommit: manifest.stageBaseCommit,
       pausedFrom: null,
       cause: null,               // PAUSED_* / EXHAUSTED 的原因
+      lastPauseCause: null,
+      waitingForHuman: false,
+      waitingReason: null,
       markerRetries: 0,
       verdictRetries: 0,
       retry: { pushAttempts: 0, pushMax: 4 },
@@ -226,6 +229,16 @@ export class AuditRun {
    * 第 1 次 → MARKER_RETRY（状态不变，等待重问）；第 2 次 → PAUSED_NEEDS_USER。
    * @returns {{retry: boolean}|{failed: boolean}}
    */
+  markWaitingForHuman(reason = 'B4_SEAL_APPROVAL') {
+    this.#assertNotTerminal();
+    if (this.s.state !== 'EXECUTING') throw new IllegalTransitionError(this.s.state, 'WAITING_FOR_HUMAN');
+    this.s.waitingForHuman = true;
+    this.s.waitingReason = reason;
+    this.#touch(); this.store.saveState(this.s);
+    this.#emit('NEED_USER', { reason });
+    return { waitingForHuman: true, reason };
+  }
+
   markerMissing() {
     this.#assertNotTerminal();
     if (this.s.state !== 'EXECUTING') throw new IllegalTransitionError(this.s.state, 'EXECUTING(marker-retry)');
@@ -556,6 +569,8 @@ export class AuditRun {
     this.#emit('HUMAN_RESUME');
     const target = this.s.pausedFrom ?? 'EXECUTING';
     const previousCause = this.s.cause;
+    this.s.waitingForHuman = false;
+    this.s.waitingReason = null;
     this.#transition(target);
     // Preserve the historical reason separately; an active run must not be
     // presented as currently paused after a successful human resume.
