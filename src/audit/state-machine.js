@@ -16,7 +16,6 @@ import {
 } from './errors.js';
 import { validateIdentity } from './protocol.js';
 import { createManifest, changeStopAfter } from './manifest.js';
-
 export const STATES = Object.freeze([
   'IDLE', 'EXECUTING', 'AUDITING', 'NEXT_STAGE',
   'WAIT_DSH_QUOTA', 'WAIT_WEB_QUOTA', 'WAIT_GIT_PUSH',
