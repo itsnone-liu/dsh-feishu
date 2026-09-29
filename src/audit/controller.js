@@ -363,19 +363,6 @@ export class AuditController {
     if (t.error) return t.error;
     const id = t.id;
     if (!id) return { ok: false, code: 'AUDIT_NO_ACTIVE_RUN', message: '没有活跃的审计运行可恢复。' };
-    if (this.lifecycle?.liveRuns?.has(id)) return this.#control(id, (run) => {
-      // A5.5 幂等保护：REVISE feedback 已同步把 run 交还 EXECUTING；
-      // 重复 /audit resume 不得再次调用 resume()，否则会制造 AUDITING→AUDITING。
-      if (run.s.state === 'EXECUTING') return { state: run.s.state, resumed: false, ignored: true };
-      if (run.s.state === 'AUDITING' && run.s.auditInFlight) {
-        return { state: run.s.state, resumed: false, ignored: true };
-      }
-      if (run.s.state === 'PAUSED_NEEDS_USER') {
-        if (run.s.cause === 'HISTORY_REWRITTEN') { const e = new Error('历史被改写后的恢复需要显式新 baseline（G11）；A2 命令面未提供该操作，请等待 A3 接线或人工处理 store。'); e.code = 'AUDIT_BASELINE_REQUIRED'; throw e; }
-        const r = run.resumeFromHuman({ bumpReviewIterations }); return { state: run.s.state, resumed: r.resumed, maxReviewIterations: run.s.runOptions.maxReviewIterations };
-      }
-      const r = run.resume(); return { state: run.s.state, resumed: r.resumed };
-    }, 'resume');
     if (this.lifecycle) {
       return this.lifecycle.resume(id, { human: true, bumpReviewIterations })
         .then(({ run }) => ({ ok: true, runId: id, result: { state: run.s.state, resumed: true, maxReviewIterations: run.s.runOptions.maxReviewIterations } }))
