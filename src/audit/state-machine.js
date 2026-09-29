@@ -95,6 +95,7 @@ export class AuditRun {
       lastPauseCause: null,
       waitingForHuman: false,
       waitingReason: null,
+      waitingApprovalHash: null,
       lastExecutorEventAt: null,
       lastExecutorEvent: null,
       lastExecutorTurn: null,
@@ -246,11 +247,12 @@ export class AuditRun {
     this.#touch(); this.store.saveState(this.s);
   }
 
-  markWaitingForHuman(reason = 'B4_SEAL_APPROVAL') {
+  markWaitingForHuman(reason = 'B4_SEAL_APPROVAL', approvalHash = null) {
     this.#assertNotTerminal();
     if (this.s.state !== 'EXECUTING') throw new IllegalTransitionError(this.s.state, 'WAITING_FOR_HUMAN');
     this.s.waitingForHuman = true;
     this.s.waitingReason = reason;
+    this.s.waitingApprovalHash = approvalHash;
     this.#touch(); this.store.saveState(this.s);
     this.#emit('NEED_USER', { reason });
     return { waitingForHuman: true, reason };
