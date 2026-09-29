@@ -309,6 +309,7 @@ export class AuditLifecycle {
   }
 
   async rebind(runId) {
+    return this.#serial(runId, async () => {
     const old = this.liveRuns.get(runId) ?? AuditRun.open(this.controller.store, { now: this.controller.now })(runId);
     if (!old) throw Object.assign(new Error(`run not found: ${runId}`), { code: 'AUDIT_RUN_NOT_FOUND' });
     const binding = this.bindings?.get(old.manifest.chatId);
@@ -334,6 +335,7 @@ export class AuditLifecycle {
     await executor.start({ run: old, agent, gitGate: gate, sendPrompt: old.s.state === 'EXECUTING' });
     this.#notify(old, 'AUDIT_SESSION_REBOUND', { auditSessionId: agent.id, observerSessionId: binding.sessionId });
     return { run: old, agent, executor };
+    });
   }
 
   async submitHumanResponse(chatId, text) {
@@ -408,6 +410,7 @@ export class AuditLifecycle {
   }
 
   async resume(runId, { human = false, bumpReviewIterations = null } = {}) {
+    return this.#serial(runId, async () => {
     const run = AuditRun.open(this.controller.store, { now: this.controller.now })(runId);
     if (!run) throw Object.assign(new Error(`run not found: ${runId}`), { code: 'AUDIT_RUN_NOT_FOUND' });
     const binding = this.bindings?.get(run.manifest.chatId);
@@ -462,5 +465,6 @@ export class AuditLifecycle {
     }
     if (run.s.state === 'AUDITING') await this.#maybeAutoReviewLocked(runId);
     return { run, agent, executor };
+    });
   }
 }
