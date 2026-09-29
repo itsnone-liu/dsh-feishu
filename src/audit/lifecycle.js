@@ -320,7 +320,10 @@ export class AuditLifecycle {
     old.rebindAuditSession(binding.sessionId, agent.id);
     // Migration is also the explicit recovery boundary for a marker failure:
     // resume the durable run before the first prompt reaches the new session.
-    if (old.s.state === 'PAUSED_NEEDS_USER' && old.s.cause !== 'HISTORY_REWRITTEN') old.resumeFromHuman({});
+    if (old.s.state === 'PAUSED_NEEDS_USER' && old.s.cause !== 'HISTORY_REWRITTEN') {
+      if (old.s.cause === 'MARKER_PARSE_FAILED') old.markHumanResumeCycle();
+      old.resumeFromHuman({});
+    }
     this.liveRuns.set(runId, old);
     const gate = this.gitGateFactory({ cwd: old.manifest.cwd });
     const executor = this.executorFactory({
@@ -424,6 +427,7 @@ export class AuditLifecycle {
       && run.s.state === 'PAUSED_NEEDS_USER'
       && run.s.cause === 'MARKER_PARSE_FAILED';
     if (human && run.s.state === 'PAUSED_NEEDS_USER') {
+      if (run.s.cause === 'MARKER_PARSE_FAILED') run.markHumanResumeCycle();
       if (run.s.cause === 'HISTORY_REWRITTEN') {
         throw Object.assign(new Error('history was rewritten: explicit new baseline required'), { code: 'AUDIT_BASELINE_REQUIRED' });
       }

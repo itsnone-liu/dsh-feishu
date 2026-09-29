@@ -258,6 +258,12 @@ export class AuditRun {
     return { waitingForHuman: true, reason };
   }
 
+  markHumanResumeCycle() {
+    this.#assertNotTerminal();
+    this.s.markerRetries = 0;
+    this.#touch(); this.store.saveState(this.s);
+  }
+
   markerMissing() {
     this.#assertNotTerminal();
     if (this.s.state !== 'EXECUTING') throw new IllegalTransitionError(this.s.state, 'EXECUTING(marker-retry)');
