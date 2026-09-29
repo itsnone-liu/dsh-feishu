@@ -327,6 +327,8 @@ export class AuditController {
           lastPauseCause: run.s.lastPauseCause ?? null,
           waitingForHuman: Boolean(run.s.waitingForHuman),
           waitingReason: run.s.waitingReason ?? null,
+          observerSessionId: run.manifest.observerSessionId ?? null,
+          auditSessionId: run.manifest.dshSessionId ?? null,
           auditedCommits: run.manifest.auditedCommits,
           repo: run.manifest.repo,
           branch: run.manifest.branch,

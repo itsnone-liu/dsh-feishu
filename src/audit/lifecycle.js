@@ -43,7 +43,7 @@ export class AuditLifecycle {
   #watchdog() {
     const now = Date.now();
     for (const run of this.liveRuns.values()) {
-      if (run.isTerminal || !['EXECUTING', 'AUDITING'].includes(run.s.state)) continue;
+      if (run.isTerminal || run.s.waitingForHuman || !['EXECUTING', 'AUDITING'].includes(run.s.state)) continue;
       const a = this.activity.get(run.runId) ?? { at: run.s.updatedAt ?? now, warned: false };
       if (!a.warned && now - a.at >= 5 * 60_000) {
         this.#notify(run, 'WATCHDOG_TIMEOUT', { idleMs: now - a.at, message: '审计执行器超过 5 分钟无进展事件' });
