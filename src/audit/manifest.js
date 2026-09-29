@@ -104,6 +104,10 @@ export function createManifest(raw, now = Date.now) {
     approvedPlan,
     taskPacketHash: raw.taskPacketHash ?? null,
     stageRequirements: raw.stageRequirements ?? null,
+    // P-B 门位声明（任务书 preauthorization 节派生）：stage → {kind, bindings}。
+    // 旧 run 无此字段 → null（executor 按 legacy /^B4$/ 回退推断）。
+    stageGates: raw.stageGates ?? null,
+    preauthorization: raw.preauthorization ?? null,
     stages: [...stages],
     currentStage,
     stopAfter,

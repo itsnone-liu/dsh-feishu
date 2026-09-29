@@ -242,11 +242,20 @@ export class AuditRun {
   }
 
   clearHumanWait() {
+    const passedHash = this.s.waitingApprovalHash;
     this.s.waitingForHuman = false;
     this.s.waitingReason = null;
     this.s.waitingApprovalHash = null;
     this.s.waitingQuestion = null; // R1 F1：随人闸解除一并清空
+    // P-B D5：记录该（stage, iteration）人闸已按规放行——executor 的 READY
+    // 防绕过守卫据此区分"门已过"与"门未过"。自作用域：阶段推进或 REVISE 换
+    // iteration 后自然失配（批准绑定 attempt，不复用）。旧 state 无此字段 →
+    // undefined → 守卫按未放行处理（fail-closed）。
+    this.s.humanGatePassed = { stage: String(this.s.currentStage ?? '').toUpperCase(), iteration: this.s.iteration };
     this.#touch(); this.store.saveState(this.s);
+    // GATE_PASSED 携带已放行 receipt hash：CONSTRAINT 预授权（P-B）的上游链
+    // 核验（I5）以本事件为证据源。
+    this.#emit('GATE_PASSED', { stage: this.s.currentStage, iteration: this.s.iteration, approvalHash: passedHash });
   }
 
   /**
@@ -262,6 +271,9 @@ export class AuditRun {
     this.s.waitingApprovalHash = approvalHash;
     this.s.waitingQuestion = question == null ? null
       : (Array.isArray(question) ? question.join('\n') : String(question));
+    // P-B D5：新 WAIT 块 = 同（stage, iteration）重新布防，旧放行即刻作废
+    //（防"批准一次、二次 WAIT 直接 READY"绕过）。
+    this.s.humanGatePassed = null;
     this.#touch(); this.store.saveState(this.s);
     this.#emit('NEED_USER', { reason });
     return { waitingForHuman: true, reason };

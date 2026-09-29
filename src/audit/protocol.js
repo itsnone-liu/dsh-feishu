@@ -27,6 +27,28 @@ export function buildSealApprovalText(hash) {
   return `我明确批准 SEAL_ANNOTATION_ONLY receipt exact hash:\n${hash}\n\n该批准仅授权当前 session / reveal / attempt 所绑定的\n这一份 exact receipt bytes，不授权任何其他 receipt、REVEAL、\noutcome 或 next ordinal。`;
 }
 
+/**
+ * P-B 门位通用化：C2 类人闸（NEXT_REVEAL_ONLY）的冻结批准话术。与
+ * SEAL_APPROVAL_RE 同级的严格语义：逐字模板 + proposal 64hex + 反授权扩张句。
+ * receipt/proposal 在本管线一律 sha256（与任务书 receipt_sha256 一致）。
+ */
+export const REVEAL_APPROVAL_RE = /^我明确批准 NEXT_REVEAL_ONLY proposal exact hash:\n([0-9a-f]{64})\n\n该批准仅授权当前 session \/ reveal \/ attempt 所绑定的\n这一份 exact proposal bytes，不授权任何其他 receipt、REVEAL、\noutcome 或 next ordinal。$/i;
+export const revealApprovalHash = (text) => String(text ?? '').trim().match(REVEAL_APPROVAL_RE)?.[1] ?? null;
+export function buildRevealApprovalText(hash) {
+  if (!/^[0-9a-f]{64}$/i.test(String(hash ?? ''))) return null;
+  return `我明确批准 NEXT_REVEAL_ONLY proposal exact hash:\n${hash}\n\n该批准仅授权当前 session / reveal / attempt 所绑定的\n这一份 exact proposal bytes，不授权任何其他 receipt、REVEAL、\noutcome 或 next ordinal。`;
+}
+
+/**
+ * P-B：按门型分发的冻结话术注册表。kind 未识别 → approvalForGateKind
+ * 返回 null（fail-closed：不匹配任何话术，也不构造话术）。
+ */
+export const APPROVAL_PHRASES = {
+  SEAL: { re: SEAL_APPROVAL_RE, hashOf: sealApprovalHash, build: buildSealApprovalText, gateKind: 'SEAL_ANNOTATION_ONLY', noun: 'receipt' },
+  REVEAL: { re: REVEAL_APPROVAL_RE, hashOf: revealApprovalHash, build: buildRevealApprovalText, gateKind: 'NEXT_REVEAL_ONLY', noun: 'proposal' },
+};
+export const approvalForGateKind = (gateKind) => Object.values(APPROVAL_PHRASES).find((p) => p.gateKind === String(gateKind ?? '').toUpperCase()) ?? null;
+
 export const EXECUTOR_MARKER_STATES = ['READY_FOR_AUDIT'];
 export const EXECUTOR_WAIT_STATES = ['WAIT_HUMAN_APPROVAL'];
 export const VERDICT_STATES = ['APPROVE', 'REVISE', 'NEED_USER'];

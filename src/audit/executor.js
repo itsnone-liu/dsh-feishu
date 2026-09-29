@@ -6,10 +6,31 @@
  * executor path at the remote gate; REVISE feedback is injected into the same
  * bound session.
  */
-import { parseExecutorMarker, parseHumanApprovalWait, executorMarkerTemplate, sealApprovalHash } from './protocol.js';
+import { parseExecutorMarker, parseHumanApprovalWait, executorMarkerTemplate, sealApprovalHash, revealApprovalHash, approvalForGateKind } from './protocol.js';
 
 const isHumanApprovalGateText = (text) => /\[DSH-AUDIT WAITING_APPROVAL\]/i.test(text);
-const runStageIsB4 = (run) => /^B4$/i.test(String(run?.s?.currentStage ?? ''));
+
+/**
+ * P-B 门位通用化：人闸不再按阶段名硬编码（/^B4$/），改为读冻结任务书
+ * preauthorization 节派生的 manifest.stageGates（B4 SEAL / C2 REVEAL / C5 SEAL …
+ * 由任务书声明，代码不认知任何具体阶段名）。旧任务书（无该节）→ 无人闸，
+ * 行为与现在完全一致。返回 { kind, gateKind, phrase } 或 null。
+ */
+const humanGateFor = (run) => {
+  const stage = String(run?.s?.currentStage ?? '').toUpperCase();
+  const gates = run?.manifest?.stageGates;
+  const gate = gates?.[stage];
+  // P-B 兼容回退：manifest 无任何 stageGates（旧任务书/修订前创建的 run）时，
+  // 沿用历史 /^B4$/ 推断为 SEAL 门——修订前创建的在途 run 不因任务书未修订
+  // 而丢闸门。一旦 manifest 声明了 stageGates（修订后新 run），声明即权威：
+  // 未声明的阶段（含 B4）无门。
+  const resolved = gate ?? (gates && Object.keys(gates).length > 0 ? null : (/^B4$/.test(stage) ? { kind: 'SEAL' } : null));
+  if (!resolved) return null;
+  const phrase = approvalForGateKind(resolved.kind === 'REVEAL' ? 'NEXT_REVEAL_ONLY' : 'SEAL_ANNOTATION_ONLY');
+  return phrase ? { kind: resolved.kind, gateKind: phrase.gateKind, phrase } : null;
+};
+/** 兼容旧 state（waitingReason='B4_SEAL_APPROVAL'）与 P-B 通用 reason。 */
+const isHumanWaitReason = (reason) => /_(SEAL|REVEAL)_APPROVAL$/.test(String(reason ?? ''));
 
 const textFromMessage = (message) => {
   const content = message?.content ?? message?.message?.content ?? [];
@@ -48,8 +69,9 @@ export class AuditExecutor {
     const taskBlock = reqs
       ? `\n\n【本阶段要求（冻结任务书${run.manifest.taskPacketHash ? ` hash ${run.manifest.taskPacketHash.slice(0, 12)}` : ''}，逐条满足）】\n${reqs}`
       : '';
-    const humanGate = /^B4$/i.test(String(run.s.currentStage))
-      ? `\n\n本阶段包含人工授权门。到达人闸时必须输出以下严格块（不要输出 READY_FOR_AUDIT）：\n[DSH-AUDIT]\nSTATE: WAIT_HUMAN_APPROVAL\nRUN_ID: ${run.runId}\nSTAGE: B4\nITERATION: ${run.s.iteration}\nHOST_ID: ${run.manifest.hostId}\nQUESTION:\n<receipt_sha256 与任务书固定批准说明>\n收到批准后只继续当前阶段并输出 READY_FOR_AUDIT。`
+    const gate = humanGateFor(run);
+    const humanGate = gate
+      ? `\n\n本阶段包含人工授权门（${gate.gateKind}）。到达人闸时必须输出以下严格块（不要输出 READY_FOR_AUDIT）：\n[DSH-AUDIT]\nSTATE: WAIT_HUMAN_APPROVAL\nRUN_ID: ${run.runId}\nSTAGE: ${run.s.currentStage}\nITERATION: ${run.s.iteration}\nHOST_ID: ${run.manifest.hostId}\nQUESTION:\n<${gate.phrase.noun}_sha256 与任务书固定批准说明>\n收到批准后只继续当前阶段并输出 READY_FOR_AUDIT。`
       : '';
     return `${lead}请只执行当前阶段：完成代码修改后必须创建本地 commit；确认 HEAD 与该 commit 完全一致，然后只输出严格 READY_FOR_AUDIT marker——除 HEAD 与可选的 SUMMARY/TESTS 外，字段值必须与下面模板中给出的值完全一致（HEAD 填写该 commit 哈希）。不要进入下一阶段，不要输出 marker 以外的说明。${humanGate}${taskBlock}\n\n${tpl}`;
   }
@@ -145,17 +167,19 @@ export class AuditExecutor {
     if (run.s.state !== 'EXECUTING') return { ignored: true, stale: true };
     const text = textFromMessage(data);
     if (!text) return { ignored: true };
-    // B4 is a deliberate human gate: the executor must stop after presenting
-    // the receipt hash and waiting for the fixed human approval phrase. This
-    // is not a missing marker and must not consume marker retries.
-    if (runStageIsB4(entry.run)) {
+    // P-B 门位通用化：WAIT_HUMAN_APPROVAL 属声明的授权门（不再按 /^B4$/ 阶段名）。
+    // 门是刻意的人工停止点：不是缺 marker，不消耗 marker 重试。
+    const gate = humanGateFor(entry.run);
+    if (gate) {
       try {
         const waiting = parseHumanApprovalWait(text);
         if (waiting.runId === entry.run.runId && waiting.stage === entry.run.s.currentStage && waiting.iteration === entry.run.s.iteration) {
           // R1 F1：question（QUESTION 段原文）随 state 持久化（waitingQuestion），
-          // 人闸通知才能完整呈现"等待什么、批什么"。
-          const result = entry.run.markWaitingForHuman('B4_SEAL_APPROVAL', text.match(/[0-9a-f]{64}/i)?.[0] ?? null, waiting.question);
-          return { ...result, event: 'WAITING_FOR_HUMAN', question: waiting.question };
+          // 人闸通知才能完整呈现"等待什么、批什么"。reason = <STAGE>_<KIND>_APPROVAL
+          //（B4 SEAL → 'B4_SEAL_APPROVAL'，与历史 state 逐字一致）。
+          const reason = `${String(entry.run.s.currentStage).toUpperCase()}_${gate.kind}_APPROVAL`;
+          const result = entry.run.markWaitingForHuman(reason, text.match(/[0-9a-f]{64}/i)?.[0] ?? null, waiting.question);
+          return { ...result, event: 'WAITING_FOR_HUMAN', gate: gate.gateKind, question: waiting.question };
         }
       } catch {}
     }
@@ -164,6 +188,15 @@ export class AuditExecutor {
       marker = parseExecutorMarker(text);
     } catch {
       return { ignored: true };
+    }
+    // P-B D5 防绕过：声明了人闸的阶段，READY_FOR_AUDIT 不得跳过人闸。门未对该
+    //（stage, iteration）放行时 marker 一律拒收并回发指引；不消耗 marker 重试
+    //（这是协议违规指引，不是缺 marker）。REVISE 换 attempt 后旧批准自失效
+    //（humanGatePassed 按 stage+iteration 作用域，见 state-machine）。
+    if (gate && (entry.run.s.waitingForHuman
+      || !(entry.run.s.humanGatePassed?.stage === String(entry.run.s.currentStage).toUpperCase() && entry.run.s.humanGatePassed?.iteration === entry.run.s.iteration))) {
+      this.driver.submit(entry.agent, `当前阶段 ${entry.run.s.currentStage} 含人工授权门（${gate.gateKind}）：必须先输出 WAIT_HUMAN_APPROVAL 严格块（RUN_ID/STAGE/ITERATION/HOST_ID/QUESTION，QUESTION 含 ${gate.phrase.noun}_sha256），等待人类批准后才允许输出 READY_FOR_AUDIT。请重新输出 WAIT_HUMAN_APPROVAL 块。`);
+      return { ignored: true, gateBypassBlocked: true, stage: entry.run.s.currentStage };
     }
     if (run.isTerminal) {
       // 残留的终态 entry 收到了（属于新 run 的）marker：自清理让位，
@@ -202,16 +235,29 @@ export class AuditExecutor {
     }
   }
 
+  /**
+   * P-B 门位通用化：人工明文批准按门型分发冻结话术校验，且 hash 必须与
+   * waitingApprovalHash 逐字符相等（旧代码只查话术格式、不比对 hash ——
+   * 任何 64hex 的合法话术都能放行，属父链 D 发现的失配缺口）。
+   * 显式拒绝词 fail-closed。话术路径不读 PreauthStore（§3 并行原则）。
+   */
   submitHumanResponse(runId, text) {
     const entry = this.runs.get(runId);
     if (!entry || entry.run.isTerminal || !entry.run.s.waitingForHuman) return { ignored: true };
     const value = String(text ?? '').trim();
-    if (!sealApprovalHash(value) || /拒绝|不同意|不批准|reject|deny/i.test(value)) {
+    if (/拒绝|不同意|不批准|reject|deny/i.test(value)) {
       return { ignored: true, invalidApproval: true, reason: 'approval was not affirmative' };
+    }
+    const gate = humanGateFor(entry.run);
+    const hashOf = gate ? gate.phrase.hashOf : sealApprovalHash; // 旧 state 无 stageGates：维持 SEAL 话术
+    const hash = hashOf(value);
+    if (!hash) return { ignored: true, invalidApproval: true, reason: 'approval phrase mismatch' };
+    if (entry.run.s.waitingApprovalHash && hash.toLowerCase() !== String(entry.run.s.waitingApprovalHash).toLowerCase()) {
+      return { ignored: true, invalidApproval: true, reason: 'approval hash does not match the gate receipt hash' };
     }
     this.driver.submit(entry.agent, value);
     entry.run.clearHumanWait();
-    return { submitted: true, sessionId: entry.agent.id };
+    return { submitted: true, sessionId: entry.agent.id, gateKind: gate?.gateKind ?? null };
   }
 
   /** Reviewer stub/A5 adapter calls this after REVISE; same DSH session only. */

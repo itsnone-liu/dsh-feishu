@@ -120,13 +120,19 @@ function apply(ctx, config) {
       const AUDIT_NOTICE_EVENTS = new Set([
         'NEED_USER', 'WAITING_FOR_HUMAN', 'REVIEW_TIMEOUT',
         'VERDICT_NEED_USER', 'VERDICT_REVISE_LOOP_EXHAUSTED', 'VERDICT_TARGET_REACHED', 'VERDICT_STAGE_ADVANCED',
+        'GATE_PASSED_BY_PREAUTH', 'GATE_PREAUTH_MISMATCH', // P-B：预授权放行/失配都要可见
       ]);
+      // P-B §3：预授权 store 与 AuditStore 同根（<root>/preauth/records.jsonl）。
+      const { PreauthStore } = await import('./audit/preauth-store.js');
+      const preauthStore = new PreauthStore(commands.auditController.store.root);
+      commands.auditPreauthStore = preauthStore; // P-C /audit preauth add|list|revoke 登记层用
       commands.auditLifecycle = new AuditLifecycle({
         controller: commands.auditController,
         driver,
         bindings: store,
         reviewTimeoutMs: cfg.audit?.reviewTimeoutMs, // R1 F4
         gitTimeoutMs: cfg.audit?.gitTimeoutMs,       // R1 F4
+        preauthStore,                                 // P-B 门位消费（commands 层同实例登记）
         onProgress: (p) => {
           const send = AUDIT_NOTICE_EVENTS.has(p.event)
             ? transport.sendCard(p.chatId, auditNoticeCard(p))

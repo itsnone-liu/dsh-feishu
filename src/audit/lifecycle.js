@@ -10,12 +10,15 @@
 import { AuditRun } from './state-machine.js';
 import { AuditExecutor } from './executor.js';
 import { GitRemoteGate } from './git-gate.js';
-import { buildSealApprovalText } from './protocol.js';
+import { buildSealApprovalText, buildRevealApprovalText, approvalForGateKind } from './protocol.js';
 import { loadTaskPacket } from './task-packet.js';
 import { AuditRetryScheduler } from './retry-scheduler.js';
+import { parsePreauthText } from './preauth-protocol.js';
+import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 
 export class AuditLifecycle {
-  constructor({ controller, driver, bindings, onProgress = null, watchdogMs = 5 * 60_000, gitGateFactory = (opts) => new GitRemoteGate(opts), executorFactory = (opts) => new AuditExecutor(opts), taskPacketLoader = loadTaskPacket, retryScheduler = null, onError = null, reviewTimeoutMs = 20 * 60_000, gitTimeoutMs = 120_000 } = {}) {
+  constructor({ controller, driver, bindings, onProgress = null, watchdogMs = 5 * 60_000, gitGateFactory = (opts) => new GitRemoteGate(opts), executorFactory = (opts) => new AuditExecutor(opts), taskPacketLoader = loadTaskPacket, retryScheduler = null, onError = null, reviewTimeoutMs = 20 * 60_000, gitTimeoutMs = 120_000, preauthStore = null } = {}) {
     this.controller = controller;
     this.driver = driver;
     this.onError = onError;
@@ -24,6 +27,9 @@ export class AuditLifecycle {
     this.watchdogMs = watchdogMs;
     this.reviewTimeoutMs = reviewTimeoutMs; // R1 F4：reviewer.review 硬超时（默认 20min，可注入；测试传 1ms）
     this.gitTimeoutMs = gitTimeoutMs;       // R1 F4：git 子进程硬超时（透传 gitGateFactory）
+    // P-B §3：门位预授权消费只读候选 + 单事务消费（markConsumed）；登记权
+    //（append/revoke）仍只在 commands 层（I7）。null = 未装配 = 全走人工话术。
+    this.preauthStore = preauthStore;
     this.gitGateFactory = gitGateFactory;
     this.executorFactory = executorFactory;
     this.taskPacketLoader = taskPacketLoader;
@@ -131,6 +137,7 @@ export class AuditLifecycle {
       startingCommit: git.head, stageBaseCommit: git.head,
       goal: packet.goal, approvedPlan: packet.approvedPlan,
       taskPacketHash: packet.taskPacketHash, stageRequirements: packet.stageRequirements,
+      stageGates: packet.stageGates ?? {}, preauthorization: packet.preauthorization ?? null, // P-B 门位声明随 manifest 冻结
     }, { maxReviewIterations: this.controller.maxReviewIterations, now: this.controller.now });
     const executor = this.executorFactory({
       driver: this.driver, gitGate: gate,
@@ -230,6 +237,7 @@ export class AuditLifecycle {
       startingCommit: git.head, stageBaseCommit: parent.state.headCommit,
       goal: pm.goal, approvedPlan: pm.approvedPlan,
       taskPacketHash: pm.taskPacketHash, stageRequirements: pm.stageRequirements,
+      stageGates: pm.stageGates ?? {}, preauthorization: packet.preauthorization ?? null, // P-B 门位声明随 manifest 冻结
       parentRunId: pm.runId, rootRunId: pm.rootRunId ?? pm.runId, completedStages,
       ignorePaths: pm.ignorePaths,
     }, { maxReviewIterations: this.controller.maxReviewIterations, now: this.controller.now });
@@ -451,10 +459,134 @@ export class AuditLifecycle {
       if (run.manifest.chatId !== chatId || !run.s.waitingForHuman) continue;
       const executor = this.executors.get(runId);
       if (!executor) return { handled: false, reason: 'executor_missing' };
+      // P-B §3：预授权先于人工话术尝试（先到先消费，两者并行）。
+      const gateHash = run.s.waitingApprovalHash;
+      const pre = this.#tryPreauthPass(run, text);
+      if (pre?.passed) {
+        // 消费成功：向绑定 session 注入该门型的规范批准话术（与人工路径同一
+        // 下游语义，executor 侧 seal/reveal_approval.json 逐字符一致可核对），
+        // clearHumanWait → GATE_PASSED 事件由 executor.submitHumanResponse 完成。
+        const gate = run.manifest.stageGates?.[String(run.s.currentStage).toUpperCase()];
+        const phrase = approvalForGateKind(gate?.kind === 'REVEAL' ? 'NEXT_REVEAL_ONLY' : 'SEAL_ANNOTATION_ONLY');
+        const canonical = (gate?.kind === 'REVEAL' ? buildRevealApprovalText : buildSealApprovalText)(gateHash);
+        if (!canonical || !phrase) return { handled: false, reason: 'gate_phrase_unavailable' };
+        const result = executor.submitHumanResponse(runId, canonical);
+        if (!result.submitted) return { handled: false, reason: 'canonical_phrase_rejected', ...result };
+        this.#appendRunEvent(run, 'GATE_PASSED_BY_PREAUTH', { preauthId: pre.record.preauthId, binding: pre.record.binding, stage: run.s.currentStage, receiptHash: gateHash });
+        this.#notify(run, 'GATE_PASSED_BY_PREAUTH', { message: `阶段 ${run.s.currentStage} 人闸已由预授权 ${pre.record.preauthId}（${pre.record.binding}）放行，继续无人值守。` });
+        return { handled: true, runId, byPreauth: true, preauthId: pre.record.preauthId };
+      }
+      if (pre?.mismatch) {
+        this.#appendRunEvent(run, 'GATE_PREAUTH_MISMATCH', { stage: run.s.currentStage, receiptHash: gateHash, detail: pre.detail });
+        this.#notify(run, 'GATE_PREAUTH_MISMATCH', { message: `预授权话术与门位事实不符（${pre.detail}），不放电；可人工话术批准或 /audit preauth list 检查。` });
+        // 失配不阻断人工话术并行路径（该文本若同时是合法人工话术仍可放行）。
+      }
       const result = executor.submitHumanResponse(runId, text);
-      return { handled: Boolean(result.submitted), runId, ...result };
+      return { handled: Boolean(result.submitted), runId, byPreauth: false, ...result };
     }
     return { handled: false };
+  }
+
+  /**
+   * P-B §3 门位消费算法（只读候选 + 逐项核验；核验全过才由调用方消费）。
+   * @returns {{passed:true, record}|{mismatch:true, detail}|null}
+   *  null = 不是预授权话术或该门未启用预授权（走人工路径）。
+   */
+  #tryPreauthPass(run, text) {
+    if (!this.preauthStore) return null;
+    let parsed;
+    try { parsed = parsePreauthText(text); } catch { return null; } // 非预授权话术
+    const stage = String(run.s.currentStage).toUpperCase();
+    const gateDecl = run.manifest.stageGates?.[stage];
+    if (!gateDecl) return { mismatch: true, detail: `阶段 ${stage} 未声明人闸` };
+    if (!gateDecl.bindings?.includes(parsed.binding)) {
+      return { mismatch: true, detail: `阶段 ${stage} 不接受 ${parsed.binding} 预授权（声明：${(gateDecl.bindings ?? []).join('|')}）` };
+    }
+    const rootRunId = run.manifest.rootRunId ?? run.runId;
+    const gateKind = parsed.gateKind;
+    const candidates = this.preauthStore.findEligible({ stage, gateKind, rootRunId });
+    if (candidates.length === 0) return { mismatch: true, detail: `无可用 ${gateKind}/${stage}@${rootRunId} 预授权记录` };
+    const chainEvents = this.#chainEvents(run);
+    // ordinal = 本链在该阶段已布防的人闸次数（markWaitingForHuman 同步落
+    // NEED_USER 事件，当前等待已计入 —— 首门 ordinal=1）。
+    const waitOrdinal = chainEvents.filter((e) => (e.event === 'NEED_USER' || e.event === 'WAITING_FOR_HUMAN') && String(e.stage).toUpperCase() === stage).length;
+    for (const rec of candidates) {
+      if (rec.binding !== parsed.binding) continue; // 话术声明的绑定型与记录必须一致
+      if (rec.binding === 'EXACT') {
+        // I2：精确 hash 比对（逐字符，小写归一）。
+        if (String(rec.receiptHash).toLowerCase() === String(run.s.waitingApprovalHash).toLowerCase()) {
+          return this.#consumePreauth(rec, run, stage, waitOrdinal);
+        }
+        continue;
+      }
+      // CONSTRAINT：I5 上游链 + I6 blob 溯源 + ordinal 上限。
+      const c = rec.constraints ?? {};
+      if (Number.isFinite(c.maxOrdinal) && waitOrdinal > c.maxOrdinal) continue;
+      const upstream = c.upstream?.[0];
+      if (!upstream) continue;
+      const upstreamPassed = chainEvents.some((e) => e.event === 'GATE_PASSED'
+        && String(e.stage).toUpperCase() === String(upstream.stage).toUpperCase()
+        && String(e.approvalHash ?? '').toLowerCase() === String(upstream.receiptHash).toLowerCase());
+      if (!upstreamPassed) continue;
+      const src = c.receiptSource;
+      if (!src?.path || !src?.commit) continue;
+      // I6：从 git object db 取 (commit, path) blob 字节，sha256 与门位 hash 比对。
+      const blobHash = this.#blobSha256(run.manifest.cwd, src.commit, src.path);
+      if (blobHash && blobHash === String(run.s.waitingApprovalHash).toLowerCase()) {
+        return this.#consumePreauth(rec, run, stage, waitOrdinal);
+      }
+    }
+    return { mismatch: true, detail: `${candidates.length} 条候选均未通过 I2/I5/I6/ordinal 核验` };
+  }
+
+  #consumePreauth(rec, run, stage, ordinal) {
+    try {
+      this.preauthStore.markConsumed(rec.preauthId, {
+        runId: run.runId, stage, ordinal, receiptHash: run.s.waitingApprovalHash,
+      });
+      return { passed: true, record: this.preauthStore.get(rec.preauthId) ?? rec };
+    } catch (e) {
+      // PreauthAlreadyConsumed / 已撤销已过期 → fail-closed 当作失配。
+      return { mismatch: true, detail: `消费失败：${e.code ?? e.message}` };
+    }
+  }
+
+  /** 运行链（本 run → parentRunId → … → root）事件证据（loadRun 只读；缺失容忍）。 */
+  #chainEvents(run) {
+    const out = [];
+    const seen = new Set();
+    let cursor = run.runId;
+    while (cursor && !seen.has(cursor)) {
+      seen.add(cursor);
+      const st = this.controller.store.loadRun(cursor);
+      if (st?.events) out.push(...(st.events ?? []));
+      const parent = st?.manifest?.parentRunId;
+      if (!parent || seen.has(parent)) break;
+      cursor = parent;
+    }
+    return out;
+  }
+
+  #blobSha256(cwd, commit, path) {
+    try {
+      const stdout = execFileSync('git', ['-c', 'core.autocrlf=false', 'show', `${commit}:${path}`], { cwd, maxBuffer: 16 * 1024 * 1024 });
+      return createHash('sha256').update(stdout).digest('hex');
+    } catch { return null; }
+  }
+
+  /** lifecycle 级事件（镜像 state-machine #emit 形态；dedupeKey 必填唯一）。 */
+  #appendRunEvent(run, event, extra = {}) {
+    try {
+      this.controller.store.appendEvent({
+        runId: run.runId, stage: run.s.currentStage, iteration: run.s.iteration,
+        headCommit: run.s.headCommit ?? null, event, timestamp: Date.now(),
+        elapsedMs: null, tokens: null,
+        dedupeKey: `${run.runId}|${run.s.currentStage}|${run.s.iteration}|${run.s.headCommit ?? ''}|${event}|${extra.preauthId ?? ''}#${Date.now()}`,
+        ...extra,
+      });
+    } catch (e) {
+      this.onError?.(Object.assign(new Error(`appendEvent ${event} failed: ${e.message}`), { cause: e }), run.runId);
+    }
   }
 
   async retry(runId) {
