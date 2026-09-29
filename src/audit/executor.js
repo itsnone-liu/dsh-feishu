@@ -120,8 +120,12 @@ export class AuditExecutor {
     // A stale assistant message can be delivered after resume and before the
     // new turn/start. It must never be parsed as the current marker.
     if (entry.awaitingFreshTurn) return { ignored: true, stale: true };
-    if (entry.run.s.state !== 'EXECUTING') return { ignored: true, stale: true };
     const { run, gitGate } = entry;
+    if (run.isTerminal) {
+      this.runs.delete(run.runId);
+      return { ignored: true, stale: true };
+    }
+    if (run.s.state !== 'EXECUTING') return { ignored: true, stale: true };
     const text = textFromMessage(data);
     if (!text) return { ignored: true };
     // B4 is a deliberate human gate: the executor must stop after presenting

@@ -14,12 +14,13 @@ import { loadTaskPacket } from './task-packet.js';
 import { AuditRetryScheduler } from './retry-scheduler.js';
 
 export class AuditLifecycle {
-  constructor({ controller, driver, bindings, onProgress = null, gitGateFactory = (opts) => new GitRemoteGate(opts), executorFactory = (opts) => new AuditExecutor(opts), taskPacketLoader = loadTaskPacket, retryScheduler = null, onError = null } = {}) {
+  constructor({ controller, driver, bindings, onProgress = null, watchdogMs = 5 * 60_000, gitGateFactory = (opts) => new GitRemoteGate(opts), executorFactory = (opts) => new AuditExecutor(opts), taskPacketLoader = loadTaskPacket, retryScheduler = null, onError = null } = {}) {
     this.controller = controller;
     this.driver = driver;
     this.onError = onError;
     this.bindings = bindings;
     this.onProgress = onProgress;
+    this.watchdogMs = watchdogMs;
     this.gitGateFactory = gitGateFactory;
     this.executorFactory = executorFactory;
     this.taskPacketLoader = taskPacketLoader;
@@ -45,7 +46,8 @@ export class AuditLifecycle {
     for (const run of this.liveRuns.values()) {
       if (run.isTerminal || run.s.waitingForHuman || !['EXECUTING', 'AUDITING'].includes(run.s.state)) continue;
       const a = this.activity.get(run.runId) ?? { at: run.s.updatedAt ?? now, warned: false };
-      if (!a.warned && now - a.at >= 5 * 60_000) {
+      const last = run.s.lastExecutorEventAt ?? a.at;
+      if (!a.warned && now - last >= this.watchdogMs) {
         this.#notify(run, 'WATCHDOG_TIMEOUT', { idleMs: now - a.at, message: '审计执行器超过 5 分钟无进展事件' });
       }
     }
@@ -318,7 +320,7 @@ export class AuditLifecycle {
     old.rebindAuditSession(binding.sessionId, agent.id);
     // Migration is also the explicit recovery boundary for a marker failure:
     // resume the durable run before the first prompt reaches the new session.
-    if (old.s.state === 'PAUSED_NEEDS_USER') old.resumeFromHuman({});
+    if (old.s.state === 'PAUSED_NEEDS_USER' && old.s.cause !== 'HISTORY_REWRITTEN') old.resumeFromHuman({});
     this.liveRuns.set(runId, old);
     const gate = this.gitGateFactory({ cwd: old.manifest.cwd });
     const executor = this.executorFactory({ driver: this.driver, gitGate: gate });
