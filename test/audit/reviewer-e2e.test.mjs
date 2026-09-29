@@ -2,6 +2,8 @@
 /** A4.2 reviewer lifecycle E2E: real git + lifecycle + FakeWebAuditRunner seam. */
 import assert from 'node:assert';
 import fs from 'node:fs';
+// R1 修复（A2）：raw dump 根强制指向临时目录，杜绝测试写进生产 store 的可能。
+process.env.DSH_AUDIT_RAW_DUMP_DIR = fs.mkdtempSync('/tmp/audit-e2e-test.XXXX');
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';

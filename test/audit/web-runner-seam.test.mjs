@@ -3,6 +3,8 @@
 // A4 冻结的 AuditLifecycle orchestration 一行不改，全链路跑到 TARGET_REACHED。
 import assert from 'node:assert';
 import { mkdtempSync, rmSync, cpSync, mkdirSync, writeFileSync } from 'node:fs';
+// R1 修复（A2）：raw dump 根强制指向临时目录，杜绝测试写进生产 store 的可能。
+process.env.DSH_AUDIT_RAW_DUMP_DIR = mkdtempSync('/tmp/audit-seam-test.XXXX');
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';

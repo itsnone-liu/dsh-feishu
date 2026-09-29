@@ -220,9 +220,15 @@ export class WebAuditRunner {
     this.execTest = execTest ?? null;
     // 观测性（不改任何冻结语义）：评审文本缺失/不可解析时把原始文本落盘，便于事后诊断。
     // DSH_AUDIT_RAW_DUMP=0 可整体关闭；注入 rawDumpDirFor 覆盖落盘位置（测试用）。
+    // R1 修复（评审 addendum A2）：默认根目录不再硬编码 ~/.dsh/feishu —— 跟随桥的
+    // 数据目录解析（DSH_FEISHU_DATA_DIR ?? $HOME/.dsh/feishu，与 config.js/dataDir
+    // 同源），DSH_AUDIT_RAW_DUMP_DIR 可显式覆盖。此前硬编码令未隔离的测试运行把
+    // reviewer-raw-*.txt 写进生产 store（run-x1 / audit_19700101* 污染事件）。
+    this.rawDumpRoot = process.env.DSH_AUDIT_RAW_DUMP_DIR
+      ?? join(process.env.DSH_FEISHU_DATA_DIR ?? join(process.env.HOME ?? '/root', '.dsh/feishu'), 'audit/runs');
     this.rawDumpDirFor = rawDumpDirFor ?? ((p) => (
       process.env.DSH_AUDIT_RAW_DUMP === '0' ? null
-        : join(process.env.HOME ?? '/root', '.dsh/feishu/audit/runs', p.runId)
+        : join(this.rawDumpRoot, p.runId)
     ));
     this.calls = []; // 可观测性：{ packet, attempts, outcome }
   }

@@ -1,7 +1,11 @@
 #!/usr/bin/env node
 // A5.1 WebAuditRunner 单元测试 —— 全部确定性，无网络依赖（transport 注入）。
 import assert from 'node:assert';
+import { mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
+// R1 修复（评审 addendum A2）：raw dump 根强制指向临时目录 —— 本文件无论被
+// 怎么运行（哪怕未隔离、HOME=/root）都不可能把 reviewer-raw-* 写进生产 store。
+process.env.DSH_AUDIT_RAW_DUMP_DIR = mkdtempSync('/tmp/audit-webrunner-test.XXXX');
 import { WebAuditRunner, extractReviewerText, consumeSseStream } from '../../src/audit/web-runner.js';
 import { buildVerdictText } from '../../src/audit/protocol.js';
 
