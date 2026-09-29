@@ -21,6 +21,17 @@ const runFixture = () => {
   return { store, run, agent, driver, submitted };
 };
 
+await ok('B4 human approval wait is not marker failure and routes approval', async () => {
+  const f = runFixture(); f.run.s.currentStage = 'B4';
+  const ex = new AuditExecutor({ driver: f.driver, gitGate: {} });
+  await ex.start({ run: f.run, agent: f.agent, gitGate: {} });
+  const r = await ex.onEvent({ id: 's-a' }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'receipt_sha256: abc; 等待人工批准 SEAL_ANNOTATION_ONLY' }] } } });
+  assert.equal(r.waitingForHuman, true); assert.equal(f.run.s.waitingForHuman, true); assert.equal(f.run.s.markerRetries, 0);
+  const before = f.submitted.length;
+  const routed = ex.submitHumanResponse('r1', 'SEAL_ANNOTATION_ONLY receipt exact hash abc');
+  assert.equal(routed.submitted, true); assert.equal(f.submitted.length, before + 1); assert.equal(f.run.s.waitingForHuman, false);
+});
+
 await ok('start submits exactly one executor prompt to bound session', async () => {
   const f = runFixture(); const ex = new AuditExecutor({ driver: f.driver, gitGate: {} });
   const r = await ex.start({ run: f.run, agent: f.agent, gitGate: {} });

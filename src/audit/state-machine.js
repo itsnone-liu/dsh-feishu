@@ -233,6 +233,7 @@ export class AuditRun {
    * @returns {{retry: boolean}|{failed: boolean}}
    */
   recordExecutorEvent(event, turn = null) {
+    if (this.isTerminal) return;
     this.s.lastExecutorEventAt = this.now();
     this.s.lastExecutorEvent = event;
     this.s.lastExecutorTurn = turn;

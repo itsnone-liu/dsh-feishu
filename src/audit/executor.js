@@ -178,13 +178,14 @@ export class AuditExecutor {
     }
   }
 
-  submitHumanResponse(text) {
-    const entry = [...this.runs.values()].find((x) => x.run.s.waitingForHuman);
-    if (!entry) return { ignored: true };
-    if (!/SEAL_ANNOTATION_ONLY|receipt exact hash|receipt_sha256/i.test(String(text))) {
-      return { ignored: true, invalidApproval: true, reason: 'approval text does not match B4 fixed protocol' };
+  submitHumanResponse(runId, text) {
+    const entry = this.runs.get(runId);
+    if (!entry || entry.run.isTerminal || !entry.run.s.waitingForHuman) return { ignored: true };
+    const value = String(text ?? '').trim();
+    if (!value || /拒绝|不同意|不批准|reject|deny/i.test(value)) {
+      return { ignored: true, invalidApproval: true, reason: 'approval was not affirmative' };
     }
-    this.driver.submit(entry.agent, text);
+    this.driver.submit(entry.agent, value);
     entry.run.clearHumanWait();
     return { submitted: true, sessionId: entry.agent.id };
   }

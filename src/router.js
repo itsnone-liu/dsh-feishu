@@ -195,6 +195,10 @@ export class ChatRouter {
       await this.transport.sendCard(chatId, buildInfoCard('✅ 审计人工输入已转交', `run：\`${auditResponse.runId}\`\n审计 session：\`${auditResponse.sessionId}\``));
       return;
     }
+    if (auditResponse?.invalidApproval) {
+      await this.transport.sendCard(chatId, buildErrorCard('❌ 审计人工输入未转交', auditResponse.reason));
+      return;
+    }
 
     // normal text traffic → agent
     const agent = await this.#agentFor(chatId);

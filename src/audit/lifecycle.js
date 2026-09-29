@@ -335,8 +335,8 @@ export class AuditLifecycle {
       if (run.manifest.chatId !== chatId || !run.s.waitingForHuman) continue;
       const executor = this.executors.get(runId);
       if (!executor) return { handled: false, reason: 'executor_missing' };
-      const result = executor.submitHumanResponse(text);
-      return { handled: true, runId, ...result };
+      const result = executor.submitHumanResponse(runId, text);
+      return { handled: Boolean(result.submitted), runId, ...result };
     }
     return { handled: false };
   }
