@@ -6,6 +6,7 @@
  *   <root>/runs/<runId>/manifest.json         — 冻结授权边界
  *   <root>/runs/<runId>/state.json            — 运行态（状态机快照）
  *   <root>/runs/<runId>/events.jsonl          — 审计流水（append-only）
+ *   <root>/runs/<runId>/verdicts.jsonl        — 裁决全文历史（append-only，v0.4.4）
  *
  * 规则：
  *  - 全部 JSON 落盘走 tmp+rename 原子写（沿用仓库 BindingStore 风格）；
@@ -40,6 +41,7 @@ export class AuditStore {
   #manifestFile(runId) { return path.join(this.#runDir(runId), 'manifest.json'); }
   #stateFile(runId) { return path.join(this.#runDir(runId), 'state.json'); }
   #eventsFile(runId) { return path.join(this.#runDir(runId), 'events.jsonl'); }
+  #verdictsFile(runId) { return path.join(this.#runDir(runId), 'verdicts.jsonl'); }
 
   /** 沿用仓库原子写风格：tmp + rename。 */
   #atomicWrite(file, text) {
@@ -161,6 +163,55 @@ export class AuditStore {
   #rebuildSeen(runId) {
     const { events } = this.#readEvents(runId);
     this.#seenKeys.set(runId, new Set(events.map((e) => e.dedupeKey)));
+  }
+
+  // ---------- 裁决历史（v0.4.4） ----------
+
+  /**
+   * 追加一条裁决全文记录到 verdicts.jsonl。
+   *
+   * 背景（CSR-8 run audit_20260928142305936 实况教训）：state.lastVerdict
+   * 只保留最近一次裁决，历史裁决文本随覆盖丢失，导致后续阶段无法把
+   * "此前裁决原文"作为可独立验证的证据引用（评审员明确拒绝采信会话
+   * 转述的裁决转录）。本文件让每一次被接受的裁决全文都成为运行目录内
+   * 机器可引用的持久证据。
+   *
+   * 策略与 events.jsonl 一致：append-only；不做 dedup（同一 stage/iteration
+   * 只有一次被接受的 verdict，重复投递在 state-machine 层 dedup/拒绝）；
+   * 末行写一半（crash 窗口）读取时容忍截断；中间坏行 = 损坏 fail loud。
+   */
+  appendVerdict({ runId, stage, iteration, headCommit, verdict }) {
+    if (!runId || !stage || !Number.isInteger(iteration) || !headCommit
+        || !verdict || typeof verdict.state !== 'string') {
+      throw new AuditError('AUDIT_STORE_CORRUPTION',
+        'appendVerdict: required fields {runId,stage,iteration,headCommit,verdict{state}} missing');
+    }
+    const entry = {
+      ts: this.now(), runId, stage, iteration, headCommit,
+      verdict,
+    };
+    fs.appendFileSync(this.#verdictsFile(runId), `${JSON.stringify(entry)}\n`);
+    return true;
+  }
+
+  /** 读取裁决历史（时间序）。文件不存在 → 空数组；末行不完整容忍；中间坏行 fail loud。 */
+  listVerdicts(runId) {
+    const file = this.#verdictsFile(runId);
+    if (!fs.existsSync(file)) return [];
+    const raw = fs.readFileSync(file, 'utf8');
+    if (raw === '') return [];
+    const lines = raw.split('\n');
+    if (!raw.endsWith('\n')) lines.pop(); // 末行写一半：容忍截断
+    const out = [];
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i] === '') continue;
+      try {
+        out.push(JSON.parse(lines[i]));
+      } catch {
+        throw new StoreCorruptionError(file, `corrupt verdict line ${i + 1} (not the trailing partial line)`);
+      }
+    }
+    return out;
   }
 
   // ---------- 读取 / 恢复 ----------

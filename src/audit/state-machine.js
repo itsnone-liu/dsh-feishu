@@ -400,6 +400,16 @@ export class AuditRun {
       parsed,
     );
     this.s.lastVerdict = { ...parsed, headCommit: this.s.auditInFlight.headCommit };
+    // v0.4.4：裁决全文持久化（verdicts.jsonl）——lastVerdict 会被后续裁决
+    // 覆盖，历史裁决文本必须独立留存，供后续阶段作为可机器验证的证据引用
+    // （CSR-8 实况：评审员拒绝采信无法独立验证来源的裁决转录）。
+    this.store.appendVerdict({
+      runId: this.runId,
+      stage: this.s.currentStage,
+      iteration: this.s.iteration,
+      headCommit: this.s.auditInFlight.headCommit,
+      verdict: parsed,
+    });
     this.s.verdictRetries = 0; // A1.2-3：合法 verdict 被接受 = 协议周期成功，旧失败不跨 iteration/stage 继承
 
     if (parsed.state === 'APPROVE') {

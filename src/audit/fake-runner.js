@@ -129,6 +129,7 @@ export function runAuditScenario(p) {
     updateIndex: (...a) => store.updateIndex(...a),
     loadRun: (...a) => store.loadRun(...a),
     listRuns: (...a) => store.listRuns(...a),
+    appendVerdict: (...a) => store.appendVerdict(...a),
     appendEvent: (evt) => {
       const r = store.appendEvent(evt);
       if (r.appended) {
