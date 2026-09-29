@@ -244,6 +244,7 @@ export class AuditRun {
   clearHumanWait() {
     this.s.waitingForHuman = false;
     this.s.waitingReason = null;
+    this.s.waitingApprovalHash = null;
     this.#touch(); this.store.saveState(this.s);
   }
 
