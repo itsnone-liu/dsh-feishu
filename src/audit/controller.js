@@ -78,6 +78,15 @@ export class AuditController {
     return { cwd: loaded.manifest.cwd, repo: loaded.manifest.repo, branch: loaded.manifest.branch };
   }
 
+  rebind(chatId) {
+    const t = this.#target(chatId);
+    if (t.error) return t.error;
+    if (!t.id || !this.lifecycle) return { ok: false, code: 'AUDIT_NO_ACTIVE_RUN', message: '没有可迁移的审计运行。' };
+    return this.lifecycle.rebind(t.id)
+      .then(({ run, agent }) => ({ ok: true, runId: run.runId, result: { state: run.s.state, auditSessionId: agent.id } }))
+      .catch((e) => ({ ok: false, runId: t.id, code: e.code ?? 'AUDIT_ERROR', message: e.message }));
+  }
+
   /** 当前活跃 run（非终态）。@returns {{id, state, chatId}|null} */
   activeRun() {
     // listRuns 索引可能滞后（saveState 才更新），以磁盘 state.json 为准逐个 open。

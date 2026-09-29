@@ -291,6 +291,25 @@ export class AuditLifecycle {
     });
   }
 
+  async rebind(runId) {
+    const old = this.liveRuns.get(runId) ?? AuditRun.open(this.controller.store, { now: this.controller.now })(runId);
+    if (!old) throw Object.assign(new Error(`run not found: ${runId}`), { code: 'AUDIT_RUN_NOT_FOUND' });
+    const binding = this.bindings?.get(old.manifest.chatId);
+    if (!binding?.sessionId || binding.sessionId !== (old.manifest.observerSessionId ?? binding.sessionId)) {
+      throw Object.assign(new Error('observer session binding mismatch'), { code: 'AUDIT_SESSION_BINDING_MISMATCH' });
+    }
+    const agent = await this.driver.ensureAuditSession({ cwd: old.manifest.cwd });
+    if (agent.status !== 'idle') throw Object.assign(new Error('dedicated audit session is busy'), { code: 'AUDIT_SESSION_OCCUPIED' });
+    old.rebindAuditSession(binding.sessionId, agent.id);
+    this.liveRuns.set(runId, old);
+    const gate = this.gitGateFactory({ cwd: old.manifest.cwd });
+    const executor = this.executorFactory({ driver: this.driver, gitGate: gate });
+    this.executors.set(runId, executor);
+    await executor.start({ run: old, agent, gitGate: gate });
+    this.#notify(old, 'AUDIT_SESSION_REBOUND', { auditSessionId: agent.id, observerSessionId: binding.sessionId });
+    return { run: old, agent, executor };
+  }
+
   async retry(runId) {
     return this.#serial(runId, async () => {
       const before = this.liveRuns.get(runId);

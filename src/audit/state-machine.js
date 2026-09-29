@@ -56,6 +56,7 @@ export const EVENTS = Object.freeze([
   'NEED_USER', 'HISTORY_REWRITTEN', 'HUMAN_RESUME', 'PAUSED_BY_USER', 'RESUMED_BY_USER',
   'RECOVERED_REVISE_EXECUTING',
   'STAGE_ADVANCED', 'TARGET_REACHED', 'RUN_STOPPED', 'STOP_TARGET_CHANGED',
+  'AUDIT_SESSION_REBOUND',
 ]);
 
 export function canTransition(from, to) {
@@ -500,6 +501,18 @@ export class AuditRun {
     this.#emit('RUN_STOPPED');
     this.s.stoppedAt = this.now();
     this.#transition('STOPPED');
+  }
+
+  rebindAuditSession(observerSessionId, auditSessionId) {
+    this.#assertNotTerminal();
+    if (!observerSessionId || !auditSessionId) throw new AuditError('AUDIT_ARG_INVALID', 'both observer and audit session ids are required');
+    if (this.manifest.observerSessionId && this.manifest.observerSessionId !== observerSessionId) {
+      throw new AuditError('AUDIT_SESSION_BINDING_MISMATCH', 'observer session binding changed');
+    }
+    this.manifest = { ...this.manifest, observerSessionId, dshSessionId: auditSessionId, updatedAt: this.now() };
+    this.store.saveManifest(this.manifest);
+    this.#emit('AUDIT_SESSION_REBOUND', { observerSessionId, auditSessionId });
+    return { observerSessionId, auditSessionId };
   }
 
   /** /audit until（§6.2）。写入 manifest + 事件。 */

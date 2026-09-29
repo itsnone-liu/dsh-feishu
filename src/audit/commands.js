@@ -21,6 +21,8 @@ const USAGE = [
   '- `/audit` — 一次性运行全部阶段（停止点：' + DEFAULT_STAGES.at(-1) + '）',
   '- `/audit <阶段>` — 运行至指定阶段（如 `/audit T2`，阶段表：' + DEFAULT_STAGES.join(' · ') + '）',
   '- `/audit next [阶段]` — 延续最近已完成的任务链，从下一阶段开始（不重审已完成阶段）',
+  '- `/audit rebind` — 将当前运行迁移到专用审计 session（普通对话保持观察/控制）',
+  '- `/audit rebind` — 将当前运行迁移到专用审计 session（普通对话保持观察/控制）',
   '- `/audit status` — 查看状态 · `/audit pause` 暂停 · `/audit resume` 恢复',
   '- `/audit stop` — 终止 · `/audit until <阶段>` — 修改停止点',
   '',
@@ -54,7 +56,7 @@ export async function handleAuditCommand(controller, arg, chatId) {
   const raw = arg.trim();
   const [first, ...rest] = raw.split(/\s+/);
   const word = (first ?? '').toLowerCase();
-  const management = new Set(['status', 'pause', 'resume', 'stop', 'until', 'next']);
+  const management = new Set(['status', 'pause', 'resume', 'stop', 'until', 'next', 'rebind']);
 
   // 无参数默认跑完整阶段表；显式阶段仍允许设置停止点。
   if (!raw) {
@@ -102,6 +104,11 @@ export async function handleAuditCommand(controller, arg, chatId) {
   }
 
   switch (word) {
+    case 'rebind': {
+      const r = await controller.rebind(chatId);
+      if (!r.ok) return { title: '❌ 审计 session 迁移失败', body: r.message, template: 'red' };
+      return { title: '🔗 审计 session 已迁移', body: `run：\`${r.runId}\`\n状态：**${r.result.state}**\n审计 session：\`${r.result.auditSessionId}\`\n普通对话 session 保留为观察/控制入口。` };
+    }
     case '': return { title: '/audit 用法', body: USAGE };
     case 'status': {
       const r = await controller.status(chatId);
