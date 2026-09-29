@@ -316,6 +316,9 @@ export class AuditLifecycle {
     const agent = await this.driver.ensureAuditSession({ cwd: old.manifest.cwd });
     if (agent.status !== 'idle') throw Object.assign(new Error('dedicated audit session is busy'), { code: 'AUDIT_SESSION_OCCUPIED' });
     old.rebindAuditSession(binding.sessionId, agent.id);
+    // Migration is also the explicit recovery boundary for a marker failure:
+    // resume the durable run before the first prompt reaches the new session.
+    if (old.s.state === 'PAUSED_NEEDS_USER') old.resumeFromHuman({});
     this.liveRuns.set(runId, old);
     const gate = this.gitGateFactory({ cwd: old.manifest.cwd });
     const executor = this.executorFactory({ driver: this.driver, gitGate: gate });
