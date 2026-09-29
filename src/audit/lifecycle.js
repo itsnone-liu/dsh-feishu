@@ -453,7 +453,7 @@ export class AuditLifecycle {
     if (reviseRecovery) {
       executor.startStage(runId);
     }
-    if (run.s.state === 'WAIT_GIT_PUSH' && run.s.pendingRemoteSync) {
+    if (run.s.pendingRemoteSync) {
       this.#scheduleRetry(runId, run.s.retry.pushAttempts);
     }
     if (run.s.state === 'AUDITING') await this.#maybeAutoReviewLocked(runId);
