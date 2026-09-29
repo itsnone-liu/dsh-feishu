@@ -30,10 +30,25 @@ export class AuditLifecycle {
     this.busyRuns = new Set();
     this.reviewRounds = new Map();
     this.reviewer = null;
+    this.activity = new Map();
+    this.watchdogInterval = setInterval(() => this.#watchdog(), 60_000);
+    this.watchdogInterval.unref?.();
   }
 
   #notify(run, event, detail = {}) {
+    this.activity.set(run.runId, { at: Date.now(), warned: event === 'WATCHDOG_TIMEOUT' });
     try { this.onProgress?.({ runId: run.runId, chatId: run.manifest.chatId, stage: run.s.currentStage, state: run.s.state, event, ...detail }); } catch {}
+  }
+
+  #watchdog() {
+    const now = Date.now();
+    for (const run of this.liveRuns.values()) {
+      if (run.isTerminal || !['EXECUTING', 'AUDITING'].includes(run.s.state)) continue;
+      const a = this.activity.get(run.runId) ?? { at: run.s.updatedAt ?? now, warned: false };
+      if (!a.warned && now - a.at >= 5 * 60_000) {
+        this.#notify(run, 'WATCHDOG_TIMEOUT', { idleMs: now - a.at, message: '审计执行器超过 5 分钟无进展事件' });
+      }
+    }
   }
 
   #scheduleRetry(runId, attempt) {
