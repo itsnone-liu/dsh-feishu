@@ -323,7 +323,10 @@ export class AuditLifecycle {
     if (old.s.state === 'PAUSED_NEEDS_USER' && old.s.cause !== 'HISTORY_REWRITTEN') old.resumeFromHuman({});
     this.liveRuns.set(runId, old);
     const gate = this.gitGateFactory({ cwd: old.manifest.cwd });
-    const executor = this.executorFactory({ driver: this.driver, gitGate: gate });
+    const executor = this.executorFactory({
+      driver: this.driver, gitGate: gate,
+      onTransient: this.retryScheduler ? (entry, _result, attempt) => this.#scheduleRetry(entry.run.runId, attempt) : null,
+    });
     this.executors.set(runId, executor);
     await executor.start({ run: old, agent, gitGate: gate });
     this.#notify(old, 'AUDIT_SESSION_REBOUND', { auditSessionId: agent.id, observerSessionId: binding.sessionId });
@@ -425,7 +428,10 @@ export class AuditLifecycle {
       run.resumeFromHuman({ bumpReviewIterations });
     }
     const gate = this.gitGateFactory({ cwd: run.manifest.cwd });
-    const executor = this.executorFactory({ driver: this.driver, gitGate: gate });
+    const executor = this.executorFactory({
+      driver: this.driver, gitGate: gate,
+      onTransient: this.retryScheduler ? (entry, _result, attempt) => this.#scheduleRetry(entry.run.runId, attempt) : null,
+    });
     this.executors.set(runId, executor);
     this.liveRuns.set(runId, run);
     await executor.start({ run, agent, gitGate: gate, sendPrompt: false });
