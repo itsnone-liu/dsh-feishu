@@ -366,8 +366,8 @@ export class AuditLifecycle {
         // 非绑定 session 的事件返回 {ignored:true}，不得误触 reviewer。
         if (r?.turnEnded === true) await this.#maybeAutoReviewLocked(runId);
         const current = this.liveRuns.get(runId);
-        if (current && (r?.turnEnded || r?.ready || r?.advanced || r?.retry || r?.paused)) {
-          this.#notify(current, r?.ready ? 'READY_FOR_AUDIT' : (r?.paused ? 'PAUSED' : 'EXECUTOR_EVENT'), { result: r });
+        if (current && (r?.turnEnded || r?.ready || r?.advanced || r?.retry || r?.paused || r?.waitingForHuman)) {
+          this.#notify(current, r?.ready ? 'READY_FOR_AUDIT' : (r?.waitingForHuman ? 'WAITING_FOR_HUMAN' : (r?.paused ? 'PAUSED' : 'EXECUTOR_EVENT')), { result: r });
         }
         return r;
       });
