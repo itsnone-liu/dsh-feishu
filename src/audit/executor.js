@@ -6,7 +6,7 @@
  * executor path at the remote gate; REVISE feedback is injected into the same
  * bound session.
  */
-import { parseExecutorMarker, executorMarkerTemplate, sealApprovalHash } from './protocol.js';
+import { parseExecutorMarker, parseHumanApprovalWait, executorMarkerTemplate, sealApprovalHash } from './protocol.js';
 
 const isHumanApprovalGateText = (text) => /\[DSH-AUDIT WAITING_APPROVAL\]/i.test(text);
 const runStageIsB4 = (run) => /^B4$/i.test(String(run?.s?.currentStage ?? ''));
@@ -131,9 +131,14 @@ export class AuditExecutor {
     // B4 is a deliberate human gate: the executor must stop after presenting
     // the receipt hash and waiting for the fixed human approval phrase. This
     // is not a missing marker and must not consume marker retries.
-    if (runStageIsB4(entry.run) && isHumanApprovalGateText(text)) {
-      const result = entry.run.markWaitingForHuman('B4_SEAL_APPROVAL', sealApprovalHash(text));
-      return { ...result, event: 'WAITING_FOR_HUMAN' };
+    if (runStageIsB4(entry.run)) {
+      try {
+        const waiting = parseHumanApprovalWait(text);
+        if (waiting.runId === entry.run.runId && waiting.stage === entry.run.s.currentStage && waiting.iteration === entry.run.s.iteration) {
+          const result = entry.run.markWaitingForHuman('B4_SEAL_APPROVAL', text.match(/[0-9a-f]{64}/i)?.[0] ?? null);
+          return { ...result, event: 'WAITING_FOR_HUMAN', question: waiting.question };
+        }
+      } catch {}
     }
     let marker;
     try {

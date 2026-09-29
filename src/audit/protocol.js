@@ -17,6 +17,7 @@ export const SEAL_APPROVAL_RE = /^我明确批准 SEAL_ANNOTATION_ONLY receipt e
 export const sealApprovalHash = (text) => String(text ?? '').trim().match(SEAL_APPROVAL_RE)?.[1] ?? null;
 
 export const EXECUTOR_MARKER_STATES = ['READY_FOR_AUDIT'];
+export const EXECUTOR_WAIT_STATES = ['WAIT_HUMAN_APPROVAL'];
 export const VERDICT_STATES = ['APPROVE', 'REVISE', 'NEED_USER'];
 
 /** 头段键白名单（封闭集合）。 */
@@ -128,6 +129,13 @@ export function parseAuditBlock(text, opts) {
     hostId: headers.has('HOST_ID') ? headers.get('HOST_ID') : null,
     sections,
   };
+}
+
+/** 解析 DSH executor 的人类批准等待块。HEAD 不应出现。 */
+export function parseHumanApprovalWait(text) {
+  const b = parseAuditBlock(text, { allowedStates: EXECUTOR_WAIT_STATES, requireHead: false });
+  if (!b.sections.QUESTION?.length) throw new ProtocolParseError('WAIT_HUMAN_APPROVAL requires QUESTION');
+  return { state: b.state, runId: b.runId, stage: b.stage, iteration: b.iteration, hostId: b.hostId, question: b.sections.QUESTION };
 }
 
 /** 解析 DSH executor 的 READY_FOR_AUDIT marker（§9）。HEAD 必填。 */
