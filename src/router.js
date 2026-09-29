@@ -187,6 +187,15 @@ export class ChatRouter {
       return;
     }
 
+    // A running audit may be waiting for an explicit human response (e.g. B4
+    // seal approval). Route that text to the dedicated audit session first;
+    // never inject it into the observer chat session.
+    const auditResponse = await this.commands.auditLifecycle?.submitHumanResponse(chatId, norm);
+    if (auditResponse?.handled) {
+      await this.transport.sendCard(chatId, buildInfoCard('✅ 审计人工输入已转交', `run：\`${auditResponse.runId}\`\n审计 session：\`${auditResponse.sessionId}\``));
+      return;
+    }
+
     // normal text traffic → agent
     const agent = await this.#agentFor(chatId);
     const mode = this.driver.submit(agent, norm);

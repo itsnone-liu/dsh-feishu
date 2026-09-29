@@ -328,6 +328,17 @@ export class AuditLifecycle {
     return { run: old, agent, executor };
   }
 
+  async submitHumanResponse(chatId, text) {
+    for (const [runId, run] of this.liveRuns) {
+      if (run.manifest.chatId !== chatId || !run.s.waitingForHuman) continue;
+      const executor = this.executors.get(runId);
+      if (!executor) return { handled: false, reason: 'executor_missing' };
+      const result = executor.submitHumanResponse(text);
+      return { handled: true, runId, ...result };
+    }
+    return { handled: false };
+  }
+
   async retry(runId) {
     return this.#serial(runId, async () => {
       const before = this.liveRuns.get(runId);

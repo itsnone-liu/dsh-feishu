@@ -229,6 +229,12 @@ export class AuditRun {
    * 第 1 次 → MARKER_RETRY（状态不变，等待重问）；第 2 次 → PAUSED_NEEDS_USER。
    * @returns {{retry: boolean}|{failed: boolean}}
    */
+  clearHumanWait() {
+    this.s.waitingForHuman = false;
+    this.s.waitingReason = null;
+    this.#touch(); this.store.saveState(this.s);
+  }
+
   markWaitingForHuman(reason = 'B4_SEAL_APPROVAL') {
     this.#assertNotTerminal();
     if (this.s.state !== 'EXECUTING') throw new IllegalTransitionError(this.s.state, 'WAITING_FOR_HUMAN');

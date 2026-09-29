@@ -172,6 +172,14 @@ export class AuditExecutor {
     }
   }
 
+  submitHumanResponse(text) {
+    const entry = [...this.runs.values()].find((x) => x.run.s.waitingForHuman);
+    if (!entry) return { ignored: true };
+    this.driver.submit(entry.agent, text);
+    entry.run.clearHumanWait();
+    return { submitted: true, sessionId: entry.agent.id };
+  }
+
   /** Reviewer stub/A5 adapter calls this after REVISE; same DSH session only. */
   applyVerdict(runId, parsed) {
     const entry = this.runs.get(runId);
