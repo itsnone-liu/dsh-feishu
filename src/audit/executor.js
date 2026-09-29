@@ -128,7 +128,8 @@ export class AuditExecutor {
     // the receipt hash and waiting for the fixed human approval phrase. This
     // is not a missing marker and must not consume marker retries.
     if (runStageIsB4(entry.run) && isHumanApprovalGateText(text)) {
-      return entry.run.markWaitingForHuman('B4_SEAL_APPROVAL');
+      const result = entry.run.markWaitingForHuman('B4_SEAL_APPROVAL');
+      return { ...result, event: 'WAITING_FOR_HUMAN' };
     }
     let marker;
     try {
