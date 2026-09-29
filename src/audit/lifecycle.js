@@ -341,6 +341,15 @@ export class AuditLifecycle {
       throw Object.assign(new Error('persisted dshSessionId does not match the owner chat binding'), { code: 'AUDIT_SESSION_BINDING_MISMATCH' });
     }
     const agent = await this.driver.ensure({ ...binding }, { allowCreate: false });
+    // MARKER_PARSE_FAILED is a recoverable executor-turn loss.  Human resume
+    // changes the durable state back to EXECUTING, but the failed turn's
+    // prompt is gone; reattaching with sendPrompt:false alone leaves the run
+    // permanently idle (the exact failure seen after repeated resume).  Latch
+    // this before resumeFromHuman clears/changes the paused state, then replay
+    // the same stage prompt once after the executor is attached.
+    const replayMarkerPrompt = human
+      && run.s.state === 'PAUSED_NEEDS_USER'
+      && run.s.cause === 'MARKER_PARSE_FAILED';
     if (human && run.s.state === 'PAUSED_NEEDS_USER') {
       if (run.s.cause === 'HISTORY_REWRITTEN') {
         throw Object.assign(new Error('history was rewritten: explicit new baseline required'), { code: 'AUDIT_BASELINE_REQUIRED' });
@@ -352,6 +361,9 @@ export class AuditLifecycle {
     this.executors.set(runId, executor);
     this.liveRuns.set(runId, run);
     await executor.start({ run, agent, gitGate: gate, sendPrompt: false });
+    if (replayMarkerPrompt) {
+      executor.startStage(runId);
+    }
     if (human && run.s.state === 'AUDITING' && run.s.auditInFlight) {
       this.reviewRounds.delete(runId);
     }

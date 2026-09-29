@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-/** A3 lifecycle tests: existing session binding + real git facts, no silent fork. */
 import assert from 'node:assert';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -65,6 +64,26 @@ await ok('resume requires persisted dshSessionId to match owner binding', async 
   const r = await life.start({ chatId: 'chat-a', stopAfter: 'T1' });
   const resumed = await life.resume(r.run.runId);
   assert.equal(resumed.agent.id, 's-a');
+});
+
+await ok('MARKER_PARSE_FAILED human resume replays the current stage prompt', async () => {
+  const f = fixture(); const c = ctrl(f.root, f.work);
+  const bindings = new Map([['chat-a', { sessionId: 's-a', cwd: f.work }]]);
+  const prompts = [];
+  const driver = { ensure: async () => ({ id: 's-a', status: 'idle' }), submit: (_agent, prompt) => prompts.push(prompt) };
+  const gate = { inspect: async () => ({ cwd: f.work, repo: 'real-origin', branch: 'main', head: f.head }) };
+  const executorFactory = (opts) => new (class {
+    async start({ run, agent, gitGate, sendPrompt = true }) { this.run = run; this.agent = agent; this.gitGate = gitGate; if (sendPrompt) opts.driver.submit(agent, 'initial'); }
+    startStage() { opts.driver.submit(this.agent, `replayed:${this.run.s.currentStage}`); }
+  })();
+  const life = new AuditLifecycle({ controller: c, driver, bindings, gitGateFactory: () => gate,
+    taskPacketLoader: () => ({ goal: 'g', approvedPlan: 'p', stages: ['T1', 'T2'], stageRequirements: {}, taskPacketHash: 'hash' }), executorFactory });
+  const r = await life.start({ chatId: 'chat-a', stopAfter: 'T1' });
+  r.run.markerMissing(); r.run.markerMissing();
+  assert.equal(r.run.s.state, 'PAUSED_NEEDS_USER');
+  const resumed = await life.resume(r.run.runId, { human: true });
+  assert.equal(resumed.run.s.state, 'EXECUTING');
+  assert.deepEqual(prompts, ['initial', 'replayed:T1']);
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);
