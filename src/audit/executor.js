@@ -49,7 +49,7 @@ export class AuditExecutor {
       ? `\n\n【本阶段要求（冻结任务书${run.manifest.taskPacketHash ? ` hash ${run.manifest.taskPacketHash.slice(0, 12)}` : ''}，逐条满足）】\n${reqs}`
       : '';
     const humanGate = /^B4$/i.test(String(run.s.currentStage))
-      ? '本阶段包含人工授权门：若执行到 B4_SEAL_APPROVAL，必须先输出独立的 [DSH-AUDIT WAITING_APPROVAL] 块，并明确说明正在等待人工批准；此时不要输出 READY_FOR_AUDIT。收到批准后只继续当前阶段并输出 marker。'
+      ? `\n\n本阶段包含人工授权门。到达人闸时必须输出以下严格块（不要输出 READY_FOR_AUDIT）：\n[DSH-AUDIT]\nSTATE: WAIT_HUMAN_APPROVAL\nRUN_ID: ${run.runId}\nSTAGE: B4\nITERATION: ${run.s.iteration}\nHOST_ID: ${run.manifest.hostId}\nQUESTION:\n<receipt_sha256 与任务书固定批准说明>\n收到批准后只继续当前阶段并输出 READY_FOR_AUDIT。`
       : '';
     return `${lead}请只执行当前阶段：完成代码修改后必须创建本地 commit；确认 HEAD 与该 commit 完全一致，然后只输出严格 READY_FOR_AUDIT marker——除 HEAD 与可选的 SUMMARY/TESTS 外，字段值必须与下面模板中给出的值完全一致（HEAD 填写该 commit 哈希）。不要进入下一阶段，不要输出 marker 以外的说明。${humanGate}${taskBlock}\n\n${tpl}`;
   }
