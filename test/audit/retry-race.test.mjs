@@ -18,13 +18,13 @@ await ok('in-flight retry serializes before stop; stop cannot overlap push', asy
   const x = setup(); await x.lifecycle.control('r1', (run) => run.resume(), 'resume'); const retry = x.fire();
   await new Promise((r) => setImmediate(r));
   const stop = x.lifecycle.control('r1', (run) => run.stop(), 'stop');
-  assert.deepEqual(x.events, ['run.resume', 'retry.enter', 'push.start']);
+  assert.deepEqual(x.events, ['run.resume', 'retry.cancel', 'retry.enter', 'push.start']);
   x.release(); await retry; await stop;
-  assert.deepEqual(x.events, ['run.resume', 'retry.enter', 'push.start', 'push.finish', 'remote.result', 'retry.cancel', 'executor.stop', 'run.stop']);
+  assert.deepEqual(x.events, ['run.resume', 'retry.cancel', 'retry.enter', 'push.start', 'push.finish', 'remote.result', 'retry.cancel', 'executor.stop', 'run.stop']);
 });
 await ok('stop first detaches executor; later retry is ignored and never pushes', async () => {
   const x = setup(); await x.lifecycle.control('r1', (run) => run.stop(), 'stop');
   const result = await x.lifecycle.retry('r1'); assert.deepEqual(result, { ignored: true });
-  assert.deepEqual(x.events, ['retry.cancel', 'executor.stop', 'run.stop']);
+  assert.deepEqual(x.events, ['retry.cancel', 'executor.stop', 'run.stop', 'retry.cancel']);
 });
 console.log(`\n${pass} passed, ${fail} failed`); process.exitCode = fail ? 1 : 0;

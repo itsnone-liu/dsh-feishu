@@ -245,15 +245,23 @@ export class AuditRun {
     this.s.waitingForHuman = false;
     this.s.waitingReason = null;
     this.s.waitingApprovalHash = null;
+    this.s.waitingQuestion = null; // R1 F1：随人闸解除一并清空
     this.#touch(); this.store.saveState(this.s);
   }
 
-  markWaitingForHuman(reason = 'B4_SEAL_APPROVAL', approvalHash = null) {
+  /**
+   * R1 F1：question（WAIT 块 QUESTION 段原文）随 run state 持久化，供人闸
+   * 等待通知完整呈现。可选字段：旧 state 无此字段读出 undefined，不影响
+   * 序列化/恢复兼容。
+   */
+  markWaitingForHuman(reason = 'B4_SEAL_APPROVAL', approvalHash = null, question = null) {
     this.#assertNotTerminal();
     if (this.s.state !== 'EXECUTING') throw new IllegalTransitionError(this.s.state, 'WAITING_FOR_HUMAN');
     this.s.waitingForHuman = true;
     this.s.waitingReason = reason;
     this.s.waitingApprovalHash = approvalHash;
+    this.s.waitingQuestion = question == null ? null
+      : (Array.isArray(question) ? question.join('\n') : String(question));
     this.#touch(); this.store.saveState(this.s);
     this.#emit('NEED_USER', { reason });
     return { waitingForHuman: true, reason };

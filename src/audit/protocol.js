@@ -16,6 +16,17 @@ export const HANDOFF_TAG = '[DSH-AUDIT HANDOFF]';
 export const SEAL_APPROVAL_RE = /^我明确批准 SEAL_ANNOTATION_ONLY receipt exact hash:\n([0-9a-f]{64})\n\n该批准仅授权当前 session \/ reveal \/ attempt 所绑定的\n这一份 exact receipt bytes，不授权任何其他 receipt、REVEAL、\noutcome 或 next ordinal。$/i;
 export const sealApprovalHash = (text) => String(text ?? '').trim().match(SEAL_APPROVAL_RE)?.[1] ?? null;
 
+/**
+ * R1 止血 F1：按 SEAL_APPROVAL_RE 冻结语义构造含真实 hash 的完整可复制批准话术。
+ * 纯构造器，不改变 SEAL_APPROVAL_RE 的匹配语义；返回值必须能通过
+ * sealApprovalHash 校验并取回同一 hash（r1-hotfix 测试双向锁定）。
+ * hash 非 64 位十六进制时返回 null —— 不生成注定校验失败的话术。
+ */
+export function buildSealApprovalText(hash) {
+  if (!/^[0-9a-f]{64}$/i.test(String(hash ?? ''))) return null;
+  return `我明确批准 SEAL_ANNOTATION_ONLY receipt exact hash:\n${hash}\n\n该批准仅授权当前 session / reveal / attempt 所绑定的\n这一份 exact receipt bytes，不授权任何其他 receipt、REVEAL、\noutcome 或 next ordinal。`;
+}
+
 export const EXECUTOR_MARKER_STATES = ['READY_FOR_AUDIT'];
 export const EXECUTOR_WAIT_STATES = ['WAIT_HUMAN_APPROVAL'];
 export const VERDICT_STATES = ['APPROVE', 'REVISE', 'NEED_USER'];

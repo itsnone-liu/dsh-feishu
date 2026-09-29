@@ -10,17 +10,20 @@
 import { AuditRun } from './state-machine.js';
 import { AuditExecutor } from './executor.js';
 import { GitRemoteGate } from './git-gate.js';
+import { buildSealApprovalText } from './protocol.js';
 import { loadTaskPacket } from './task-packet.js';
 import { AuditRetryScheduler } from './retry-scheduler.js';
 
 export class AuditLifecycle {
-  constructor({ controller, driver, bindings, onProgress = null, watchdogMs = 5 * 60_000, gitGateFactory = (opts) => new GitRemoteGate(opts), executorFactory = (opts) => new AuditExecutor(opts), taskPacketLoader = loadTaskPacket, retryScheduler = null, onError = null } = {}) {
+  constructor({ controller, driver, bindings, onProgress = null, watchdogMs = 5 * 60_000, gitGateFactory = (opts) => new GitRemoteGate(opts), executorFactory = (opts) => new AuditExecutor(opts), taskPacketLoader = loadTaskPacket, retryScheduler = null, onError = null, reviewTimeoutMs = 20 * 60_000, gitTimeoutMs = 120_000 } = {}) {
     this.controller = controller;
     this.driver = driver;
     this.onError = onError;
     this.bindings = bindings;
     this.onProgress = onProgress;
     this.watchdogMs = watchdogMs;
+    this.reviewTimeoutMs = reviewTimeoutMs; // R1 F4：reviewer.review 硬超时（默认 20min，可注入；测试传 1ms）
+    this.gitTimeoutMs = gitTimeoutMs;       // R1 F4：git 子进程硬超时（透传 gitGateFactory）
     this.gitGateFactory = gitGateFactory;
     this.executorFactory = executorFactory;
     this.taskPacketLoader = taskPacketLoader;
@@ -39,6 +42,24 @@ export class AuditLifecycle {
   #notify(run, event, detail = {}) {
     this.activity.set(run.runId, { at: Date.now(), warned: event === 'WATCHDOG_TIMEOUT' });
     try { this.onProgress?.({ runId: run.runId, chatId: run.manifest.chatId, stage: run.s.currentStage, state: run.s.state, event, ...detail }); } catch {}
+  }
+
+  /**
+   * R1 止血 F1：人闸等待的完整通知 detail。此前 onProgress 只有一行状态摘要，
+   * 用户看不到问题、hash 与批准话术 —— 人闸等同静默死锁。话术由
+   * protocol.buildSealApprovalText 按 SEAL_APPROVAL_RE 冻结语义构造
+   * （sealApprovalHash 可校验回同一 hash）；旧 state 无 waitingQuestion 字段
+   * 读出 undefined → null，兼容。
+   */
+  #humanWaitDetail(run) {
+    const hash = run.s.waitingApprovalHash ?? null;
+    return {
+      reason: run.s.waitingReason ?? null,
+      question: run.s.waitingQuestion ?? null,
+      approvalHash: hash,
+      approvalTemplate: hash ? buildSealApprovalText(hash) : null,
+      stopHint: '/audit stop',
+    };
   }
 
   #watchdog() {
@@ -89,7 +110,7 @@ export class AuditLifecycle {
       throw Object.assign(new Error('dedicated audit DSH session is busy'), { code: 'AUDIT_SESSION_OCCUPIED' });
     }
 
-    const gate = this.gitGateFactory({ cwd: binding.cwd });
+    const gate = this.gitGateFactory({ cwd: binding.cwd, timeoutMs: this.gitTimeoutMs });
     const packet = taskPacket ?? this.taskPacketLoader(binding.cwd);
     const stageList = packet.stages;
     const stopAfterCanonical = stageList.find((s) => s.toLowerCase() === String(stopAfter ?? '').toLowerCase());
@@ -188,7 +209,7 @@ export class AuditLifecycle {
     if (agent.status !== 'idle') {
       throw Object.assign(new Error('绑定的 DSH session 当前正在运行；/audit next 不会并发或偷偷 fork'), { code: 'AUDIT_SESSION_OCCUPIED' });
     }
-    const gate = this.gitGateFactory({ cwd: binding.cwd });
+    const gate = this.gitGateFactory({ cwd: binding.cwd, timeoutMs: this.gitTimeoutMs });
     const packet = this.taskPacketLoader(binding.cwd);
     // 任务链一致性：工作区任务书哈希必须与父链一致（改了任务书 → 显式拒绝，fail closed）。
     if (pm.taskPacketHash && packet.taskPacketHash !== pm.taskPacketHash) {
@@ -231,7 +252,7 @@ export class AuditLifecycle {
     return f ? `${run.runId}|${f.stage ?? run.s.currentStage}|${f.iteration ?? run.s.iteration}|${f.headCommit}` : null;
   }
 
-  #maybeAutoReviewLocked(runId) {
+  async #maybeAutoReviewLocked(runId) {
     const run = this.liveRuns.get(runId);
     const executor = this.executors.get(runId);
     if (!run || !executor || run.s.state !== 'AUDITING' || !run.s.auditInFlight) return { skipped: true };
@@ -241,7 +262,50 @@ export class AuditLifecycle {
     if (key) this.reviewRounds.set(runId, key);
     // Infrastructure failure keeps the round key latched: duplicate triggers stay deduped
     // and only an explicit review()/resume can retry this round (fail-closed).
-    return this.#reviewLocked(runId, this.reviewer);
+    const result = await this.#reviewLocked(runId, this.reviewer);
+    this.#notifyVerdictOutcome(runId, result); // R1 F2：自动审核的裁决结果不再静默
+    return result;
+  }
+
+  /**
+   * R1 止血 F2：自动审核路径的裁决结果通知。此前只有 executor 事件通知，
+   * verdict 落地（NEED_USER / 轮次耗尽 / 到达停止点 / 阶段推进）对聊天全程
+   * 静默 —— 生产曾 31 分钟无人知晓。只读 lastVerdict 与 run 现态，绝不改
+   * 审核编排本身；通知异常被吞（不得影响审核结果传播）。
+   */
+  #notifyVerdictOutcome(runId, result) {
+    try {
+      const run = this.liveRuns.get(runId);
+      if (!run || !result) return;
+      if (result.deduped || result.skipped || result.timedOut || result.retry || result.failed) return;
+      const v = run.s.lastVerdict;
+      if (!v) return;
+      const join = (x) => (Array.isArray(x) ? x.join('\n') : (x ?? null));
+      const detail = { verdictState: v.state, summary: join(v.summary) };
+      if (result.needUser) {
+        this.#notify(run, 'VERDICT_NEED_USER', {
+          ...detail,
+          question: join(v.question),
+          nextStep: '请直接回复本会话回答上述问题（同轮审核已保留）；处理后 `/audit resume` 继续，或 `/audit stop` 退出。',
+        });
+      } else if (result.exhausted) {
+        this.#notify(run, 'VERDICT_REVISE_LOOP_EXHAUSTED', {
+          ...detail,
+          nextStep: 'REVISE 轮次已达上限（不自动归零）：`/audit resume <N>` 提高上限继续修复，或 `/audit stop` 结束。',
+        });
+      } else if (result.stopped) {
+        this.#notify(run, 'VERDICT_TARGET_REACHED', {
+          ...detail,
+          nextStep: '已到达停止点（审计通过）：`/audit next` 延续下一阶段（若有），或 `/audit status` 查看详情。',
+        });
+      } else if (result.advanced) {
+        this.#notify(run, 'VERDICT_STAGE_ADVANCED', {
+          ...detail,
+          stage: run.s.currentStage,
+          nextStep: `阶段已 APPROVE，执行器开始下一阶段 ${run.s.currentStage}（iteration 1）。`,
+        });
+      }
+    } catch { /* 通知失败不影响审核编排 */ }
   }
 
   async #reviewLocked(runId, reviewer) {
@@ -254,8 +318,19 @@ export class AuditLifecycle {
     const packet = { runId, hostId: run.manifest.hostId, stage, iteration: inFlight.iteration ?? run.s.iteration, repo: run.manifest.repo, branch: run.manifest.branch, targetCommit: inFlight.headCommit, baseCommit: run.s.stageBaseCommit, goal: run.manifest.goal, stageRequirement: run.manifest.stageRequirements?.[stage] ?? null };
     for (;;) {
       let verdict;
-      try { verdict = await reviewer.review(packet); }
+      try { verdict = await this.#reviewWithTimeout(packet, reviewer); }
       catch (e) {
+        if (e?.code === 'AUDIT_REVIEW_TIMEOUT') {
+          // R1 止血 F4：review 挂起会把该 run 的 stop/pause/resume/onEvent 全部
+          // 排到同一 #serial 队列后永不完成。硬超时按 infra 失败处理：
+          // reviewRounds latch 保留（重复触发保持 dedupe，不重置、不自动重发），
+          // 只有显式 review()/resume 可重试本轮；通知聊天给出下一步动作。
+          this.#notify(run, 'REVIEW_TIMEOUT', {
+            stage, iteration: packet.iteration, timeoutMs: this.reviewTimeoutMs,
+            nextStep: '审核超时已按基础设施失败处理（本轮已保留）：`/audit resume` 重发审核，或 `/audit stop` 退出。',
+          });
+          return { timedOut: true };
+        }
         if (e?.code === 'AUDIT_VERDICT_MALFORMED' || e?.code === 'AUDIT_VERDICT_MISSING') {
           const missing = run.verdictMissing();
           if (missing.retry) continue;
@@ -265,6 +340,29 @@ export class AuditLifecycle {
       }
       return executor.applyVerdict(runId, verdict);
     }
+  }
+
+  /**
+   * R1 止血 F4：reviewer.review 硬超时包装。超时 = infra 失败（不消耗
+   * verdict 重试、不动 reviewRounds latch、不自动重发）。底层 promise 无法
+   * 取消：race 已订阅，其最终 settle 的结果被丢弃（本轮已按超时收敛）。
+   */
+  #reviewWithTimeout(packet, reviewer) {
+    const ms = Number(this.reviewTimeoutMs);
+    const reviewP = Promise.resolve().then(() => reviewer.review(packet));
+    if (!Number.isFinite(ms) || ms <= 0) return reviewP;
+    let timer = null;
+    return Promise.race([
+      reviewP,
+      new Promise((_, reject) => {
+        // 注意不 unref：in-flight review 的超时定时器必须参与事件循环
+        // （否则在只剩该定时器的进程里 loop 直接排空、race 永不裁决）。
+        timer = setTimeout(() => reject(Object.assign(
+          new Error(`review exceeded hard timeout after ${ms}ms`),
+          { code: 'AUDIT_REVIEW_TIMEOUT' },
+        )), ms);
+      }),
+    ]).finally(() => clearTimeout(timer));
   }
 
   async applyVerdict(runId, verdict) {
@@ -288,10 +386,15 @@ export class AuditLifecycle {
       if (!run) throw Object.assign(new Error(`live run not found: ${runId}`), { code: 'AUDIT_RUN_NOT_FOUND' });
       if (action === 'stop') {
         this.retryScheduler.cancel(runId);
+        // R1 止血 F7：先向底层在跑 turn 发出取消意图（同步发起即返回，不等待
+        // 取消完成），再摘除 executor 监听 —— 否则 stop/pause 后底层 turn 继续
+        // 跑完，副作用照常发生。
+        this.executors.get(runId)?.cancel?.(runId);
         this.executors.get(runId)?.stop(runId);
         this.executors.delete(runId);
       } else if (action === 'pause') {
         this.retryScheduler.cancel(runId);
+        this.executors.get(runId)?.cancel?.(runId); // R1 F7：pause 同样取消在跑 turn（resume 时补发 prompt）
       }
       const result = await operation(run);
       if (action === 'resume' && result?.ignored) return result;
@@ -326,7 +429,7 @@ export class AuditLifecycle {
       old.resumeFromHuman({});
     }
     this.liveRuns.set(runId, old);
-    const gate = this.gitGateFactory({ cwd: old.manifest.cwd });
+    const gate = this.gitGateFactory({ cwd: old.manifest.cwd, timeoutMs: this.gitTimeoutMs });
     const executor = this.executorFactory({
       driver: this.driver, gitGate: gate,
       onTransient: this.retryScheduler ? (entry, _result, attempt) => this.#scheduleRetry(entry.run.runId, attempt) : null,
@@ -356,11 +459,19 @@ export class AuditLifecycle {
 
   async retry(runId) {
     return this.#serial(runId, async () => {
-      const before = this.liveRuns.get(runId);
-      const wasWaiting = before?.s.state === 'WAIT_GIT_PUSH';
+      // R1 修复：进入 retry 先取消该 run 已排定的自动重试定时器。
+      // 场景：executor onTransient 排了 30s 退避，人工/恢复路径直接 retry 成功推进
+      // ——残留定时器到期后对健康 run 再跑一次（executor 层虽 ignored，但 ref'd
+      // 定时器会拖住进程/测试事件循环 30s+）。schedule() 自身会先 cancel，这里
+      // 覆盖"不经过 schedule 的直接 retry"路径，与 control() 的取消对称。
+      try { this.retryScheduler?.cancel(runId); } catch { /* 取消失败不阻塞 retry */ }
       const result = await (this.executors.get(runId)?.retry(runId) ?? { ignored: true });
       const run = this.liveRuns.get(runId);
-      if (run && wasWaiting && run.s.state === 'AUDITING') await this.#maybeAutoReviewLocked(runId);
+      // R1 止血 F5/D1：自动审核触发条件从前置态 wasWaiting 改为后置态判断 ——
+      // 崩溃恢复（restoreActive→resume）重建的 run 在 EXECUTING+pendingRemoteSync
+      // 上完成 retry 后同样进入 AUDITING，旧前置守卫令该路径永不触发审核。
+      // #maybeAutoReviewLocked 自带 reviewRounds dedupe，不会重复审。
+      if (run && run.s.state === 'AUDITING' && run.s.auditInFlight) await this.#maybeAutoReviewLocked(runId);
       return result;
     });
   }
@@ -380,7 +491,11 @@ export class AuditLifecycle {
         if (r?.turnEnded === true) await this.#maybeAutoReviewLocked(runId);
         const current = this.liveRuns.get(runId);
         if (current && (r?.turnEnded || r?.ready || r?.advanced || r?.retry || r?.paused || r?.waitingForHuman)) {
-          this.#notify(current, r?.ready ? 'READY_FOR_AUDIT' : (r?.waitingForHuman ? 'WAITING_FOR_HUMAN' : (r?.paused ? 'PAUSED' : 'EXECUTOR_EVENT')), { result: r });
+          const event = r?.ready ? 'READY_FOR_AUDIT' : (r?.waitingForHuman ? 'WAITING_FOR_HUMAN' : (r?.paused ? 'PAUSED' : 'EXECUTOR_EVENT'));
+          this.#notify(current, event, {
+            result: r,
+            ...(event === 'WAITING_FOR_HUMAN' ? this.#humanWaitDetail(current) : {}), // R1 F1
+          });
         }
         return r;
       });
@@ -434,14 +549,21 @@ export class AuditLifecycle {
     const replayMarkerPrompt = human
       && run.s.state === 'PAUSED_NEEDS_USER'
       && run.s.cause === 'MARKER_PARSE_FAILED';
+    // R1 止血 F5：/audit pause 后的 PAUSED 也是 resume 的合法目标 —— 此前只
+    // 处理 PAUSED_NEEDS_USER，PAUSED 恢复落空、run 永远停摆。只在 human=true
+    // （显式 /audit resume）时转移：restoreActive（human=false）不得把用户
+    // 亲手暂停的 run 在桥重启后自动放行。
+    const resumedFromPause = human && run.s.state === 'PAUSED';
     if (human && run.s.state === 'PAUSED_NEEDS_USER') {
       if (run.s.cause === 'MARKER_PARSE_FAILED') run.markHumanResumeCycle();
       if (run.s.cause === 'HISTORY_REWRITTEN') {
         throw Object.assign(new Error('history was rewritten: explicit new baseline required'), { code: 'AUDIT_BASELINE_REQUIRED' });
       }
       run.resumeFromHuman({ bumpReviewIterations });
+    } else if (resumedFromPause) {
+      run.resume();
     }
-    const gate = this.gitGateFactory({ cwd: run.manifest.cwd });
+    const gate = this.gitGateFactory({ cwd: run.manifest.cwd, timeoutMs: this.gitTimeoutMs });
     const executor = this.executorFactory({
       driver: this.driver, gitGate: gate,
       onTransient: this.retryScheduler ? (entry, _result, attempt) => this.#scheduleRetry(entry.run.runId, attempt) : null,
@@ -464,6 +586,16 @@ export class AuditLifecycle {
       && run.s.headCommit === run.s.lastVerdict.headCommit;
     if (reviseRecovery) {
       executor.startStage(runId);
+    } else if (resumedFromPause
+      && run.s.state === 'EXECUTING'
+      && agent.status === 'idle'
+      && !run.s.pendingRemoteSync
+      && !run.s.waitingForHuman) {
+      // R1 止血 F5（D4 同款）：暂停被取消的 turn 不会再来事件 —— 恢复后若
+      // 执行端 idle 静坐，必须补发当前阶段 prompt，否则没人再驱动该 run。
+      // 范围仅限 PAUSED→resume 路径：EXECUTING 的重启重挂必须保持「不重复
+      // 发送 stage prompt」的既有冻结语义（lifecycle-e2e）。
+      executor.startStage?.(runId);
     }
     if (run.s.pendingRemoteSync) {
       this.#scheduleRetry(runId, run.s.retry.pushAttempts);

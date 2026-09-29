@@ -106,6 +106,11 @@ const DEFAULTS = {
    * web 子块只含传输参数，不含任何 orchestration 语义（A4 冻结边界）。 */
   audit: {
     reviewer: '',
+    /** R1 F4：reviewer.review 硬超时（默认 20min）。挂起的 review 会把该 run
+     * 的全部控制操作排死在串行队列上，必须能按 infra 失败收敛。 */
+    reviewTimeoutMs: 20 * 60_000,
+    /** R1 F4：audit 链路 git 子进程硬超时（默认 120s），并禁止凭据交互提示。 */
+    gitTimeoutMs: 120_000,
     web: {
       baseUrl: 'http://127.0.0.1:8787',
       model: 'gpt-5.6-luna',

@@ -18,16 +18,26 @@ await ok('live pause/resume/until/stop cards use one live run and preserve resul
   const created = controller.createRun({ stopAfter: 'T2', chatId: 'chat-a' });
   const run = AuditRun.open(store, { now: Date.now })(created.runId);
   const retry = { cancel() {}, schedule() {} };
-  const lifecycle = new AuditLifecycle({ controller, driver: { submit() {} }, bindings: new Map(), retryScheduler: retry, executorFactory: () => ({ stop() {} }) });
+  // R1 修复：resume 现行契约要求 owner binding、driver.ensure（回 idle agent）
+  // 与 executor.start —— 旧 fixture 缺这三样，resume 必然 binding mismatch。
+  const agent = { id: 's-exec', status: 'idle' };
+  const driver = { ensure: async () => agent, submit() {} };
+  const lifecycle = new AuditLifecycle({
+    controller, driver,
+    bindings: new Map([['chat-a', { sessionId: 's-obs', cwd: '/w' }]]),
+    retryScheduler: retry,
+    executorFactory: () => ({ start: async () => ({}), startStage() {}, stop() {} }),
+  });
   lifecycle.liveRuns.set(created.runId, run);
-  lifecycle.executors.set(created.runId, { stop() {} });
+  lifecycle.executors.set(created.runId, { start: async () => ({}), startStage() {}, stop() {} });
   controller.lifecycle = lifecycle;
   const transport = new MockTransport({});
   const commands = new Commands({ config: {}, store: null, driver: null, renderer: null, transport, permissionPresets: {}, llm: null, agentPresets: {}, auditController: controller });
   for (const text of ['/audit pause', '/audit resume', '/audit until T2', '/audit stop']) {
     assert.equal(await commands.handle('chat-a', text), true);
   }
-  assert.equal(run.s.state, 'STOPPED');
+  // resume 会从磁盘重载 run 并替换 liveRuns 条目 —— 终态必须以 store 为准。
+  assert.equal(AuditRun.open(store, { now: Date.now })(created.runId).s.state, 'STOPPED');
   assert.equal(transport.sent.length, 4);
   assert.match(JSON.stringify(transport.sent[0].card), /PAUSED/);
   assert.match(JSON.stringify(transport.sent[1].card), /EXECUTING/);

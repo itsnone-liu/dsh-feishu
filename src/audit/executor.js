@@ -69,6 +69,23 @@ export class AuditExecutor {
 
   stop(runId) { this.runs.delete(runId); }
 
+  /**
+   * R1 止血 F7：stop/pause 传播取消 —— 对底层 DSH agent 的在跑 turn 发起
+   * cancel（kind:'user' + keepInbox:true，与 driver.stop 同语义，参考
+   * driver.js）。cancel 是异步回调式：这里同步发起即返回，不等待取消完成。
+   * agent 无 cancel 接口（测试 stub）时静默忽略。
+   */
+  cancel(runId) {
+    const entry = this.runs.get(runId);
+    if (!entry || typeof entry.agent?.cancel !== 'function') return { ignored: true };
+    try {
+      entry.agent.cancel({ kind: 'user' }, { keepInbox: true });
+      return { cancelled: true, sessionId: entry.agent.id };
+    } catch (e) {
+      return { ignored: true, error: String(e?.message ?? e) };
+    }
+  }
+
   async retry(runId) {
     const entry = this.runs.get(runId);
     if (!entry || !entry.run.s.pendingRemoteSync) return { ignored: true };
@@ -135,7 +152,9 @@ export class AuditExecutor {
       try {
         const waiting = parseHumanApprovalWait(text);
         if (waiting.runId === entry.run.runId && waiting.stage === entry.run.s.currentStage && waiting.iteration === entry.run.s.iteration) {
-          const result = entry.run.markWaitingForHuman('B4_SEAL_APPROVAL', text.match(/[0-9a-f]{64}/i)?.[0] ?? null);
+          // R1 F1：question（QUESTION 段原文）随 state 持久化（waitingQuestion），
+          // 人闸通知才能完整呈现"等待什么、批什么"。
+          const result = entry.run.markWaitingForHuman('B4_SEAL_APPROVAL', text.match(/[0-9a-f]{64}/i)?.[0] ?? null, waiting.question);
           return { ...result, event: 'WAITING_FOR_HUMAN', question: waiting.question };
         }
       } catch {}

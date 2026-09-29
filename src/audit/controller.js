@@ -399,11 +399,28 @@ export class AuditController {
     const id = t.id;
     if (!id) return { ok: false, code: 'AUDIT_NO_ACTIVE_RUN', message: '没有活跃的审计运行可修改停止点。' };
     if (!target) return { ok: false, code: 'AUDIT_ARG_INVALID', message: '用法：`/audit until <阶段>`' };
+    if (this.lifecycle?.liveRuns?.has(id)) {
+      // R1 止血 F6：真实 run 的停止点校验用 run.manifest.stages（冻结任务书
+      // 阶段表，如 B4/G）——此前用 controller 默认表（T1/T2/T3），真实任务
+      // 阶段全部被拒。§6.2 语义（target ∈ stages 且 index ≥ currentStage）
+      // 仍全部由内核 manifest.changeStopAfter 执行，其具体错误经 #control
+      // 原样透传（code/message 不改写）。
+      return this.#control(id, (run) => {
+        const stages = run.manifest.stages;
+        const canonical = stages.find((x) => x.toLowerCase() === String(target).toLowerCase());
+        if (!canonical) {
+          throw Object.assign(new Error(`停止点 \`${target}\` 不在阶段表 [${stages.join(', ')}] 中`), { code: 'AUDIT_MANIFEST_INVALID' });
+        }
+        // 其余 §6.2 校验（index ≥ currentStage 等）由内核 changeStopAfter 执行，错误透传。
+        const r = run.until(canonical);
+        return { changed: r.changed, stopAfter: run.s.stopAfter };
+      }, 'until');
+    }
+    // A2 stub 路径（无 lifecycle manifest 的 run）：保持默认表行为。
     const canonical = this.resolveStage(target);
     if (!canonical) {
       return { ok: false, code: 'AUDIT_MANIFEST_INVALID', message: `停止点 \`${target}\` 不在阶段表 [${this.stages.join(', ')}] 中。` };
     }
-    if (this.lifecycle?.liveRuns?.has(id)) return this.#control(id, (run) => { const r = run.until(canonical); return { changed: r.changed, stopAfter: run.s.stopAfter }; }, 'until');
     return this.#call(id, (run) => {
       const r = run.until(canonical);
       return { changed: r.changed, stopAfter: run.s.stopAfter };

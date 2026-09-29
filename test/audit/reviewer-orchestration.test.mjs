@@ -26,7 +26,7 @@ const setup = (x, opts = {}) => {
   const packet = { goal: 'g', approvedPlan: 'p', stages: ['T1', 'T2'], stageRequirements: { T1: 'r1', T2: 'r2' }, taskPacketHash: 'ph' };
   const reviewer = new FakeWebAuditRunner({ script });
   reviewer.script = script;
-  const lifecycle = new AuditLifecycle({ controller, driver, bindings: new Map([['chat-a', { sessionId: 'session-fixed', cwd: x.work }]]), gitGateFactory: (o) => new GitRemoteGate({ ...o, allowNonGithubRemote: true }), taskPacketLoader: () => packet });
+  const lifecycle = new AuditLifecycle({ controller, driver, bindings: new Map([['chat-a', { sessionId: 'session-fixed', cwd: x.work }]]), gitGateFactory: (o) => new GitRemoteGate({ ...o, allowNonGithubRemote: true }), taskPacketLoader: () => packet, reviewTimeoutMs: 200 }); // R1 F4：注入短 review 超时——本文件有"reviewer 永久挂起模拟崩溃"用例，默认 20min 超时定时器会吊住测试进程事件循环（超时必须 ref'd 才能在生产触发，进程退出问题由测试侧注入解决）。
   lifecycle.reviewer = reviewer;
   const commit = (file, text, msg) => { fs.writeFileSync(path.join(x.work, file), text); git(x.work, 'add', file); git(x.work, 'commit', '-m', msg); return git(x.work, 'rev-parse', 'HEAD'); };
   const send = async (head, stage, iter, turn) => {

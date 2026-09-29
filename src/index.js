@@ -33,6 +33,7 @@ import { installSelfGuard } from './selfguard.js';
 import { installVisionTool } from './vision-tool.js';
 import { AuditController } from './audit/controller.js';
 import { AuditLifecycle } from './audit/lifecycle.js';
+import { buildInfoCard, buildErrorCard } from './cards.js';
 
 const name = 'feishu-bridge';
 
@@ -99,13 +100,53 @@ function apply(ctx, config) {
       commands.auditController = new AuditController({
         hostId: process.env.HOST_ID,
       });
+      // R1 止血 F1/F2：人闸等待与裁决结果用专用卡片（问题、hash、可复制批准
+      // 话术、退出/下一步提示）；其余事件保持单行进度镜像。
+      const auditNoticeCard = (p) => {
+        const lines = [`run：\`${p.runId}\`（阶段 **${p.stage}** · ${p.state}）`];
+        if (p.reason) lines.push(`等待原因：\`${p.reason}\``);
+        if (p.question) lines.push('', '**问题**', '```', String(p.question), '```');
+        if (p.approvalHash) lines.push('', `批准 hash：\`${p.approvalHash}\``);
+        if (p.approvalTemplate) lines.push('', '**如批准，请整段复制以下话术直接回复本会话**（必须一字不差）：', '```', p.approvalTemplate, '```');
+        if (p.summary) lines.push('', '**审核摘要**', '```', String(p.summary), '```');
+        if (p.nextStep) lines.push('', `下一步：${p.nextStep}`);
+        if (p.stopHint) lines.push('', `退出审计：\`${p.stopHint}\``);
+        const title = p.event === 'WAITING_FOR_HUMAN' || p.event === 'NEED_USER' || p.event === 'VERDICT_NEED_USER'
+          ? '⏸ 审计等待人工处理'
+          : (p.event === 'VERDICT_REVISE_LOOP_EXHAUSTED' ? '⚠️ 审计 REVISE 轮次耗尽'
+            : (p.event === 'VERDICT_TARGET_REACHED' ? '✅ 审计到达停止点' : '🧾 审计裁决'));
+        return buildInfoCard(title, lines.join('\n'), { template: p.event === 'VERDICT_TARGET_REACHED' ? 'green' : 'orange' });
+      };
+      const AUDIT_NOTICE_EVENTS = new Set([
+        'NEED_USER', 'WAITING_FOR_HUMAN', 'REVIEW_TIMEOUT',
+        'VERDICT_NEED_USER', 'VERDICT_REVISE_LOOP_EXHAUSTED', 'VERDICT_TARGET_REACHED', 'VERDICT_STAGE_ADVANCED',
+      ]);
       commands.auditLifecycle = new AuditLifecycle({
         controller: commands.auditController,
         driver,
         bindings: store,
-        onProgress: (p) => transport.sendText(p.chatId,
-          `[Audit] ${p.runId} · ${p.stage} · ${p.state} · ${p.event}`)
-          .catch((e) => log.warn(`audit progress mirror: ${e.message}`)),
+        reviewTimeoutMs: cfg.audit?.reviewTimeoutMs, // R1 F4
+        gitTimeoutMs: cfg.audit?.gitTimeoutMs,       // R1 F4
+        onProgress: (p) => {
+          const send = AUDIT_NOTICE_EVENTS.has(p.event)
+            ? transport.sendCard(p.chatId, auditNoticeCard(p))
+            : transport.sendText(p.chatId, `[Audit] ${p.runId} · ${p.stage} · ${p.state} · ${p.event}`);
+          return send.catch((e) => log.warn(`audit progress mirror: ${e.message}`));
+        },
+        // R1 止血 F3：单 run 恢复失败发卡到该 run 的 owner chat（runId、失败
+        // 原因、补救指引 /audit rebind 或 /audit stop）；找不到 chat 时
+        // log.error 兜底，绝不让失败只沉在 restoreActive 的 errors 数组里。
+        onError: (error, runId) => {
+          const chatId = commands.auditController.store.loadRun(runId)?.manifest.chatId ?? null;
+          const text = `run \`${runId}\` 恢复失败：[${error?.code ?? 'AUDIT_RESTORE_FAILED'}] ${error?.message ?? error}`;
+          if (!chatId) {
+            log.error(`audit restore failed (no chat bound): ${text}`);
+            return;
+          }
+          transport.sendCard(chatId, buildErrorCard('审计运行恢复失败',
+            `${text}\n\n补救：\`/audit rebind\` 迁移到新的专用审计 session，或 \`/audit stop\` 终止后重新 /audit <阶段> 开始。`))
+            .catch((e) => log.error(`audit restore-failure card send failed: ${e.message}; ${text}`));
+        },
       });
       commands.auditController.lifecycle = commands.auditLifecycle;
       // A5：真实 Web 审核器接入 —— 只注入 reviewer 实例，不改 A4 冻结 orchestration。
@@ -118,7 +159,7 @@ function apply(ctx, config) {
           // A5.5（A′）：verified git evidence bundle —— fact source 仍是 GitHub
           // @TARGET_COMMIT，transport 改为桥生成的 object-db 证据包。
           evidence: {
-            provider: new GitEvidenceProvider(),
+            provider: new GitEvidenceProvider({ timeoutMs: cfg.audit?.gitTimeoutMs }), // R1 F4
             resolve: (runId) => commands.auditController.resolveRunContext(runId),
           },
           execTest: cfg.audit.execTest ?? null,

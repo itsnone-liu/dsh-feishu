@@ -35,16 +35,23 @@ export class GitEvidenceProvider {
     maxFileBytes = 64 * 1024,
     maxTotalBytes = 512 * 1024,
     maxPatchBytes = 256 * 1024,
+    timeoutMs = 120_000,
   } = {}) {
     this.git = git;
     this.execFileFn = execFileFn;
     this.maxFileBytes = maxFileBytes;
     this.maxTotalBytes = maxTotalBytes;
     this.maxPatchBytes = maxPatchBytes;
+    this.timeoutMs = timeoutMs; // R1 F4：audit.gitTimeoutMs（默认 120s）
   }
 
   async #git(args, cwd) {
-    const { stdout } = await this.execFileFn(this.git, args, { cwd, encoding: 'buffer', maxBuffer: 64 * 1024 * 1024 });
+    const { stdout } = await this.execFileFn(this.git, args, {
+      cwd, encoding: 'buffer', maxBuffer: 64 * 1024 * 1024,
+      // R1 F4：硬超时 + 禁止凭据交互提示（与 git-gate 同批止血）。
+      timeout: this.timeoutMs,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+    });
     return stdout;
   }
 

@@ -20,16 +20,22 @@ export class GitGateError extends Error {
 }
 
 export class GitRemoteGate {
-  constructor({ cwd, git = 'git', execFileFn = exec, allowNonGithubRemote = false } = {}) {
+  constructor({ cwd, git = 'git', execFileFn = exec, allowNonGithubRemote = false, timeoutMs = 120_000 } = {}) {
     this.cwd = cwd;
     this.git = git;
     this.execFile = execFileFn;
     this.allowNonGithubRemote = allowNonGithubRemote;
+    this.timeoutMs = timeoutMs; // R1 F4：audit.gitTimeoutMs（默认 120s）
   }
 
   async #git(args) {
     try {
-      const { stdout, stderr } = await this.execFile(this.git, args, { cwd: this.cwd, encoding: 'utf8' });
+      const { stdout, stderr } = await this.execFile(this.git, args, {
+        cwd: this.cwd, encoding: 'utf8',
+        // R1 F4：硬超时 + 禁止凭据交互提示 —— 挂起等待输入的 git 等同于死 gate。
+        timeout: this.timeoutMs,
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+      });
       return { stdout: String(stdout ?? '').trim(), stderr: String(stderr ?? '').trim() };
     } catch (e) {
       const detail = `${e.stderr ?? ''} ${e.stdout ?? ''} ${e.message ?? ''}`;
