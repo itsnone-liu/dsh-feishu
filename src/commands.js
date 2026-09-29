@@ -152,8 +152,20 @@ export class Commands {
       const raw = (arg ?? '').trim();
       const first = raw.split(/\s+/)[0]?.toLowerCase();
       const second = raw.split(/\s+/)[1] ?? null;
-      const management = new Set(['', 'status', 'pause', 'resume', 'stop', 'until', 'next']);
-      if (!raw && this.auditLifecycle) {
+      const management = new Set(['', 'status', 'pause', 'resume', 'stop', 'until', 'next', 'rebind']);
+      if (first === 'rebind' && this.auditLifecycle) {
+        const result = await this.auditController.rebind(chatId);
+        if (!result.ok) {
+          card = buildErrorCard(new Error(result.message));
+        } else {
+          card = buildInfoCard('🔗 审计 session 已迁移', [
+            `run：\`${result.runId}\``,
+            `状态：**${result.result.state}**`,
+            `审计 session：\`${result.result.auditSessionId}\``,
+            '普通对话 session 保留为观察/控制入口。',
+          ].join('\n'));
+        }
+      } else if (!raw && this.auditLifecycle) {
         // 裸 /audit 也必须走真实 A3 lifecycle；不得回落到 A2 stub。
         // 停止点由冻结 task packet 的最后阶段解析，避免 DEFAULT_STAGES 漂移。
         const packet = this.auditLifecycle.taskPacketLoader(
