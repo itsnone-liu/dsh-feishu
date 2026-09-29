@@ -103,6 +103,9 @@ function apply(ctx, config) {
         controller: commands.auditController,
         driver,
         bindings: store,
+        onProgress: (p) => transport.sendText(p.chatId,
+          `[Audit] ${p.runId} · ${p.stage} · ${p.state} · ${p.event}`)
+          .catch((e) => log.warn(`audit progress mirror: ${e.message}`)),
       });
       commands.auditController.lifecycle = commands.auditLifecycle;
       // A5：真实 Web 审核器接入 —— 只注入 reviewer 实例，不改 A4 冻结 orchestration。

@@ -96,6 +96,7 @@ export function createManifest(raw, now = Date.now) {
     runId,
     hostId: raw.hostId,
     chatId: raw.chatId ?? null,
+    observerSessionId: raw.observerSessionId ?? null,
     dshSessionId: raw.dshSessionId ?? null,
     cwd: raw.cwd,
 

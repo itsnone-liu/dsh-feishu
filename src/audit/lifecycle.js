@@ -14,11 +14,12 @@ import { loadTaskPacket } from './task-packet.js';
 import { AuditRetryScheduler } from './retry-scheduler.js';
 
 export class AuditLifecycle {
-  constructor({ controller, driver, bindings, gitGateFactory = (opts) => new GitRemoteGate(opts), executorFactory = (opts) => new AuditExecutor(opts), taskPacketLoader = loadTaskPacket, retryScheduler = null, onError = null } = {}) {
+  constructor({ controller, driver, bindings, onProgress = null, gitGateFactory = (opts) => new GitRemoteGate(opts), executorFactory = (opts) => new AuditExecutor(opts), taskPacketLoader = loadTaskPacket, retryScheduler = null, onError = null } = {}) {
     this.controller = controller;
     this.driver = driver;
     this.onError = onError;
     this.bindings = bindings;
+    this.onProgress = onProgress;
     this.gitGateFactory = gitGateFactory;
     this.executorFactory = executorFactory;
     this.taskPacketLoader = taskPacketLoader;
@@ -29,6 +30,10 @@ export class AuditLifecycle {
     this.busyRuns = new Set();
     this.reviewRounds = new Map();
     this.reviewer = null;
+  }
+
+  #notify(run, event, detail = {}) {
+    try { this.onProgress?.({ runId: run.runId, chatId: run.manifest.chatId, stage: run.s.currentStage, state: run.s.state, event, ...detail }); } catch {}
   }
 
   #scheduleRetry(runId, attempt) {
@@ -47,20 +52,24 @@ export class AuditLifecycle {
       });
     }
     const binding = this.bindings?.get(chatId);
-    if (!binding?.sessionId || !binding?.cwd) {
-      throw Object.assign(new Error('当前聊天必须已有绑定的 DSH session 和 workspace；A3 不会偷偷创建新 session'), { code: 'AUDIT_SESSION_REQUIRED' });
+    if (!binding?.cwd) {
+      throw Object.assign(new Error('当前聊天必须已有 workspace 绑定'), { code: 'AUDIT_SESSION_REQUIRED' });
     }
-    if (!this.driver?.ensure) throw Object.assign(new Error('DSH driver unavailable'), { code: 'AUDIT_EXECUTOR_CONFIG_INVALID' });
+    if (!this.driver?.ensureAuditSession && !this.driver?.ensure) throw Object.assign(new Error('dedicated audit session unavailable'), { code: 'AUDIT_EXECUTOR_CONFIG_INVALID' });
 
+    // The chat binding remains the observer/control session. The executor gets
+    // a separate durable DSH session so ordinary conversation can continue.
     let agent;
     try {
-      agent = await this.driver.ensure({ ...binding }, { allowCreate: false });
+      agent = this.driver.ensureAuditSession
+        ? await this.driver.ensureAuditSession({ cwd: binding.cwd })
+        : await this.driver.ensure({ ...binding }, { allowCreate: false });
     } catch (e) {
       if (e?.occupied) throw Object.assign(e, { code: 'AUDIT_SESSION_OCCUPIED' });
       throw Object.assign(e, { code: e.code ?? 'AUDIT_SESSION_RESUME_FAILED' });
     }
     if (agent.status !== 'idle') {
-      throw Object.assign(new Error('绑定的 DSH session 当前正在运行；A3 不会并发或偷偷 fork'), { code: 'AUDIT_SESSION_OCCUPIED' });
+      throw Object.assign(new Error('dedicated audit DSH session is busy'), { code: 'AUDIT_SESSION_OCCUPIED' });
     }
 
     const gate = this.gitGateFactory({ cwd: binding.cwd });
@@ -77,7 +86,8 @@ export class AuditLifecycle {
     let runId = `audit_${stamp}`;
     for (let n = 2; this.controller.store.loadRun(runId); n += 1) runId = `audit_${stamp}_${n}`;
     const run = AuditRun.create(this.controller.store, {
-      runId, hostId: this.controller.hostId, chatId, dshSessionId: agent.id,
+      runId, hostId: this.controller.hostId, chatId,
+      observerSessionId: binding.sessionId ?? null, dshSessionId: agent.id,
       cwd: git.cwd, repo: git.repo, branch: git.branch,
       stages: stageList, stopAfter: stopAfterCanonical,
       startingCommit: git.head, stageBaseCommit: git.head,
@@ -91,6 +101,7 @@ export class AuditLifecycle {
     this.executors.set(runId, executor);
     this.liveRuns.set(runId, run);
     await executor.start({ run, agent, gitGate: gate });
+    this.#notify(run, 'EXECUTOR_STARTED', { auditSessionId: agent.id, observerSessionId: binding.sessionId ?? null });
     return { run, executor, agent, git };
   }
 
@@ -174,7 +185,8 @@ export class AuditLifecycle {
     for (let n = 2; this.controller.store.loadRun(runId); n += 1) runId = `audit_${stamp}_${n}`;
     const completedStages = [...(pm.completedStages ?? []), pm.stages[lastDoneIdx]];
     const run = AuditRun.create(this.controller.store, {
-      runId, hostId: this.controller.hostId, chatId, dshSessionId: agent.id,
+      runId, hostId: this.controller.hostId, chatId,
+      observerSessionId: binding.sessionId ?? null, dshSessionId: agent.id,
       cwd: git.cwd, repo: git.repo, branch: git.branch,
       stages: pm.stages, stopAfter: stopAfterStage, currentStage: nextStage,
       startingCommit: git.head, stageBaseCommit: parent.state.headCommit,
@@ -303,6 +315,10 @@ export class AuditLifecycle {
         // 只有 Executor 确认是本 audit 自己的有效 turn/end 才触发自动审核；
         // 非绑定 session 的事件返回 {ignored:true}，不得误触 reviewer。
         if (r?.turnEnded === true) await this.#maybeAutoReviewLocked(runId);
+        const current = this.liveRuns.get(runId);
+        if (current && (r?.turnEnded || r?.ready || r?.advanced || r?.retry || r?.paused)) {
+          this.#notify(current, r?.ready ? 'READY_FOR_AUDIT' : (r?.paused ? 'PAUSED' : 'EXECUTOR_EVENT'), { result: r });
+        }
         return r;
       });
       this.eventQueues.set(runId, task.catch(() => undefined));
@@ -337,10 +353,12 @@ export class AuditLifecycle {
     const run = AuditRun.open(this.controller.store, { now: this.controller.now })(runId);
     if (!run) throw Object.assign(new Error(`run not found: ${runId}`), { code: 'AUDIT_RUN_NOT_FOUND' });
     const binding = this.bindings?.get(run.manifest.chatId);
-    if (!binding || binding.sessionId !== run.manifest.dshSessionId) {
-      throw Object.assign(new Error('persisted dshSessionId does not match the owner chat binding'), { code: 'AUDIT_SESSION_BINDING_MISMATCH' });
+    if (!binding || (run.manifest.observerSessionId && binding.sessionId !== run.manifest.observerSessionId)) {
+      throw Object.assign(new Error('persisted observerSessionId does not match the owner chat binding'), { code: 'AUDIT_SESSION_BINDING_MISMATCH' });
     }
-    const agent = await this.driver.ensure({ ...binding }, { allowCreate: false });
+    const agent = this.driver.ensureAuditSession
+      ? await this.driver.ensureAuditSession({ cwd: run.manifest.cwd, sessionId: run.manifest.dshSessionId })
+      : await this.driver.ensure({ sessionId: run.manifest.dshSessionId, cwd: run.manifest.cwd }, { allowCreate: false });
     // MARKER_PARSE_FAILED is a recoverable executor-turn loss.  Human resume
     // changes the durable state back to EXECUTING, but the failed turn's
     // prompt is gone; reattaching with sendPrompt:false alone leaves the run

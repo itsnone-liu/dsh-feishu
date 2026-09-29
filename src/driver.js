@@ -155,6 +155,13 @@ export class SessionDriver {
     return handle.agent;
   }
 
+  /** Create/resume a session for a subsystem that must not mutate a chat binding. */
+  async ensureAuditSession({ cwd, sessionId = null, preset = null } = {}) {
+    if (!cwd) throw new Error('audit session requires cwd');
+    const ephemeralBinding = { cwd, sessionId };
+    return this.ensure(ephemeralBinding, { allowCreate: true, preset: preset ?? this.config.agentPreset });
+  }
+
   /**
    * Submit user input: steer when running, followup when idle. Returns which.
    * `images` are durable attachment refs (already committed by admitImages) —
