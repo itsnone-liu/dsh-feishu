@@ -747,8 +747,10 @@ export class AuditLifecycle {
         // WATCHDOG_TIMEOUT 在旧版本会误伤仍处于 EXECUTING 的长步骤。
         // 该类事故没有可靠的“人工修复”内容；升级后按确定性规则自动
         // 清除并重挂当前执行器，避免假事故把无人值守 run 永久闸住。
-        if (persistedIncident.trigger === 'WATCHDOG_TIMEOUT' && loaded.state.state === 'EXECUTING') {
-          const repaired = { ...persistedIncident, status: 'resolved', resolvedAt: Date.now(), resolution: 'auto-resolved: watchdog no longer interrupts running executor' };
+        if (persistedIncident.trigger === 'WATCHDOG_TIMEOUT'
+          && (loaded.state.state === 'EXECUTING'
+            || (loaded.state.state === 'PAUSED_NEEDS_USER' && loaded.state.cause === 'MARKER_PARSE_FAILED'))) {
+          const repaired = { ...persistedIncident, status: 'resolved', resolvedAt: Date.now(), resolution: 'auto-resolved: watchdog/marker recovery' };
           this.controller.store.writeIncident(item.runId, repaired);
           // fall through: immediately restore the executor below; resolving the
           // stale incident must not skip the resume path.
