@@ -129,15 +129,15 @@ export async function handleAuditCommand(controller, arg, chatId, ctx = {}) {
         `run：\`${r.runId}\``,
         `状态：**${s.state}** — ${stateHint(s.state)}`,
         `阶段：**${s.currentStage}**（第 ${s.iteration} 轮 · REVISE ${s.revisionCount}/${s.maxReviewIterations > 0 ? s.maxReviewIterations : '无限'}）`,
-        '运行策略：**纯无人值守**（额度/审核超时/瞬态仓库错误自动等待重试；其余异常停机报告并派修复 agent，修复后自动续跑）',
+        '运行策略：**纯无人值守**（额度/审核超时/瞬态仓库错误自动等待重试；其余异常自动停机并汇报，人工修复后 `/audit resume` 续跑）',
         `停止点：**${s.stopAfter}**`,
       ];
       if (s.waitingForHuman) lines.push(`等待人工：\`${s.waitingReason}\``);
       else if (s.cause) lines.push(`暂停原因：\`${s.cause}\``);
       else if (s.lastPauseCause) lines.push(`上次暂停原因：\`${s.lastPauseCause}\``);
-      // P-E：未解决事故一览（停-报-修-续进行中）。
+      // P-E 简化版：未解决事故（已停机等人工）。
       const inc = controller.lifecycle?.openIncident?.(r.runId);
-      if (inc) lines.push(`⚠️ 事故处理中：\`${inc.trigger}\`（第 ${inc.repairAttempt ?? '?'} 次修复，agent \`${inc.repairSessionId ?? '-'}\`）`);
+      if (inc) lines.push(`⚠️ 事故停机中：\`${inc.trigger}\`（${new Date(inc.raisedAt).toLocaleString('zh-CN', { hour12: false })} 起，等人工修复后 \`/audit resume\`）`);
       if (s.lastExecutorEventAt) lines.push(`最后 executor 事件：\`${s.lastExecutorEvent}\`（turn ${s.lastExecutorTurn ?? '-'}）`);
       if (s.observerSessionId) lines.push(`观察 session：\`${s.observerSessionId}\``);
       if (s.auditSessionId) lines.push(`审计 session：\`${s.auditSessionId}\``);

@@ -8,21 +8,18 @@
  * run plus executor adapter. Reviewer remains a caller-supplied stub until A5.
  */
 import { AuditRun } from './state-machine.js';
-import { AuditExecutor, textFromMessage } from './executor.js';
+import { AuditExecutor } from './executor.js';
 import { GitRemoteGate } from './git-gate.js';
 import { buildSealApprovalText, buildRevealApprovalText, approvalForGateKind } from './protocol.js';
 import { loadTaskPacket } from './task-packet.js';
 import { AuditRetryScheduler } from './retry-scheduler.js';
 import { parsePreauthText } from './preauth-protocol.js';
-import { buildRepairPrompt, buildRepairNudge, parseRepairReport } from './repair-protocol.js';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 
 export class AuditLifecycle {
-  constructor({ controller, driver, bindings, onProgress = null, watchdogMs = 5 * 60_000, gitGateFactory = (opts) => new GitRemoteGate(opts), executorFactory = (opts) => new AuditExecutor(opts), taskPacketLoader = loadTaskPacket, retryScheduler = null, onError = null, reviewTimeoutMs = 20 * 60_000, gitTimeoutMs = 120_000, preauthStore = null, approvalPolicy = 'MANUAL', gitSnapshotProvider = null, restartBridge = null,
-    // P-E「停-报-修-续」参数（桥内不再做 LLM 枚举恢复/自动代码修复）：
-    repairCwd = null, repairWatchdogMs = 30 * 60_000, repairRetryDelays = null, repairResetAfter = 3,
-    reviewRetryDelays = null, reviewInfraIncidentAfter = 3, logFileHint = null,
+  constructor({ controller, driver, bindings, onProgress = null, watchdogMs = 5 * 60_000, gitGateFactory = (opts) => new GitRemoteGate(opts), executorFactory = (opts) => new AuditExecutor(opts), taskPacketLoader = loadTaskPacket, retryScheduler = null, onError = null, reviewTimeoutMs = 20 * 60_000, gitTimeoutMs = 120_000, preauthStore = null, approvalPolicy = 'MANUAL', gitSnapshotProvider = null,
+    reviewRetryDelays = null, reviewInfraIncidentAfter = 3, logFileHint = null, incidentBridgeRoot = null,
   } = {}) {
     this.controller = controller;
     this.driver = driver;
@@ -38,18 +35,15 @@ export class AuditLifecycle {
     // AUTO is the production unattended policy. MANUAL remains an explicit
     // step-by-step compatibility mode for tests and deliberate re-audits.
     this.approvalPolicy = String(approvalPolicy ?? 'MANUAL').toUpperCase();
-    // P-E 事故处理：异常 → 停（停该 run 的自动重试，保留现场）→ 报（持久化
-    // 完整事故报告 + 飞书卡）→ 修（独立修复 agent session 调查/修复/自测/
-    // commit）→ 续（修复完成后自动 resume）。多修几次，常见问题自然收敛。
-    this.restartBridge = restartBridge;
+    // P-E 简化版（2026-09-29 用户定稿）：异常 → 停（该 run 自动重试全停）→
+    // 报（incident.json + recovery.jsonl + 飞书卡）→ 等人工修复 → /audit resume。
+    // 程序内不做自动修（不派修复 agent、不自动重启）；确定性已知类（配额/
+    // 审核超时/瞬态 git）仍按退避自动重试。多修几次，常见问题慢慢消失。
     this.gitSnapshotProvider = gitSnapshotProvider; // 事故报告里的 git 快照采集
-    this.repairCwd = repairCwd;
-    this.repairWatchdogMs = repairWatchdogMs;
-    this.repairRetryDelays = repairRetryDelays ?? [60_000, 300_000, 900_000, 1_800_000];
-    this.repairResetAfter = repairResetAfter;
     this.reviewRetryDelays = reviewRetryDelays ?? [30_000, 60_000, 120_000, 240_000];
     this.reviewInfraIncidentAfter = reviewInfraIncidentAfter;
     this.logFileHint = logFileHint;
+    this.incidentBridgeRoot = incidentBridgeRoot;
     this.gitGateFactory = gitGateFactory;
     this.executorFactory = executorFactory;
     this.taskPacketLoader = taskPacketLoader;
@@ -65,12 +59,6 @@ export class AuditLifecycle {
     this.recoveryAttempts = new Map(); // review: 升级计数 / reviewretry: 退避档位
     /** runId → 事故记录（incident.json 同步落盘；report 为完整事故报告） */
     this.incidents = new Map();
-    /** runId → 修复 session 跟踪 { agent, incidentId, attempt, startedAt, lastEventAt, nudged, report } */
-    this.repairs = new Map();
-    /** runId → 修复重派退避 timer */
-    this.repairTimers = new Map();
-    /** runId → 连续 BLOCKED / 派出失败计数（repairResetAfter 用） */
-    this.repairAttempts = new Map();
     this.watchdogInterval = setInterval(() => this.#watchdog(), 60_000);
     this.watchdogInterval.unref?.();
   }
@@ -102,39 +90,16 @@ export class AuditLifecycle {
     const now = Date.now();
     for (const run of this.liveRuns.values()) {
       if (run.isTerminal || ['WAIT_DSH_QUOTA', 'WAIT_WEB_QUOTA'].includes(run.s.state)) continue;
-      if (this.incidents.has(run.runId)) continue; // 事故处理中：交给修复监督，不再重复触发
+      if (this.incidents.has(run.runId)) continue; // 事故已停机等人工：不再重复触发
       const a = this.activity.get(run.runId) ?? { at: run.s.updatedAt ?? now, warned: false };
       const last = run.s.lastExecutorEventAt ?? a.at;
       if (now - last < this.watchdogMs) continue;
       if (!a.warned) {
-        this.#notify(run, 'WATCHDOG_TIMEOUT', { idleMs: now - last, message: '审计执行器超过 watchdog 窗口无进展，转入事故处理（停-报-修-续）。' });
+        this.#notify(run, 'WATCHDOG_TIMEOUT', { idleMs: now - last, message: '审计执行器超过 watchdog 窗口无进展，已停机转事故汇报。' });
         a.warned = true; this.activity.set(run.runId, a);
       }
-      // P-E：异常就停 + 汇报 + 派修复 agent，修复后自动续跑。同一事故只处理
-      // 一次；未知的 executor 挂起不再靠重放同一操作碰运气。
+      // P-E 简化版：异常就停 + 汇报，修复由人工做（多修几次常见问题慢慢消失）。
       this.#raiseIncidentSafe(run, 'WATCHDOG_TIMEOUT', { idleMs: now - last });
-    }
-    this.#superviseRepairs(now);
-  }
-
-  /** P-E：修复 session 停滞监督（静默超窗 → 提醒一次 → 再停滞取消并按退避重派）。 */
-  #superviseRepairs(now) {
-    for (const [runId, rp] of [...this.repairs]) {
-      const silent = now - (rp.lastEventAt ?? rp.startedAt ?? now);
-      if (silent < this.repairWatchdogMs) continue;
-      if ((rp.nudged ?? 0) === 0) {
-        rp.nudged = 1;
-        rp.lastEventAt = now;
-        try { this.driver.submit(rp.agent, '（系统提醒）修复已静默较久。请继续调查，并按要求输出 [DSH-REPAIR] 报告块。'); } catch { /* 提醒失败留给下次监督 */ }
-        const run = this.liveRuns.get(runId);
-        if (run) this.#notify(run, 'AUDIT_REPAIR_STALLED', { attempt: rp.attempt, message: `修复 agent 静默 ${Math.round(silent / 60_000)} 分钟，已发提醒。` });
-        continue;
-      }
-      try { rp.agent?.cancel?.({ kind: 'user' }, { keepInbox: true }); } catch { /* 取消失败也重派 */ }
-      this.repairs.delete(runId);
-      const run = this.liveRuns.get(runId);
-      if (run) this.#notify(run, 'AUDIT_REPAIR_STALLED', { attempt: rp.attempt, message: '修复 agent 二次停滞，已取消并按退避安排重派。' });
-      this.#scheduleRepairRetry(runId, 'repair agent stalled twice');
     }
   }
 
@@ -143,21 +108,25 @@ export class AuditLifecycle {
     if (!run || run.isTerminal) return;
     Promise.resolve()
       .then(() => this.#raiseIncident(run, trigger, detail))
-      .catch((e) => this.#incidentDispatchFailed(run, e));
+      .catch((e) => {
+        // 汇报链路自身故障：尽力留痕 + 兜底通知（不能再派修——没有自动修）。
+        this.onError?.(Object.assign(new Error(`事故汇报失败：${e?.message ?? e}`), { code: 'AUDIT_INCIDENT_REPORT_FAILED', cause: e }), run?.runId);
+        try { this.#notify(run, 'AUDIT_INCIDENT_RAISED', { trigger, reason: `事故落盘/汇报环节出错（${e?.message ?? e}），请查看桥日志与 recovery.jsonl。`, nextStep: '人工排查后 /audit resume 或 /audit stop。' }); } catch { /* 尽力而为 */ }
+      });
   }
 
   /**
-   * P-E 核心：有异常就停 → 汇报 → 派修复 agent。
-   * 「停」= 停止该 run 的一切自动重试（git 重试 / 审核重试 / watchdog 再触发），
+   * P-E 简化版核心：有异常就停 → 汇报 → 等人工。
+   * 「停」= 停止该 run 的一切自动重试（git 重试 / 审核重试 / watchdog 再触发）。
    * 在跑的 executor turn 不取消 —— 它可能只是慢而非死，晚到的完成事件照常
-   * 推进状态机（executor 监听保持挂载），修复完成后统一续跑。
+   * 推进状态机（executor 监听保持挂载）；人工修好后 /audit resume 续跑。
    */
   async #raiseIncident(run, trigger, detail = {}) {
-    if (this.incidents.has(run.runId)) return; // 一 run 一事故：处理中不重复触发
+    if (this.incidents.has(run.runId)) return; // 一 run 一事故：停机中不重复触发
     const incident = await this.#incidentContext(run, trigger, detail);
     incident.bridge = {
       pid: process.pid,
-      bridgeRoot: this.repairCwd ?? process.cwd(),
+      bridgeRoot: this.incidentBridgeRoot ?? process.cwd(),
       logFile: this.logFileHint ?? null,
     };
     const record = {
@@ -166,8 +135,6 @@ export class AuditLifecycle {
       trigger,
       raisedAt: Date.now(),
       status: 'open',
-      repairAttempt: 0,
-      repairSessionId: null,
     };
     this.controller.store.writeIncident(run.runId, record);
     this.incidents.set(run.runId, { ...record, report: incident });
@@ -179,252 +146,9 @@ export class AuditLifecycle {
       trigger,
       incidentId: incident.incidentId,
       reason: `${trigger}${detail.error ? `：${String(detail.error).slice(0, 300)}` : ''}`,
-      nextStep: '已停止自动重试并保留现场，正在派出修复 agent 调查修复；修复完成后自动续跑，无需人工介入。',
+      question: JSON.stringify({ runId: run.runId, trigger, state: run.s.state, stage: run.s.currentStage, logFile: incident.bridge.logFile }, null, 2),
+      nextStep: '已停止自动重试并保留现场（事故报告见 recovery.jsonl / incident.json）。请人工排查修复，完成后发送 /audit resume 续跑。',
     });
-    await this.#dispatchRepair(run.runId, 1, null);
-  }
-
-  async #dispatchRepair(runId, attempt, previousBlockedSummary) {
-    const inc = this.incidents.get(runId);
-    const run = this.liveRuns.get(runId);
-    if (!inc || !run || run.isTerminal) return;
-    const rp = this.repairs.get(runId);
-    if (rp && rp.agent?.status === 'running') {
-      // 修复 session 的上一个 turn 还没结束（慢而非死）：不重复派 prompt，
-      // 但必须留在监督名单里 —— 否则它若真卡死将无人再管（watchdog 对
-      // 事故中的 run 是跳过的）。
-      rp.lastEventAt = Date.now();
-      return;
-    }
-    this.#clearRepairTimer(runId);
-    const workspace = run.manifest.cwd;
-    const bridgeRoot = this.repairCwd ?? process.cwd();
-    const agent = await this.driver.ensureRepairSession({
-      cwd: bridgeRoot,
-      sessionId: rp?.agent?.id ?? inc.repairSessionId ?? null,
-      allowCreate: true,
-    });
-    this.repairs.set(runId, {
-      agent, incidentId: inc.incidentId, attempt,
-      startedAt: Date.now(), lastEventAt: Date.now(), nudged: 0, report: null,
-    });
-    inc.repairAttempt = attempt;
-    inc.repairSessionId = agent.id;
-    const { report: _r1, ...persistable } = inc;
-    this.controller.store.writeIncident(runId, persistable);
-    this.#appendRunEvent(run, 'AUDIT_REPAIR_DISPATCHED', { attempt, sessionId: agent.id, incidentId: inc.incidentId });
-    this.#notify(run, 'AUDIT_REPAIR_DISPATCHED', {
-      attempt,
-      reason: `第 ${attempt} 次修复尝试，修复 agent session \`${agent.id}\`（工作目录 ${bridgeRoot}）`,
-      nextStep: '修复 agent 正在调查事故报告（可读代码/日志、改文件、跑测试、本地 commit）；完成后自动续跑。',
-    });
-    this.driver.submit(agent, buildRepairPrompt({
-      incident: inc.report,
-      runId,
-      incidentId: inc.incidentId,
-      attempt,
-      workspace,
-      bridgeRoot,
-      logFile: this.logFileHint ?? null,
-      previousBlockedSummary,
-    }));
-  }
-
-  /** 事故处理自身故障（派出失败等）：汇报 + 按退避重试派出，绝不静默放弃。 */
-  #incidentDispatchFailed(run, error) {
-    const message = `事故处理失败：[${error?.code ?? 'AUDIT_INCIDENT_DISPATCH_FAILED'}] ${error?.message ?? error}`;
-    this.onError?.(Object.assign(new Error(message), { code: 'AUDIT_INCIDENT_DISPATCH_FAILED', cause: error }), run?.runId);
-    try { this.#notify(run, 'AUDIT_INCIDENT_DISPATCH_FAILED', { reason: message }); } catch { /* 通知失败不影响重试 */ }
-    this.#scheduleRepairRetry(run?.runId, message);
-  }
-
-  #scheduleRepairRetry(runId, why) {
-    if (!runId || !this.incidents.has(runId)) return;
-    if (this.repairTimers.has(runId)) return;
-    // 计数由 #handleRepairReport（连续 BLOCKED）维护；这里只按当前节奏取退避间隔。
-    const n = this.repairAttempts.get(runId) ?? 0;
-    const delayMs = this.repairRetryDelays[Math.max(0, Math.min(n - 1, this.repairRetryDelays.length - 1))] ?? this.repairRetryDelays.at(-1);
-    const run = this.liveRuns.get(runId);
-    if (run) this.#notify(run, 'AUDIT_REPAIR_RETRY_SCHEDULED', { attempt: (this.incidents.get(runId)?.repairAttempt ?? 0) + 1, retryInMs: delayMs, reason: why });
-    const timer = setTimeout(() => {
-      this.repairTimers.delete(runId);
-      const inc = this.incidents.get(runId);
-      const r = this.liveRuns.get(runId);
-      if (!inc || !r || r.isTerminal) return;
-      const blocked = this.#lastBlockedSummary(runId);
-      this.#dispatchRepair(runId, inc.repairAttempt + 1, blocked)
-        .catch((e) => this.#incidentDispatchFailed(r, e));
-    }, delayMs);
-    timer.unref?.();
-    this.repairTimers.set(runId, timer);
-  }
-
-  #lastBlockedSummary(runId) {
-    try {
-      const items = this.controller.store.listRecoveryIncidents(runId);
-      for (let i = items.length - 1; i >= 0; i -= 1) {
-        const rep = items[i]?.incident?.repair;
-        if (rep?.status === 'BLOCKED') return rep.summary ?? null;
-      }
-    } catch { /* 读取失败不带偏见：当作无摘要 */ }
-    return null;
-  }
-
-  #clearRepairTimer(runId) {
-    const t = this.repairTimers.get(runId);
-    if (t) clearTimeout(t);
-    this.repairTimers.delete(runId);
-  }
-
-  /** 修复 agent session 事件处理（onEvent 的前置分支）。 */
-  async #onRepairEvent(runId, rp, event) {
-    const data = event?.data ?? event;
-    rp.lastEventAt = Date.now();
-    if (event?.type === 'assistant/message') {
-      const report = parseRepairReport(textFromMessage(data), { runId, incidentId: rp.incidentId });
-      if (report) rp.report = report;
-      return { repairEvent: true };
-    }
-    if (event?.type === 'turn/end') {
-      if (rp.report) {
-        const report = rp.report;
-        rp.report = null;
-        this.repairs.delete(runId);
-        this.#handleRepairReport(runId, report);
-        return { repairEvent: true, repair: report.status };
-      }
-      rp.nudged = (rp.nudged ?? 0) + 1;
-      if (rp.nudged <= 2) {
-        try { this.driver.submit(rp.agent, buildRepairNudge({ runId, incidentId: rp.incidentId })); } catch { /* 提醒失败留给停滞监督 */ }
-        return { repairEvent: true, nudged: rp.nudged };
-      }
-      this.repairs.delete(runId);
-      const run = this.liveRuns.get(runId);
-      if (run) this.#notify(run, 'AUDIT_REPAIR_STALLED', { attempt: rp.attempt, message: '修复 agent 连续两次未按要求输出报告块，按未解决处理。' });
-      this.#scheduleRepairRetry(runId, 'repair agent did not report');
-      return { repairEvent: true };
-    }
-    return { repairEvent: true };
-  }
-
-  #handleRepairReport(runId, report) {
-    const run = this.liveRuns.get(runId);
-    const inc = this.incidents.get(runId);
-    if (!run || !inc) return; // 事故已被清理（如用户 stop）：报告只留痕不动作
-    this.controller.store.appendRecoveryIncident({ runId, incident: { incidentId: inc.incidentId, repair: report } });
-    if (report.status === 'DONE') {
-      this.#appendRunEvent(run, 'AUDIT_REPAIR_DONE', { incidentId: inc.incidentId, files: report.files, restart: report.restart });
-      this.incidents.delete(runId);
-      this.repairAttempts.delete(runId);
-      this.#clearRepairTimer(runId);
-      const { report: _r2, ...persistable } = inc;
-      this.controller.store.writeIncident(runId, { ...persistable, status: 'resolved', resolvedAt: Date.now(), resolution: report.summary ?? null });
-      this.#notify(run, 'AUDIT_REPAIR_DONE', {
-        summary: report.summary,
-        reason: `修复完成（${report.files?.length ?? 0} 个文件${report.restart ? '，需重启桥加载' : ''}）`,
-        nextStep: report.restart
-          ? '修复涉及桥本体代码：桥将重启加载新代码，重启后自动恢复审计运行。'
-          : '已自动恢复审计运行。',
-      });
-      if (report.restart && this.restartBridge) {
-        // 事故状态已落盘 resolved：重启后 restoreActive 走正常 resume，不会重复派修。
-        Promise.resolve(this.restartBridge({ chatId: run.manifest.chatId, runId, files: report.files, reason: report.summary }))
-          .catch((e) => this.onError?.(e, runId));
-        return;
-      }
-      this.#resumeAfterRepair(runId).catch((e) => {
-        this.#notify(run, 'AUDIT_INCIDENT_DISPATCH_FAILED', { reason: `修复后恢复失败：${e?.message ?? e}` });
-        this.onError?.(e, runId);
-      });
-      return;
-    }
-    // BLOCKED：记录 + 计数；连续未解决且执行端仍在跑 → 操作复位（取消疑似
-    // 卡死的 turn 直接续跑），避免修复-阻塞乒乓。否则按退避重派。
-    this.#appendRunEvent(run, 'AUDIT_REPAIR_BLOCKED', { incidentId: inc.incidentId, attempt: inc.repairAttempt, summary: report.summary });
-    const n = (this.repairAttempts.get(runId) ?? 0) + 1;
-    this.repairAttempts.set(runId, n);
-    if (n >= this.repairResetAfter) {
-      const bound = this.driver.live?.get(run.manifest.dshSessionId)?.agent;
-      if (bound && bound.status === 'running') {
-        try { bound.cancel?.({ kind: 'user' }, { keepInbox: true }); } catch { /* 取消失败仍续跑 */ }
-      }
-      this.#notify(run, 'AUDIT_REPAIR_DONE', {
-        reason: `连续 ${n} 次修复未解决；已取消疑似卡死的执行端 turn，直接恢复运行继续观察。`,
-        summary: report.summary,
-        nextStep: '若同一异常再次出现将重新进入事故处理。',
-      });
-      this.incidents.delete(runId);
-      this.repairAttempts.delete(runId);
-      this.#clearRepairTimer(runId);
-      const { report: _r3, ...persistable } = inc;
-      this.controller.store.writeIncident(runId, { ...persistable, status: 'resolved', resolvedAt: Date.now(), resolution: `reset-after-${n}-blocked：${report.summary ?? ''}` });
-      this.#resumeAfterRepair(runId, { forceReattach: true }).catch((e) => this.onError?.(e, runId));
-      return;
-    }
-    this.#notify(run, 'AUDIT_REPAIR_BLOCKED', { attempt: inc.repairAttempt, summary: report.summary, nextStep: '将按退避自动重派修复 agent（换角度继续调查）。' });
-    this.#scheduleRepairRetry(runId, report.summary ?? 'repair blocked');
-  }
-
-  /** 修复完成后恢复运行：执行端仍在跑则只解除闸门保持监听；idle 则重挂 + 补发阶段 prompt。 */
-  async #resumeAfterRepair(runId, { forceReattach = false } = {}) {
-    const run = this.liveRuns.get(runId);
-    if (!run || run.isTerminal) return;
-    const bound = this.driver.live?.get(run.manifest.dshSessionId)?.agent;
-    if (!forceReattach && bound && bound.status === 'running') {
-      // turn 还活着（慢而非死）：不取消不重挂，保持既有 executor 监听；
-      // turn 结束后状态机自然推进，自动审核已随闸门解除而恢复。
-      // forceReattach（操作复位路径）例外：刚发起的 cancel 不会同步翻转
-      // status，若按 running 走保活分支会永远不再驱动该 run。
-      this.activity.set(runId, { at: Date.now(), warned: false });
-      this.#notify(run, 'AUDIT_RESUMED_AFTER_REPAIR', {
-        state: run.s.state,
-        reason: '执行端 turn 仍在进行，保持监听不干预。',
-        nextStep: '事故已处理，自动推进恢复。',
-      });
-      return { keptAlive: true };
-    }
-    let result;
-    try {
-      result = await this.resume(runId, { human: false });
-    } catch (e) {
-      if (e?.code === 'AUDIT_SESSION_OCCUPIED') {
-        try { bound?.cancel?.({ kind: 'user' }, { keepInbox: true }); } catch { /* 重挂再试 */ }
-        result = await this.resume(runId, { human: false });
-      } else throw e;
-    }
-    const fresh = this.liveRuns.get(runId);
-    const executor = this.executors.get(runId);
-    // D4 同款：事故期间停掉的自动驱动，恢复后若执行端 idle 静坐必须补发
-    // 当前阶段 prompt，否则没人再驱动该 run。
-    if (fresh && executor && fresh.s.state === 'EXECUTING'
-      && !fresh.s.pendingRemoteSync && !fresh.s.waitingForHuman) {
-      if (result?.agent?.status === 'idle') {
-        executor.startStage(runId);
-      } else if (forceReattach) {
-        // 操作复位路径刚 cancel 的 turn：status 翻转是异步的，立刻看仍是
-        // running。短暂轮询等落定后补发，否则该 run 将无人驱动（取消的
-        // turn 不会再产生事件）。有界等待，落不定就放弃（watchdog 兜底）。
-        const deadline = Date.now() + 15_000;
-        const poll = () => {
-          const live2 = this.liveRuns.get(runId);
-          if (!live2 || live2.isTerminal || live2.s.state !== 'EXECUTING') return;
-          const agent2 = this.driver.live?.get(live2.manifest.dshSessionId)?.agent ?? result?.agent;
-          if ((agent2?.status ?? 'idle') !== 'idle') {
-            if (Date.now() < deadline) { const t = setTimeout(poll, 250); t.unref?.(); }
-            return;
-          }
-          try { executor.startStage(runId); } catch (e) { this.onError?.(e, runId); }
-        };
-        const t = setTimeout(poll, 250);
-        t.unref?.();
-      }
-    }
-    this.activity.set(runId, { at: Date.now(), warned: false });
-    this.#notify(fresh ?? run, 'AUDIT_RESUMED_AFTER_REPAIR', {
-      state: fresh?.s?.state,
-      nextStep: '事故已处理，审计运行已恢复。',
-    });
-    return result;
   }
 
   async #incidentContext(run, trigger, detail = {}) {
@@ -875,8 +599,6 @@ export class AuditLifecycle {
           }
         }
         this.incidents.delete(runId);
-        this.repairs.delete(runId);
-        this.#clearRepairTimer(runId);
         this.#clearReviewRetry(runId);
       } else if (action === 'pause') {
         this.retryScheduler.cancel(runId);
@@ -1155,11 +877,6 @@ export class AuditLifecycle {
   }
 
   async onEvent(session, event) {
-    // P-E：修复 agent session 的事件先于执行端分发（修复 session 不属任何
-    // executor，落入下方循环只会被全部 ignore）。
-    for (const [runId, rp] of this.repairs) {
-      if (rp.agent?.id === session?.id) return this.#onRepairEvent(runId, rp, event);
-    }
     // 先为每个 run 建好任务再逐个 await，且单个 executor 的异常只计入本 run 的
     // 结果、不中断循环——否则终态 run 的残留 executor 抛错会饿死同 session 的
     // 活跃 run（marker 永远到不了目标 run，表现为 MARKER_PARSE_FAILED 假阳性）。
@@ -1225,35 +942,23 @@ export class AuditLifecycle {
     for (const item of this.controller.store.listRuns()) {
       const loaded = this.controller.store.loadRun(item.runId);
       if (!loaded || ['STOPPED', 'STOPPED_TARGET_REACHED', 'ERROR'].includes(loaded.state.state)) continue;
-      // P-E：重启前未解决的事故先闸住（resume 尾部的自动审核不得抢在修复
-      // 之前跑），resume 成功后再重派修复 agent。
-      const persistedIncident = this.controller.store.readIncident(item.runId);
-      const hadOpenIncident = persistedIncident?.status === 'open';
-      if (hadOpenIncident && !this.incidents.has(item.runId)) {
+      // P-E 简化版：重启前未解决的事故 → 只闸住 + 提醒，不自动 resume
+      //（事故停机的 run 必须等人工修复后 /audit resume，AUTO 也不放行）。
+      const persistedIncident = this.controller.store.readIncident?.(item.runId);
+      if (persistedIncident?.status === 'open') {
         this.incidents.set(item.runId, { ...persistedIncident });
         try { this.retryScheduler.cancel(item.runId); } catch { /* 无排程可取消 */ }
+        const ghost = AuditRun.open(this.controller.store, { now: this.controller.now })(item.runId);
+        if (ghost) this.#notify(ghost, 'AUDIT_INCIDENT_RAISED', {
+          trigger: persistedIncident.trigger,
+          incidentId: persistedIncident.incidentId,
+          reason: `桥重启完成；该 run 仍有未解决事故（${persistedIncident.trigger}），保持停机等人工。`,
+          nextStep: '人工排查修复后发送 /audit resume 续跑。',
+        });
+        continue;
       }
       try { restored.push(await this.resume(item.runId)); }
       catch (error) { errors.push({ runId: item.runId, code: error.code ?? 'AUDIT_RESTORE_FAILED', message: error.message }); this.onError?.(error, item.runId); }
-      if (!hadOpenIncident) continue;
-      const run = this.liveRuns.get(item.runId);
-      if (!run || run.isTerminal) { this.incidents.delete(item.runId); continue; }
-      try {
-        const report = await this.#incidentContext(run, 'RESTORE_OPEN_INCIDENT', { previousIncidentId: persistedIncident.incidentId, previousTrigger: persistedIncident.trigger });
-        report.incidentId = persistedIncident.incidentId; // 事故身份跨重启保持连续
-        report.bridge = { pid: process.pid, bridgeRoot: this.repairCwd ?? process.cwd(), logFile: this.logFileHint ?? null };
-        this.incidents.set(item.runId, { ...persistedIncident, report });
-        this.#notify(run, 'AUDIT_INCIDENT_RAISED', {
-          trigger: persistedIncident.trigger,
-          incidentId: persistedIncident.incidentId,
-          reason: `桥重启时发现未解决事故（${persistedIncident.trigger}），继续修复流程。`,
-          nextStep: '修复 agent 将重新派出；完成后自动续跑，无需人工介入。',
-        });
-        this.#dispatchRepair(item.runId, (persistedIncident.repairAttempt ?? 0) + 1, null)
-          .catch((e) => this.#incidentDispatchFailed(run, e));
-      } catch (error) {
-        this.#incidentDispatchFailed(run, error);
-      }
     }
     return { restored, errors };
   }
@@ -1271,6 +976,13 @@ export class AuditLifecycle {
 
   async resume(runId, { human = false, bumpReviewIterations = null } = {}) {
     return this.#serial(runId, async () => {
+    // P-E 简化版：事故停机中的 run 只认人工 resume（/audit resume）。
+    // AUTO 的自动恢复（restoreActive / 状态机自动路径）一律不放行——
+    // 事故必须由人修复，程序不猜修复是否已发生。
+    const preIncident = this.incidents.has(runId);
+    if (preIncident && !human) {
+      throw Object.assign(new Error('run is halted on an open incident; human /audit resume required after manual repair'), { code: 'AUDIT_INCIDENT_OPEN' });
+    }
     const run = AuditRun.open(this.controller.store, { now: this.controller.now })(runId);
     if (!run) throw Object.assign(new Error(`run not found: ${runId}`), { code: 'AUDIT_RUN_NOT_FOUND' });
     const binding = this.bindings?.get(run.manifest.chatId);
@@ -1348,16 +1060,33 @@ export class AuditLifecycle {
       && run.s.headCommit === run.s.lastVerdict.headCommit;
     if (reviseRecovery) {
       executor.startStage(runId);
-    } else if (resumedFromPause
+    } else if ((resumedFromPause || preIncident)
       && run.s.state === 'EXECUTING'
       && agent.status === 'idle'
       && !run.s.pendingRemoteSync
       && !run.s.waitingForHuman) {
-      // R1 止血 F5（D4 同款）：暂停被取消的 turn 不会再来事件 —— 恢复后若
-      // 执行端 idle 静坐，必须补发当前阶段 prompt，否则没人再驱动该 run。
-      // 范围仅限 PAUSED→resume 路径：EXECUTING 的重启重挂必须保持「不重复
-      // 发送 stage prompt」的既有冻结语义（lifecycle-e2e）。
+      // R1 止血 F5（D4 同款）：暂停/事故停机被取消或死掉的 turn 不会再有
+      // 事件 —— 人工恢复后若执行端 idle 静坐，必须补发当前阶段 prompt，
+      // 否则没人再驱动该 run。范围仅限显式恢复路径：EXECUTING 的重启重挂
+      // 必须保持「不重复发送 stage prompt」的既有冻结语义（lifecycle-e2e）。
       executor.startStage?.(runId);
+    }
+    // P-E 简化版：人工 resume = 确认事故已修复。关闭事故 + 汇报，
+    // 之后再走下方正常的自动审核/重试路径。
+    if (preIncident) {
+      const inc = this.incidents.get(runId);
+      const { report: _r, ...persistable } = inc ?? {};
+      if (persistable?.incidentId) {
+        this.controller.store.writeIncident?.(runId, { ...persistable, status: 'resolved', resolvedAt: Date.now(), resolution: 'resolved by human (/audit resume)' });
+      }
+      this.incidents.delete(runId);
+      this.recoveryAttempts.delete(`review:${runId}`);
+      this.#appendRunEvent(run, 'AUDIT_INCIDENT_RESOLVED', { incidentId: inc?.incidentId, by: 'human' });
+      this.#notify(run, 'AUDIT_INCIDENT_RESOLVED', {
+        incidentId: inc?.incidentId,
+        reason: '人工确认修复，审计运行恢复。',
+        nextStep: run.s.state === 'AUDITING' ? '同轮审核将自动重发。' : '当前阶段 prompt 已补发，运行继续。',
+      });
     }
     if (run.s.pendingRemoteSync) {
       this.#scheduleRetry(runId, run.s.retry.pushAttempts);

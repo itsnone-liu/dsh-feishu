@@ -125,18 +125,18 @@ function apply(ctx, config) {
         if (p.stopHint) lines.push('', `退出审计：\`${p.stopHint}\``);
         const title = p.event === 'WAITING_FOR_HUMAN' || p.event === 'NEED_USER' || p.event === 'VERDICT_NEED_USER'
           ? '⏸ 审计等待人工处理'
-          : (p.event === 'VERDICT_REVISE_LOOP_EXHAUSTED' ? '⚠️ 审计 REVISE 轮次耗尽'
-            : (p.event === 'VERDICT_TARGET_REACHED' ? '✅ 审计到达停止点' : '🧾 审计裁决'));
-        return buildInfoCard(title, lines.join('\n'), { template: p.event === 'VERDICT_TARGET_REACHED' ? 'green' : 'orange' });
+          : (p.event === 'AUDIT_INCIDENT_RAISED' ? '🛑 审计异常停机（已汇报，等人工修复）'
+            : (p.event === 'AUDIT_INCIDENT_RESOLVED' ? '✅ 事故已由人工确认修复，审计恢复'
+              : (p.event === 'VERDICT_REVISE_LOOP_EXHAUSTED' ? '⚠️ 审计 REVISE 轮次耗尽'
+                : (p.event === 'VERDICT_TARGET_REACHED' ? '✅ 审计到达停止点' : '🧾 审计裁决'))));
+        return buildInfoCard(title, lines.join('\n'), { template: p.event === 'VERDICT_TARGET_REACHED' || p.event === 'AUDIT_INCIDENT_RESOLVED' ? 'green' : 'orange' });
       };
       const AUDIT_NOTICE_EVENTS = new Set([
         'NEED_USER', 'WAITING_FOR_HUMAN', 'REVIEW_TIMEOUT',
         'VERDICT_NEED_USER', 'VERDICT_REVISE_LOOP_EXHAUSTED', 'VERDICT_TARGET_REACHED', 'VERDICT_STAGE_ADVANCED',
         'GATE_PASSED_BY_PREAUTH', 'GATE_PASSED_BY_POLICY', 'GATE_PREAUTH_MISMATCH', 'DSH_QUOTA_WAIT', 'DSH_QUOTA_RECOVER',
         'WATCHDOG_TIMEOUT', 'AUDIT_AUTO_RECOVER', 'AUDIT_REVIEW_RETRY', 'WEB_QUOTA_WAIT',
-        'AUDIT_INCIDENT_RAISED', 'AUDIT_INCIDENT_DISPATCH_FAILED',
-        'AUDIT_REPAIR_DISPATCHED', 'AUDIT_REPAIR_RETRY_SCHEDULED', 'AUDIT_REPAIR_STALLED', 'AUDIT_REPAIR_DONE', 'AUDIT_REPAIR_BLOCKED',
-        'AUDIT_RESUMED_AFTER_REPAIR', // P-E 停-报-修-续
+        'AUDIT_INCIDENT_RAISED', 'AUDIT_INCIDENT_RESOLVED', // P-E 简化版：停-报，等人工
       ]);
       // P-B §3：预授权 store 与 AuditStore 同根（<root>/preauth/records.jsonl）。
       const { PreauthStore } = await import('./audit/preauth-store.js');
@@ -150,23 +150,11 @@ function apply(ctx, config) {
         gitTimeoutMs: cfg.audit?.gitTimeoutMs,       // R1 F4
         preauthStore,                                 // P-B 门位消费（commands 层同实例登记）
         approvalPolicy: cfg.audit?.approvalPolicy ?? 'AUTO',
-        // P-E 停-报-修-续参数
-        repairCwd: cfg.audit?.repairBridgeRoot || process.cwd(),
-        repairWatchdogMs: cfg.audit?.repairWatchdogMs,
-        repairRetryDelays: cfg.audit?.repairRetryDelaysMs,
-        repairResetAfter: cfg.audit?.repairResetAfter,
+        // P-E 简化版参数（重试-停机-汇报；无自动修复）
         reviewRetryDelays: cfg.audit?.reviewRetryDelaysMs,
         reviewInfraIncidentAfter: cfg.audit?.reviewInfraIncidentAfter,
-        logFileHint: cfg.logFile === 'none' ? '' : cfg.logFile,
-        restartBridge: async (detail) => {
-          log.warn(`audit repair verified; bridge restart requested: ${JSON.stringify(detail)}`);
-          // Reuse the existing external restart path. It launches a detached
-          // restarter, waits for this PID, then reloads the bridge; lifecycle
-          // itself never exits from inside an event callback.
-          if (detail?.chatId && typeof commands.handle === 'function') {
-            await commands.handle(detail.chatId, '/restart');
-          }
-        },
+        logFileHint: cfg.audit?.incidentLogHint || (cfg.logFile === 'none' ? '' : cfg.logFile),
+        incidentBridgeRoot: process.cwd(),
         gitSnapshotProvider: async (cwd) => {
           const { execFile } = await import('node:child_process');
           const { promisify } = await import('node:util');
