@@ -78,6 +78,11 @@ export class AuditLifecycle {
       // 由 AutoContinue/AuditRecovery 管理，不能由 idle watchdog 重复报错。
       if (run.isTerminal || ['AUDITING', 'WAIT_DSH_QUOTA', 'WAIT_WEB_QUOTA'].includes(run.s.state)) continue;
       if (this.incidents.has(run.runId)) continue; // 事故已停机等人工：不再重复触发
+      // EXECUTING 的 step/start 后，模型可能连续工作超过 watchdog 窗口。
+      // 只要专用 agent 仍处于 running，就代表有真实进展，不能把长步骤
+      // 误报成事故；只有 idle 且无 executor 事件才进入 watchdog。
+      const executorEntry = this.executors.get(run.runId)?.runs?.get?.(run.runId);
+      if (executorEntry?.agent?.status === 'running') continue;
       const a = this.activity.get(run.runId) ?? { at: run.s.updatedAt ?? now, warned: false };
       const last = run.s.lastExecutorEventAt ?? a.at;
       if (now - last < this.watchdogMs) continue;
@@ -737,6 +742,14 @@ export class AuditLifecycle {
       //（事故停机的 run 必须等人工修复后 /audit resume，AUTO 也不放行）。
       const persistedIncident = this.controller.store.readIncident?.(item.runId);
       if (persistedIncident?.status === 'open') {
+        // WATCHDOG_TIMEOUT 在旧版本会误伤仍处于 EXECUTING 的长步骤。
+        // 该类事故没有可靠的“人工修复”内容；升级后按确定性规则自动
+        // 清除并重挂当前执行器，避免假事故把无人值守 run 永久闸住。
+        if (persistedIncident.trigger === 'WATCHDOG_TIMEOUT' && loaded.state.state === 'EXECUTING') {
+          const repaired = { ...persistedIncident, status: 'resolved', resolvedAt: Date.now(), resolution: 'auto-resolved: watchdog no longer interrupts running executor' };
+          this.controller.store.writeIncident(item.runId, repaired);
+          continue;
+        }
         this.incidents.set(item.runId, { ...persistedIncident });
         try { this.retryScheduler.cancel(item.runId); } catch { /* 无排程可取消 */ }
         const ghost = AuditRun.open(this.controller.store, { now: this.controller.now })(item.runId);
