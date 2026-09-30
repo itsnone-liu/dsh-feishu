@@ -766,8 +766,11 @@ export class AuditLifecycle {
     const run = AuditRun.open(this.controller.store, { now: this.controller.now })(runId);
     if (!run) throw Object.assign(new Error(`run not found: ${runId}`), { code: 'AUDIT_RUN_NOT_FOUND' });
     // 2026-09-30：旧持久化人闸等待态在 open→recoverTransientState 内被解除
-    //（事件 HUMAN_GATE_REMOVED）；此处记住，供下方恢复分支补发阶段 prompt。
-    const humanGateCleared = Boolean(run.humanGateCleared);
+    //（事件 HUMAN_GATE_REMOVED + 持久标记 humanGateRemovedAt）。补发条件
+    // 做成持久判定：标记存在且其后尚无任何 executor 活动 —— 跨重启仍成立，
+    // 执行器一旦开始产出事件即自然消费（不会重复补发）。
+    const humanGateCleared = Boolean(run.humanGateCleared)
+      || Boolean(run.s.humanGateRemovedAt && (run.s.lastExecutorEventAt ?? 0) < run.s.humanGateRemovedAt);
     const binding = this.bindings?.get(run.manifest.chatId);
     if (!binding || (run.manifest.observerSessionId && binding.sessionId !== run.manifest.observerSessionId)) {
       throw Object.assign(new Error('persisted observerSessionId does not match the owner chat binding'), { code: 'AUDIT_SESSION_BINDING_MISMATCH' });

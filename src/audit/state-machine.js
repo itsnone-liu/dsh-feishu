@@ -183,9 +183,10 @@ export class AuditRun {
       this.s.waitingApprovalHash = null;
       this.s.waitingQuestion = null;
       this.s.humanGatePassed = null;
+      this.s.humanGateRemovedAt = this.now(); // 持久标记：executor 首次附着时补发阶段 prompt 的依据
       this.#touch(); this.store.saveState(this.s);
       this.#emit('HUMAN_GATE_REMOVED', { reason: 'unattended-policy-2026-09-30', stage: this.s.currentStage });
-      this.humanGateCleared = true; // 供 lifecycle.restoreActive 判断补发阶段 prompt
+      this.humanGateCleared = true;
       return { recovered: null, humanGateCleared: true };
     }
     // A5.5 recovery guard: a duplicate /audit resume raced with the synchronous
