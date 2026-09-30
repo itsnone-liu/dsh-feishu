@@ -76,7 +76,7 @@ export class AuditLifecycle {
       // 5min 窗口抢先把正常的网页审核停成事故（2026-09-30 误报现场：
       // 11:14 watchdog 开事故，11:17 同一审核才返回 REVISE）。额度等待同理
       // 由 AutoContinue/AuditRecovery 管理，不能由 idle watchdog 重复报错。
-      if (run.isTerminal || ['AUDITING', 'WAIT_DSH_QUOTA', 'WAIT_WEB_QUOTA'].includes(run.s.state)) continue;
+      if (run.isTerminal || ['AUDITING', 'WAIT_DSH_QUOTA', 'WAIT_WEB_QUOTA', 'PAUSED', 'PAUSED_NEEDS_USER', 'HISTORY_REWRITTEN'].includes(run.s.state)) continue;
       if (this.incidents.has(run.runId)) continue; // 事故已停机等人工：不再重复触发
       // EXECUTING 的 step/start 后，模型可能连续工作超过 watchdog 窗口。
       // 只要专用 agent 仍处于 running，就代表有真实进展，不能把长步骤
