@@ -68,7 +68,11 @@ export class AuditLifecycle {
   #watchdog() {
     const now = Date.now();
     for (const run of this.liveRuns.values()) {
-      if (run.isTerminal || ['WAIT_DSH_QUOTA', 'WAIT_WEB_QUOTA'].includes(run.s.state)) continue;
+      // AUDITING 有独立的 reviewTimeout/retry/incident 链；watchdog 不能用更短的
+      // 5min 窗口抢先把正常的网页审核停成事故（2026-09-30 误报现场：
+      // 11:14 watchdog 开事故，11:17 同一审核才返回 REVISE）。额度等待同理
+      // 由 AutoContinue/AuditRecovery 管理，不能由 idle watchdog 重复报错。
+      if (run.isTerminal || ['AUDITING', 'WAIT_DSH_QUOTA', 'WAIT_WEB_QUOTA'].includes(run.s.state)) continue;
       if (this.incidents.has(run.runId)) continue; // 事故已停机等人工：不再重复触发
       const a = this.activity.get(run.runId) ?? { at: run.s.updatedAt ?? now, warned: false };
       const last = run.s.lastExecutorEventAt ?? a.at;
@@ -805,6 +809,13 @@ export class AuditLifecycle {
     const replayMarkerPrompt = human
       && run.s.state === 'PAUSED_NEEDS_USER'
       && run.s.cause === 'MARKER_PARSE_FAILED';
+    // 桥重启不会持久化 AutoContinue 的等待 timer。若执行器 run 留在
+    // WAIT_DSH_QUOTA，恢复时必须重新打开当前轮并补发 prompt，让新的
+    // AutoContinue watcher 接管；否则 run 会永久停在 quota 状态。
+    const replayDshQuotaPrompt = run.s.state === 'WAIT_DSH_QUOTA' && this.approvalPolicy === 'AUTO';
+    if (replayDshQuotaPrompt) run.dshQuotaRecovered();
+    const replayWebQuotaReview = run.s.state === 'WAIT_WEB_QUOTA' && this.approvalPolicy === 'AUTO';
+    if (replayWebQuotaReview) run.webQuotaRecovered();
     // R1 止血 F5：/audit pause 后的 PAUSED 也是 resume 的合法目标 —— 此前只
     // 处理 PAUSED_NEEDS_USER，PAUSED 恢复落空、run 永远停摆。只在 human=true
     // （显式 /audit resume）时转移：restoreActive（human=false）不得把用户
@@ -844,7 +855,9 @@ export class AuditLifecycle {
       && run.s.lastVerdict?.state === 'REVISE'
       && run.s.iteration > (run.s.lastVerdict.iteration ?? 0)
       && run.s.headCommit === run.s.lastVerdict.headCommit;
-    if (reviseRecovery) {
+    if (reviseRecovery || replayDshQuotaPrompt) {
+      // quota 状态恢复时 executor 的旧 turn 已结束，必须重新发当前阶段 prompt；
+      // 普通 AUDITING/EXECUTING 重挂仍维持不重复发 prompt 的语义。
       executor.startStage(runId);
     } else if ((resumedFromPause || preIncident || humanGateCleared)
       && run.s.state === 'EXECUTING'
