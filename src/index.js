@@ -149,6 +149,9 @@ function apply(ctx, config) {
         reviewInfraIncidentAfter: cfg.audit?.reviewInfraIncidentAfter,
         logFileHint: cfg.audit?.incidentLogHint || (cfg.logFile === 'none' ? '' : cfg.logFile),
         incidentBridgeRoot: process.cwd(),
+        onQuota: ({ agent, run, message }) => {
+          autoContinue.handleAuditQuota(agent, run?.manifest?.chatId, message);
+        },
         gitSnapshotProvider: async (cwd) => {
           const { execFile } = await import('node:child_process');
           const { promisify } = await import('node:util');

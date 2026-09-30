@@ -24,11 +24,12 @@ export const textFromMessage = (message) => {
 };
 
 export class AuditExecutor {
-  constructor({ driver, gitGate, prompt = '开始执行冻结任务书中的当前阶段。', onTransient = null } = {}) {
+  constructor({ driver, gitGate, prompt = '开始执行冻结任务书中的当前阶段。', onTransient = null, onQuota = null } = {}) {
     this.driver = driver;
     this.gitGate = gitGate;
     this.prompt = prompt;
     this.onTransient = onTransient;
+    this.onQuota = onQuota;
     this.runs = new Map(); // runId -> { run, agent, gate, waiting }
   }
 
@@ -128,6 +129,7 @@ export class AuditExecutor {
       // same executor cycle; never turn a temporary 429 into a human stop.
       if (data.reason?.kind === 'error' && isQuotaFailure(data.reason?.error?.message ?? data.reason?.error?.code)) {
         if (entry.run.s.state === 'EXECUTING') {
+          this.onQuota?.({ agent: entry.agent, run: entry.run, message: data.reason?.error?.message ?? data.reason?.error?.code });
           entry.run.dshQuotaExhausted();
           return { turnEnded: true, quota: true, waitingQuota: true };
         }

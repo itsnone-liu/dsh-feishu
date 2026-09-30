@@ -151,6 +151,18 @@ export class AutoContinue {
   #primary() { return this.config.fallbackPrimary ? parsePair(this.config.fallbackPrimary) : null; }
   #backup() { return this.config.fallbackBackup ? parsePair(this.config.fallbackBackup) : null; }
 
+  /** 审计专用 session 不经过 renderer 的普通 chat 绑定；其 quota 事件由
+   * AuditExecutor 显式转发到这里，复用同一套 GLM→GPT fallback。 */
+  handleAuditQuota(agent, chatId, message) {
+    const sessionId = agent?.id;
+    if (!sessionId || !chatId || this.config.autoContinue === false) return;
+    if (this.fallbackActive) {
+      this.#onBackupSideError(sessionId, chatId, message);
+      return;
+    }
+    this.#schedule(sessionId, chatId, 'long', message);
+  }
+
   /** index.js 的 session/event 钩子转发进来（外层已有 try/catch）。 */
   onEvent(session, event) {
     if (event?.type !== 'turn/end') return;

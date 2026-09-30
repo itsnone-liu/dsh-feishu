@@ -17,6 +17,7 @@ import { AuditRetryScheduler } from './retry-scheduler.js';
 export class AuditLifecycle {
   constructor({ controller, driver, bindings, onProgress = null, watchdogMs = 5 * 60_000, gitGateFactory = (opts) => new GitRemoteGate(opts), executorFactory = (opts) => new AuditExecutor(opts), taskPacketLoader = loadTaskPacket, retryScheduler = null, onError = null, reviewTimeoutMs = 20 * 60_000, gitTimeoutMs = 120_000, approvalPolicy = 'MANUAL', gitSnapshotProvider = null,
     reviewRetryDelays = null, reviewInfraIncidentAfter = 3, logFileHint = null, incidentBridgeRoot = null,
+    onQuota = null,
   } = {}) {
     this.controller = controller;
     this.driver = driver;
@@ -38,6 +39,9 @@ export class AuditLifecycle {
     this.reviewInfraIncidentAfter = reviewInfraIncidentAfter;
     this.logFileHint = logFileHint;
     this.incidentBridgeRoot = incidentBridgeRoot;
+    // 执行侧额度事件交给桥的统一 GLM→GPT fallback；审核专用 session
+    // 仍由本生命周期管理 WAIT_DSH_QUOTA 状态。
+    this.onQuota = onQuota;
     this.gitGateFactory = gitGateFactory;
     this.executorFactory = executorFactory;
     this.taskPacketLoader = taskPacketLoader;
@@ -226,6 +230,7 @@ export class AuditLifecycle {
     const executor = this.executorFactory({
       driver: this.driver, gitGate: gate,
       onTransient: this.retryScheduler ? (entry, _result, attempt) => this.#scheduleRetry(entry.run.runId, attempt) : null,
+      onQuota: this.onQuota,
     });
     this.executors.set(runId, executor);
     this.liveRuns.set(runId, run);
@@ -343,6 +348,7 @@ export class AuditLifecycle {
     const executor = this.executorFactory({
       driver: this.driver, gitGate: gate,
       onTransient: this.retryScheduler ? (entry, _result, attempt) => this.#scheduleRetry(entry.run.runId, attempt) : null,
+      onQuota: this.onQuota,
     });
     this.executors.set(runId, executor);
     this.liveRuns.set(runId, run);
@@ -623,6 +629,7 @@ export class AuditLifecycle {
     const executor = this.executorFactory({
       driver: this.driver, gitGate: gate,
       onTransient: this.retryScheduler ? (entry, _result, attempt) => this.#scheduleRetry(entry.run.runId, attempt) : null,
+      onQuota: this.onQuota,
     });
     this.executors.set(runId, executor);
     await executor.start({
@@ -838,6 +845,7 @@ export class AuditLifecycle {
     const executor = this.executorFactory({
       driver: this.driver, gitGate: gate,
       onTransient: this.retryScheduler ? (entry, _result, attempt) => this.#scheduleRetry(entry.run.runId, attempt) : null,
+      onQuota: this.onQuota,
     });
     this.executors.set(runId, executor);
     this.liveRuns.set(runId, run);
