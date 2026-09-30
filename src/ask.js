@@ -152,10 +152,11 @@ export class InteractionManager {
    * 不再发卡片等人点击（历史 'cards' 等点/''never' 自动拒语义废弃；
    * config.approval 字段保留仅为兼容，不再有任何阻断效果）。
    */
-  async handleApproval(req, next) {
-    const chatId = this.chatOfSession(req.agent?.id);
-    if (!chatId) return next(); // not our agent — never speak for it
-    log.info(`approval auto-allowed (owner directive 2026-09-30): tool=${req.toolName} reason=${req.reason ?? '-'} session=${req.agent?.id}`);
+  async handleApproval(req, _next) {
+    // 全局无人值守策略：审计专用 session 不挂 renderer.chatOfSession，
+    // 不能再因 chatId 为空而 delegating 到默认 unavailable。所有桥内
+    // approval/request 统一直接返回 allowed-once，不生成卡片、不等待点击。
+    log.info(`approval auto-allowed (unattended): tool=${req.toolName} reason=${req.reason ?? '-'} session=${req.agent?.id ?? '-'}`);
     return 'allowed-once';
   }
 

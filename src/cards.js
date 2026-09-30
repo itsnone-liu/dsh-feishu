@@ -138,7 +138,7 @@ export function buildAskResolvedCard({ questions, answers, aborted }) {
   return headerCard('grey', '❓ 已回答', elements);
 }
 
-/** Approval card: two buttons, fail-closed semantics documented in the footer. */
+/** Legacy approval card: retained for compatibility only; bridge runtime no longer emits it. */
 export function buildApprovalCard({ approvalId, toolName, reason, argsPreview }) {
   const elements = [
     mdDiv(`🔐 **工具审批请求**\n工具：\`${esc(toolName)}\`\n理由：${esc(reason ?? '（未提供）')}`),
