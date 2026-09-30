@@ -18,12 +18,15 @@ export class AuditLifecycle {
   constructor({ controller, driver, bindings, onProgress = null, watchdogMs = 5 * 60_000, gitGateFactory = (opts) => new GitRemoteGate(opts), executorFactory = (opts) => new AuditExecutor(opts), taskPacketLoader = loadTaskPacket, retryScheduler = null, onError = null, reviewTimeoutMs = 20 * 60_000, gitTimeoutMs = 120_000, approvalPolicy = 'MANUAL', gitSnapshotProvider = null,
     reviewRetryDelays = null, reviewInfraIncidentAfter = 3, logFileHint = null, incidentBridgeRoot = null,
     onQuota = null,
+    quotaProbe = null,
   } = {}) {
     this.controller = controller;
     this.driver = driver;
     this.onError = onError;
     this.bindings = bindings;
     this.onProgress = onProgress;
+    this.quotaProbe = quotaProbe;
+    this.quotaHealAt = new Map();
     this.watchdogMs = watchdogMs;
     this.reviewTimeoutMs = reviewTimeoutMs; // R1 F4：reviewer.review 硬超时（默认 20min，可注入；测试传 1ms）
     this.gitTimeoutMs = gitTimeoutMs;       // R1 F4：git 子进程硬超时（透传 gitGateFactory）
@@ -76,7 +79,19 @@ export class AuditLifecycle {
       // 5min 窗口抢先把正常的网页审核停成事故（2026-09-30 误报现场：
       // 11:14 watchdog 开事故，11:17 同一审核才返回 REVISE）。额度等待同理
       // 由 AutoContinue/AuditRecovery 管理，不能由 idle watchdog 重复报错。
-      if (run.isTerminal || ['AUDITING', 'WAIT_DSH_QUOTA', 'WAIT_WEB_QUOTA', 'PAUSED', 'PAUSED_NEEDS_USER', 'HISTORY_REWRITTEN'].includes(run.s.state)) continue;
+      if (run.isTerminal || ['AUDITING', 'WAIT_WEB_QUOTA', 'PAUSED', 'PAUSED_NEEDS_USER', 'HISTORY_REWRITTEN'].includes(run.s.state)) continue;
+      // WAIT_DSH_QUOTA 自愈（2026-10-01 事故：/glm 手动快切清掉 AutoContinue
+      // 探针 watcher 与 interrupted 队列后，额度等待的 run 永久搁浅）。额度
+      // 等待不能依赖内存 watcher——watchdog 周期自行探针，探通走 resume 的
+      // 额度恢复路径补发 prompt，任何路径恢复了都只是幂等 no-op。
+      if (run.s.state === 'WAIT_DSH_QUOTA') {
+        const at = this.quotaHealAt.get(run.runId) ?? 0;
+        if (now - at >= this.watchdogMs) {
+          this.quotaHealAt.set(run.runId, now);
+          this.#healQuotaWait(run.runId).catch(() => {});
+        }
+        continue;
+      }
       if (this.incidents.has(run.runId)) continue; // 事故已停机等人工：不再重复触发
       // EXECUTING 的 step/start 后，模型可能连续工作超过 watchdog 窗口。
       // 只要专用 agent 仍处于 running，就代表有真实进展，不能把长步骤
@@ -95,6 +110,24 @@ export class AuditLifecycle {
       // P-E 简化版：异常就停 + 汇报，修复由人工做（多修几次常见问题慢慢消失）。
       this.#raiseIncidentSafe(run, 'WATCHDOG_TIMEOUT', { idleMs: now - last });
     }
+  }
+
+  healQuotaWait(runId) { return this.#healQuotaWait(runId); }
+
+  /**
+   * WAIT_DSH_QUOTA 自愈：探针说主模型额度可用 → 走 resume() 的既有额度
+   * 恢复路径（dshQuotaRecovered + 补发当前阶段 prompt）。与 AutoContinue
+   * 自身的恢复双路并存、幂等：任一方先恢复，另一方 sees 非 WAIT 状态即
+   * no-op。探针失败/异常静默等下一轮 watchdog。
+   */
+  async #healQuotaWait(runId) {
+    if (typeof this.quotaProbe !== 'function') return;
+    const ok = await this.quotaProbe();
+    const run = this.liveRuns.get(runId);
+    if (!ok || !run || run.s.state !== 'WAIT_DSH_QUOTA') return;
+    this.quotaHealAt.delete(runId);
+    this.#notify(run, 'DSH_QUOTA_RECOVER', { result: { autoHealed: true } });
+    await this.resume(runId);
   }
 
   /** 事故入口（安全包装）：任何异常路径都可调，自身绝不抛出。 */

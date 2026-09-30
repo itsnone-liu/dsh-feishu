@@ -86,5 +86,37 @@ await ok('MARKER_PARSE_FAILED human resume replays the current stage prompt', as
   assert.deepEqual(prompts, ['initial', 'replayed:T1']);
 });
 
+await ok('WAIT_DSH_QUOTA watchdog self-heal resumes run once probe says quota is back', async () => {
+  const f = fixture(); const c = ctrl(f.root, f.work);
+  const bindings = new Map([['chat-a', { sessionId: 's-a', cwd: f.work }]]);
+  const prompts = [];
+  let probeCalls = 0;
+  const driver = { ensure: async () => ({ id: 's-a', status: 'idle' }), submit: (_agent, prompt) => prompts.push(prompt) };
+  const gate = { inspect: async () => ({ cwd: f.work, repo: 'real-origin', branch: 'main', head: f.head }), pushAndVerify: async () => ({ ok: true, tipMatches: true }) };
+  const executorFactory = (opts) => new (class {
+    async start({ run, agent, sendPrompt = true }) { this.run = run; this.agent = agent; if (sendPrompt) opts.driver.submit(agent, 'initial'); }
+    startStage() { opts.driver.submit(this.agent, `replayed:${this.run.s.currentStage}`); }
+  })();
+  const life = new AuditLifecycle({ controller: c, driver, bindings, gitGateFactory: () => gate,
+    taskPacketLoader: () => ({ goal: 'g', approvedPlan: 'p', stages: ['T1', 'T2'], stageRequirements: {}, taskPacketHash: 'hash' }),
+    executorFactory, approvalPolicy: 'AUTO',
+    quotaProbe: async () => { probeCalls++; return true; } });
+  const r = await life.start({ chatId: 'chat-a', stopAfter: 'T1' });
+  // 直接进入额度等待态（模拟执行器 429 turn/end 后的 WAIT_DSH_QUOTA）
+  r.run.dshQuotaExhausted();
+  assert.equal(r.run.s.state, 'WAIT_DSH_QUOTA');
+  // 直接驱动自愈路径（生产由 watchdog setInterval 触发，同一函数）
+  await life.healQuotaWait(r.run.runId);
+  assert.equal(probeCalls >= 1, true);
+  const cur = life.liveRuns.get(r.run.runId) ?? r.run;
+  assert.equal(cur.s.state, 'EXECUTING', `expected EXECUTING, got ${cur.s.state}`);
+  assert.equal(prompts.includes('replayed:T1'), true, `prompts=${JSON.stringify(prompts)}`);
+  // 幂等：恢复后的第二次 heal 在非 WAIT 状态下必须是 no-op
+  await life.healQuotaWait(r.run.runId);
+  const cur2 = life.liveRuns.get(r.run.runId) ?? cur;
+  assert.equal(cur2.s.state, 'EXECUTING');
+  assert.equal(prompts.filter((p) => p === 'replayed:T1').length, 1);
+});
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exitCode = fail ? 1 : 0;

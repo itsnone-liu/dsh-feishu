@@ -153,6 +153,9 @@ function apply(ctx, config) {
         onQuota: ({ agent, run, message }) => {
           autoContinue.handleAuditQuota(agent, run?.manifest?.chatId, message);
         },
+        // WAIT_DSH_QUOTA 自愈探针：AutoContinue watcher 是内存态（/glm 等手动
+        // 快切会清掉），审计生命周期必须能独立判断主模型额度恢复。
+        quotaProbe: () => autoContinue.probePrimaryNow(),
         gitSnapshotProvider: async (cwd) => {
           const { execFile } = await import('node:child_process');
           const { promisify } = await import('node:util');

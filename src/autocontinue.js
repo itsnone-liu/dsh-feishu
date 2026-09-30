@@ -163,6 +163,16 @@ export class AutoContinue {
     this.#schedule(sessionId, chatId, 'long', message);
   }
 
+  /**
+   * 审计生命周期自愈入口：立即探测主模型额度（1 token），可用返回 true。
+   * 与 fallback 探针共用同一实现；AuditLifecycle watchdog 在 WAIT_DSH_QUOTA
+   * 期间用它独立判断恢复——AutoContinue 的探针 watcher 是内存态，可能被
+   * /glm、/gpt 手动快切或进程重建清掉，额度等待的审计 run 不能依赖它。
+   */
+  probePrimaryNow() {
+    return this.#probePrimary();
+  }
+
   /** index.js 的 session/event 钩子转发进来（外层已有 try/catch）。 */
   onEvent(session, event) {
     if (event?.type !== 'turn/end') return;
