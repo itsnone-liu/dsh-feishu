@@ -177,6 +177,11 @@ export class AuditExecutor {
       this.runs.delete(run.runId);
       return { ignored: true };
     }
+    // fallback/REVISE 后迟到的旧回合 marker 不是事故，直接丢弃；
+    // 未来迭代仍保持 fail-closed。
+    if (Number.isInteger(marker.iteration) && marker.iteration < run.s.iteration) {
+      return { ignored: true, stale: true, claimedIteration: marker.iteration, expectedIteration: run.s.iteration };
+    }
     try {
       const ancestryOk = await Promise.all([
         run.manifest.stageBaseCommit,
