@@ -392,6 +392,17 @@ export class AuditController {
     });
   }
 
+  archiveCompleted({ chatId = null, all = false } = {}) {
+    const archived = [];
+    for (const entry of this.store.listRuns()) {
+      const loaded = this.store.loadRun(entry.runId);
+      if (!loaded || !['STOPPED', 'STOPPED_TARGET_REACHED', 'ERROR'].includes(loaded.state.state)) continue;
+      if (!all && chatId && loaded.manifest.chatId !== chatId) continue;
+      archived.push(this.store.archiveRun(entry.runId));
+    }
+    return { ok: true, archived };
+  }
+
   stop(chatId) {
     const t = this.#target(chatId);
     if (t.error) return t.error;

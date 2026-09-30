@@ -80,6 +80,24 @@ export class AuditStore {
     this.#atomicWrite(this.#runsFile(), `${JSON.stringify({ runs }, null, 2)}\n`);
   }
 
+  /** 可回滚清理：只允许终态 run，先移动到 archive 目录再从索引移除。 */
+  archiveRun(runId) {
+    const loaded = this.loadRun(runId);
+    if (!loaded) throw new AuditError('AUDIT_RUN_NOT_FOUND', `run not found: ${runId}`);
+    if (!STATES.includes(loaded.state.state) || !['STOPPED', 'STOPPED_TARGET_REACHED', 'ERROR'].includes(loaded.state.state)) {
+      throw new AuditError('AUDIT_RUN_NOT_TERMINAL', '只能清理已结束的审计运行');
+    }
+    const source = this.#runDir(runId);
+    const archiveRoot = path.join(this.root, 'archive');
+    fs.mkdirSync(archiveRoot, { recursive: true });
+    const target = path.join(archiveRoot, `${runId}-${Date.now()}`);
+    fs.renameSync(source, target);
+    const runs = this.listRuns().filter((r) => r.runId !== runId);
+    this.#writeIndex(runs);
+    this.#seenKeys.delete(runId);
+    return { runId, archiveDir: target, state: loaded.state.state };
+  }
+
   updateIndex(runId, patch) {
     const runs = this.listRuns();
     const i = runs.findIndex((r) => r.runId === runId);
