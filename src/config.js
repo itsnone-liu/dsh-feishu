@@ -40,8 +40,9 @@ const DEFAULTS = {
   /** Model override; empty = use the harness default selection. */
   provider: '',
   model: '',
-  /** Approval handling: 'cards' (answer via buttons) | 'never' (auto-reject). */
-  approval: 'cards',
+  /** Approval handling — 2026-09-30 业主指令：一律自动放行（allowed-once）。
+   *  旧值 'cards'（按钮卡）/ 'never'（自动拒）语义已废弃，字段保留仅兼容。 */
+  approval: 'always',
   /** Card patch throttle window (ms) — also our Feishu rate-limit protection. */
   throttleMs: 900,
   /** Burst window (ms) to coalesce consecutive image messages into ONE turn.

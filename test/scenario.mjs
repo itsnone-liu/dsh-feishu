@@ -73,8 +73,7 @@ const script = [
   { text: 'ASK: 问我一个问题' },
   { click: { bridge: 'ask', label: '选项B' } },
   { wait: 900 },
-  { text: 'APPROVE: 需要审批' },
-  { click: { bridge: 'approval', decision: 'allowed-once' } },
+  { text: 'APPROVE: 需要审批' }, // 2026-09-30 起自动放行，无需点击
   { wait: 900 },
   { text: 'SLOW 慢慢来' },
   { wait: 500 },
@@ -194,7 +193,7 @@ check('turn card streams & finalizes', Boolean(turnFinal('收到：你好，桥�
 check('usage footer present', Boolean(turnFinal('收到：你好') && /tok/.test(turnFinal('收到：你好').card?.elements?.at(-1)?.elements?.[0]?.content ?? '')));
 check('tool row rendered with result', Boolean(anyCard('🔧 `bash` ✅') && anyCard('echo hi')));
 check('ask card + button answered', Boolean(anyCard('选项B') && turnFinal('ASK 回答') && /选项B/.test(md(turnFinal('ASK 回答')))));
-check('approval allowed-once', Boolean(turnFinal('APPROVE 结果：allowed-once') && anyCard('已允许（本次）')));
+check('approval auto-allowed (no card)', Boolean(turnFinal('APPROVE 结果：allowed-once') && !anyCard('🔐 需要审批')));
 check('steer note + steer step', Boolean(turnFinal('等等，先别动')));
 check('stop cancels turn', Boolean(cards.some((c) => (c.card?.header?.title?.content ?? '').startsWith('⏹'))));
 check('/new starts fresh session', Boolean(anyCard('新会话已就绪')));

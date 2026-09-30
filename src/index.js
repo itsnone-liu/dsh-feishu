@@ -213,9 +213,11 @@ function apply(ctx, config) {
         }),
       });
       ctx.on('approval/request', (req, next) => {
-        Promise.resolve(interactions.handleApproval(req, next)).catch((e) => {
+        // 必须 return waterfall answerer 的 Promise；旧代码未 return，导致
+        // DSH user-approval 收到默认 unavailable，自动放行永远无法生效。
+        return Promise.resolve(interactions.handleApproval(req, next)).catch((e) => {
           log.error(`approval handler failed, delegating: ${e?.stack ?? e}`);
-          try { next(); } catch {}
+          return next();
         });
       });
 
