@@ -23,8 +23,8 @@ const USAGE = [
   '- `/audit <阶段>` — 运行至指定阶段（如 `/audit T2`，阶段表：' + DEFAULT_STAGES.join(' · ') + '）',
   '- `/audit next [阶段]` — 延续最近已完成的任务链，从下一阶段开始（不重审已完成阶段）',
   '- `/audit rebind` — 将当前运行迁移到专用审计 session（普通对话保持观察/控制）',
-  '- `/audit status` — 查看状态 · `/audit pause` 暂停 · `/audit resume` 恢复
-- `/audit cleanup completed` — 将已完成运行移入可回滚 archive（不触碰活跃/事故运行）',
+  '- `/audit status` — 查看状态 · `/audit pause` 暂停 · `/audit resume` 恢复',
+  '- `/audit cleanup completed` — 将已完成运行移入可回滚 archive（不触碰活跃/事故运行）',
   '- `/audit stop` — 终止 · `/audit until <阶段>` — 修改停止点',
   '',
   'A3 已接入真实 DSH session 与 Git remote gate。阶段 APPROVE 后自动推进；REVISE 上限 8 次/阶段（`/audit resume <N>` 可提高）。',
