@@ -262,10 +262,16 @@ export class AuditRun {
     this.#touch(); this.store.saveState(this.s);
   }
 
-  markerMissing() {
+  markerMissing({ unattended = false } = {}) {
     this.#assertNotTerminal();
     if (this.s.state !== 'EXECUTING') throw new IllegalTransitionError(this.s.state, 'EXECUTING(marker-retry)');
     this.s.markerRetries += 1;
+    if (unattended && this.s.markerRetries >= 2) {
+      this.#emit('MARKER_RETRY');
+      this.s.markerRetries = 0;
+      this.#touch(); this.store.saveState(this.s);
+      return { retry: true, unattendedRecovery: true };
+    }
     if (this.s.markerRetries === 1) {
       this.#emit('MARKER_RETRY');
       this.#touch(); this.store.saveState(this.s);

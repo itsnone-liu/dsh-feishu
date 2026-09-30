@@ -24,12 +24,13 @@ export const textFromMessage = (message) => {
 };
 
 export class AuditExecutor {
-  constructor({ driver, gitGate, prompt = '开始执行冻结任务书中的当前阶段。', onTransient = null, onQuota = null } = {}) {
+  constructor({ driver, gitGate, prompt = '开始执行冻结任务书中的当前阶段。', onTransient = null, onQuota = null, unattended = false } = {}) {
     this.driver = driver;
     this.gitGate = gitGate;
     this.prompt = prompt;
     this.onTransient = onTransient;
     this.onQuota = onQuota;
+    this.unattended = unattended;
     this.runs = new Map(); // runId -> { run, agent, gate, waiting }
   }
 
@@ -147,7 +148,7 @@ export class AuditExecutor {
       // explicit /audit resume path start the next cycle.
       if (entry.run.s.state !== 'EXECUTING') return { turnEnded: true, stale: true };
       if (data.reason?.kind === 'completed' && entry.markerTurn !== entry.turn) {
-        const missing = entry.run.markerMissing();
+        const missing = entry.run.markerMissing({ unattended: this.unattended });
         if (missing.retry) {
           // 不再只发送短 marker 提示：REVISE 后模型可能丢失任务书上下文，
           // 第二轮因此再次输出普通说明并被迫停机。重试携带完整冻结要求和

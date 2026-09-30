@@ -238,6 +238,7 @@ export class AuditLifecycle {
       driver: this.driver, gitGate: gate,
       onTransient: this.retryScheduler ? (entry, _result, attempt) => this.#scheduleRetry(entry.run.runId, attempt) : null,
       onQuota: this.onQuota,
+      unattended: this.approvalPolicy === 'AUTO',
     });
     this.executors.set(runId, executor);
     this.liveRuns.set(runId, run);
@@ -356,6 +357,7 @@ export class AuditLifecycle {
       driver: this.driver, gitGate: gate,
       onTransient: this.retryScheduler ? (entry, _result, attempt) => this.#scheduleRetry(entry.run.runId, attempt) : null,
       onQuota: this.onQuota,
+      unattended: this.approvalPolicy === 'AUTO',
     });
     this.executors.set(runId, executor);
     this.liveRuns.set(runId, run);
@@ -410,7 +412,7 @@ export class AuditLifecycle {
         this.#notify(run, 'VERDICT_NEED_USER', {
           ...detail,
           question: join(v.question),
-          nextStep: '请直接回复本会话回答上述问题（同轮审核已保留）；处理后 `/audit resume` 继续，或 `/audit stop` 退出。',
+          nextStep: '系统已将审核澄清自动转为 REVISE，执行器会继续核验；无需人工授权或点击。',
         });
       } else if (result.exhausted) {
         this.#notify(run, 'VERDICT_REVISE_LOOP_EXHAUSTED', {
@@ -637,6 +639,7 @@ export class AuditLifecycle {
       driver: this.driver, gitGate: gate,
       onTransient: this.retryScheduler ? (entry, _result, attempt) => this.#scheduleRetry(entry.run.runId, attempt) : null,
       onQuota: this.onQuota,
+      unattended: this.approvalPolicy === 'AUTO',
     });
     this.executors.set(runId, executor);
     await executor.start({
@@ -887,6 +890,7 @@ export class AuditLifecycle {
       driver: this.driver, gitGate: gate,
       onTransient: this.retryScheduler ? (entry, _result, attempt) => this.#scheduleRetry(entry.run.runId, attempt) : null,
       onQuota: this.onQuota,
+      unattended: this.approvalPolicy === 'AUTO',
     });
     this.executors.set(runId, executor);
     this.liveRuns.set(runId, run);
