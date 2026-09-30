@@ -148,7 +148,13 @@ export class AuditExecutor {
       if (entry.run.s.state !== 'EXECUTING') return { turnEnded: true, stale: true };
       if (data.reason?.kind === 'completed' && entry.markerTurn !== entry.turn) {
         const missing = entry.run.markerMissing();
-        if (missing.retry) this.driver.submit(entry.agent, `请在同一阶段重新严格输出 READY_FOR_AUDIT marker，不要输出普通说明。\n\n${executorMarkerTemplate({ runId: entry.run.runId, hostId: entry.run.manifest.hostId, stage: entry.run.s.currentStage, iteration: entry.run.s.iteration })}`);
+        if (missing.retry) {
+          // 不再只发送短 marker 提示：REVISE 后模型可能丢失任务书上下文，
+          // 第二轮因此再次输出普通说明并被迫停机。重试携带完整冻结要求和
+          // 当前四元组模板，保持同一 session/iteration。
+          this.driver.submit(entry.agent, this.#promptWithMarker(entry,
+            `当前阶段 ${entry.run.s.currentStage} 的上一次输出未包含合法 READY_FOR_AUDIT marker。请继续执行审核意见并完成修改；完成后只输出严格 marker。`));
+        }
         return { ...missing, turnEnded: true };
       }
       return { turnEnded: true };

@@ -295,6 +295,17 @@ export class SessionDriver {
     agent.cancel({ kind: 'user' }, { keepInbox: true });
   }
 
+  /** 清理本进程已加载但不再被任何业务绑定的旧 session。 */
+  async cleanupUnused(activeIds = new Set()) {
+    const removed = [];
+    for (const [id, entry] of this.live) {
+      if (activeIds.has(id)) continue;
+      await this.unload(id);
+      removed.push(id);
+    }
+    return removed;
+  }
+
   /** Drop our live handle (session stays durable on disk). */
   unload(sessionId) {
     const entry = this.live.get(sessionId);
