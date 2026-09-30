@@ -114,6 +114,8 @@ export class AuditExecutor {
     const data = event?.data ?? event;
     entry.run.recordExecutorEvent(event?.type ?? 'unknown', data.turn ?? entry.turn);
     if (event?.type === 'turn/start') {
+      // 新回合开始后，清除额度/重挂期间的旧消息隔离标记。
+      entry.awaitingFreshTurn = false;
       // AutoContinue submits the normal "继续" after the model quota window
       // recovers. Re-open the durable audit state at that boundary; the
       // executor prompt itself is the continuation, so no duplicate prompt.
@@ -129,6 +131,9 @@ export class AuditExecutor {
       // same executor cycle; never turn a temporary 429 into a human stop.
       if (data.reason?.kind === 'error' && isQuotaFailure(data.reason?.error?.message ?? data.reason?.error?.code)) {
         if (entry.run.s.state === 'EXECUTING') {
+          // 额度切换会结束当前 turn；其迟到的 assistant/message 必须等新
+          // turn/start 后再接收，不能污染下一轮 marker。
+          entry.awaitingFreshTurn = true;
           this.onQuota?.({ agent: entry.agent, run: entry.run, message: data.reason?.error?.message ?? data.reason?.error?.code });
           entry.run.dshQuotaExhausted();
           return { turnEnded: true, quota: true, waitingQuota: true };
