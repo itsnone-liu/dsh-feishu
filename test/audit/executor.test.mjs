@@ -21,21 +21,9 @@ const runFixture = () => {
   return { store, run, agent, driver, submitted };
 };
 
-await ok('B4 human approval wait is not marker failure and routes approval', async () => {
-  const f = runFixture(); f.run.s.currentStage = 'B4';
-  const ex = new AuditExecutor({ driver: f.driver, gitGate: {} });
-  await ex.start({ run: f.run, agent: f.agent, gitGate: {} });
-  const r = await ex.onEvent({ id: 's-a' }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: `[DSH-AUDIT]\nSTATE: WAIT_HUMAN_APPROVAL\nRUN_ID: r1\nSTAGE: B4\nITERATION: 1\nHOST_ID: h1\nQUESTION:\nreceipt_sha256: ${'a'.repeat(64)}; 等待人工批准` }] } } });
-  assert.equal(r.waitingForHuman, true); assert.equal(f.run.s.waitingForHuman, true); assert.equal(f.run.s.markerRetries, 0);
-  const before = f.submitted.length;
-  const routed = ex.submitHumanResponse('r1', `我明确批准 SEAL_ANNOTATION_ONLY receipt exact hash:
-${'a'.repeat(64)}
-
-该批准仅授权当前 session / reveal / attempt 所绑定的
-这一份 exact receipt bytes，不授权任何其他 receipt、REVEAL、
-outcome 或 next ordinal。`);
-  assert.equal(routed.submitted, true); assert.equal(f.submitted.length, before + 1); assert.equal(f.run.s.waitingForHuman, false);
-});
+// 2026-09-30 业主指令（纯无人值守）：人工授权门已删除——原"B4 human approval
+// wait is not marker failure and routes approval"用例随 WAIT_HUMAN_APPROVAL
+// 协议一并移除。B4 等阶段不再有任何人闸语义，直接 READY_FOR_AUDIT 收口。
 
 await ok('start submits exactly one executor prompt to bound session', async () => {
   const f = runFixture(); const ex = new AuditExecutor({ driver: f.driver, gitGate: {} });

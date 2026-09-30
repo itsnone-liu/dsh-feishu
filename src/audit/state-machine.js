@@ -52,7 +52,7 @@ export const EVENTS = Object.freeze([
   'AUDIT_STARTED', 'AUDIT_REVISE', 'AUDIT_APPROVE', 'REVISE_LOOP_EXHAUSTED',
   'MARKER_RETRY', 'MARKER_PARSE_FAILED', 'VERDICT_RETRY', 'VERDICT_PARSE_FAILED', 'IDENTITY_MISMATCH',
   'DSH_QUOTA_WAIT', 'DSH_QUOTA_RECOVER', 'WEB_QUOTA_WAIT', 'WEB_QUOTA_RECOVER',
-  'NEED_USER', 'WAITING_FOR_HUMAN', 'HISTORY_REWRITTEN', 'HUMAN_RESUME', 'PAUSED_BY_USER', 'RESUMED_BY_USER',
+  'NEED_USER', 'HISTORY_REWRITTEN', 'HUMAN_RESUME', 'PAUSED_BY_USER', 'RESUMED_BY_USER',
   'RECOVERED_REVISE_EXECUTING',
   'STAGE_ADVANCED', 'TARGET_REACHED', 'RUN_STOPPED', 'STOP_TARGET_CHANGED',
   'AUDIT_SESSION_REBOUND',
@@ -93,9 +93,6 @@ export class AuditRun {
       pausedFrom: null,
       cause: null,               // PAUSED_* / EXHAUSTED 的原因
       lastPauseCause: null,
-      waitingForHuman: false,
-      waitingReason: null,
-      waitingApprovalHash: null,
       lastExecutorEventAt: null,
       lastExecutorEvent: null,
       lastExecutorTurn: null,
@@ -176,6 +173,21 @@ export class AuditRun {
       this.#transition('PAUSED_NEEDS_USER', { cause: 'HISTORY_REWRITTEN', pausedFrom: 'EXECUTING' });
       return { recovered: 'PAUSED_NEEDS_USER' };
     }
+    // 2026-09-30 业主指令（纯无人值守）：人工授权门已整体删除。旧持久化
+    // state 可能仍带 waitingForHuman=true（如 2026-09-30 卡在 B4 的
+    // audit_20260930021152297）——加载即确定性解除并留事件痕迹，调用方
+    //（lifecycle.restoreActive）据 humanGateCleared 补发阶段 prompt。
+    if (this.s.waitingForHuman) {
+      this.s.waitingForHuman = false;
+      this.s.waitingReason = null;
+      this.s.waitingApprovalHash = null;
+      this.s.waitingQuestion = null;
+      this.s.humanGatePassed = null;
+      this.#touch(); this.store.saveState(this.s);
+      this.#emit('HUMAN_GATE_REMOVED', { reason: 'unattended-policy-2026-09-30', stage: this.s.currentStage });
+      this.humanGateCleared = true; // 供 lifecycle.restoreActive 判断补发阶段 prompt
+      return { recovered: null, humanGateCleared: true };
+    }
     // A5.5 recovery guard: a duplicate /audit resume raced with the synchronous
     // REVISE feedback path and persisted AUDITING without an auditInFlight.
     // REVISE is authoritative here: the next iteration must be executor-owned.
@@ -241,44 +253,6 @@ export class AuditRun {
     this.s.lastExecutorEvent = event;
     this.s.lastExecutorTurn = turn;
     this.#touch(); this.store.saveState(this.s);
-  }
-
-  clearHumanWait() {
-    const passedHash = this.s.waitingApprovalHash;
-    this.s.waitingForHuman = false;
-    this.s.waitingReason = null;
-    this.s.waitingApprovalHash = null;
-    this.s.waitingQuestion = null; // R1 F1：随人闸解除一并清空
-    // P-B D5：记录该（stage, iteration）人闸已按规放行——executor 的 READY
-    // 防绕过守卫据此区分"门已过"与"门未过"。自作用域：阶段推进或 REVISE 换
-    // iteration 后自然失配（批准绑定 attempt，不复用）。旧 state 无此字段 →
-    // undefined → 守卫按未放行处理（fail-closed）。
-    this.s.humanGatePassed = { stage: String(this.s.currentStage ?? '').toUpperCase(), iteration: this.s.iteration };
-    this.#touch(); this.store.saveState(this.s);
-    // GATE_PASSED 携带已放行 receipt hash：CONSTRAINT 预授权（P-B）的上游链
-    // 核验（I5）以本事件为证据源。
-    this.#emit('GATE_PASSED', { stage: this.s.currentStage, iteration: this.s.iteration, approvalHash: passedHash });
-  }
-
-  /**
-   * R1 F1：question（WAIT 块 QUESTION 段原文）随 run state 持久化，供人闸
-   * 等待通知完整呈现。可选字段：旧 state 无此字段读出 undefined，不影响
-   * 序列化/恢复兼容。
-   */
-  markWaitingForHuman(reason = 'B4_SEAL_APPROVAL', approvalHash = null, question = null) {
-    this.#assertNotTerminal();
-    if (this.s.state !== 'EXECUTING') throw new IllegalTransitionError(this.s.state, 'WAITING_FOR_HUMAN');
-    this.s.waitingForHuman = true;
-    this.s.waitingReason = reason;
-    this.s.waitingApprovalHash = approvalHash;
-    this.s.waitingQuestion = question == null ? null
-      : (Array.isArray(question) ? question.join('\n') : String(question));
-    // P-B D5：新 WAIT 块 = 同（stage, iteration）重新布防，旧放行即刻作废
-    //（防"批准一次、二次 WAIT 直接 READY"绕过）。
-    this.s.humanGatePassed = null;
-    this.#touch(); this.store.saveState(this.s);
-    this.#emit('NEED_USER', { reason });
-    return { waitingForHuman: true, reason };
   }
 
   markHumanResumeCycle() {
@@ -623,8 +597,6 @@ export class AuditRun {
     this.#emit('HUMAN_RESUME');
     const target = this.s.pausedFrom ?? 'EXECUTING';
     const previousCause = this.s.cause;
-    this.s.waitingForHuman = false;
-    this.s.waitingReason = null;
     this.#transition(target);
     // Preserve the historical reason separately; an active run must not be
     // presented as currently paused after a successful human resume.

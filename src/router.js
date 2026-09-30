@@ -8,7 +8,6 @@
  */
 import { buildErrorCard, buildInfoCard, buildImageRejectCard } from './cards.js';
 import { isWorkspaceAllowed } from './config.js';
-import { registerPreauthPhrase } from './audit/commands.js';
 import { sniffImageMediaType } from './util.js';
 import { log } from './log.js';
 import fs from 'node:fs';
@@ -188,43 +187,10 @@ export class ChatRouter {
       return;
     }
 
-    // A running audit may be waiting for an explicit human response (e.g. B4
-    // seal approval). Route that text to the dedicated audit session first;
-    // never inject it into the observer chat session.
-    const auditResponse = await this.commands.auditLifecycle?.submitHumanResponse(chatId, norm);
-    if (auditResponse?.handled) {
-      await this.transport.sendCard(chatId, buildInfoCard('✅ 审计人工输入已转交', `run：\`${auditResponse.runId}\`\n审计 session：\`${auditResponse.sessionId}\``));
-      return;
-    }
-    if (auditResponse?.invalidApproval) {
-      await this.transport.sendCard(chatId, buildErrorCard('❌ 审计人工输入未转交', auditResponse.reason));
-      return;
-    }
-
-    // P-C §4：无等待中人闸消费的普通文本，若逐字匹配预授权登记话术 → 登记。
-    // （等待中的话术消费已由上面 submitHumanResponse 的 preauth 分支处理。）
-    if (this.commands.auditPreauthStore && norm.length <= 2000) {
-      try {
-        const reg = registerPreauthPhrase(
-          { preauthStore: this.commands.auditPreauthStore, lifecycle: this.commands.auditLifecycle },
-          norm, chatId,
-        );
-        if (reg.ok) {
-          const r = reg.record;
-          await this.transport.sendCard(chatId, buildInfoCard('🔑 预授权已登记', [
-            `记录：\`${r.preauthId}\``,
-            `绑定：**${r.binding}** · ${r.gateKind} @ ${r.stage}`,
-            r.binding === 'EXACT' ? `receipt：\`${String(r.receiptHash).slice(0, 16)}…\`` : `约束：ordinal ≤ ${r.constraints?.maxOrdinal ?? '?'}，门位=blob(${r.constraints?.receiptSource?.commit?.slice(0, 12)}…:${r.constraints?.receiptSource?.path})`,
-            `运行链：\`${r.runScope?.rootRunId ?? '-'}\`（至 ${new Date(r.expiresAt).toISOString().replace(/\.\d{3}Z$/, 'Z')}）`,
-            '',
-            `门位布防时自动尝试消费；\`/audit preauth list\` 查看，\`/audit preauth revoke ${r.preauthId}\` 撤销。`,
-          ].join('\n')));
-          return;
-        }
-      } catch (e) {
-        log.error(`chat ${chatId}: preauth register hook failed: ${e?.stack ?? e}`);
-      }
-    }
+    // 2026-09-30 业主指令（纯无人值守）：审计人工输入转交通道已删除。
+    // 旧版把同 chat 普通文本当人闸批准尝试（invalidApproval 即丢消息并回
+    // 「❌ 审计人工输入未转交」），是 2026-09-30 卡死事故的直接机制；预授权
+    // 话术登记钩子（auditPreauthStore）一并移除。普通文本一律走正常 agent。
 
     // normal text traffic → agent
     const agent = await this.#agentFor(chatId);

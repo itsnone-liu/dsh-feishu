@@ -13,44 +13,11 @@ import { ProtocolParseError, IdentityMismatchError } from './errors.js';
 
 export const MARKER_TAG = '[DSH-AUDIT]';
 export const HANDOFF_TAG = '[DSH-AUDIT HANDOFF]';
-export const SEAL_APPROVAL_RE = /^我明确批准 SEAL_ANNOTATION_ONLY receipt exact hash:\n([0-9a-f]{64})\n\n该批准仅授权当前 session \/ reveal \/ attempt 所绑定的\n这一份 exact receipt bytes，不授权任何其他 receipt、REVEAL、\noutcome 或 next ordinal。$/i;
-export const sealApprovalHash = (text) => String(text ?? '').trim().match(SEAL_APPROVAL_RE)?.[1] ?? null;
-
-/**
- * R1 止血 F1：按 SEAL_APPROVAL_RE 冻结语义构造含真实 hash 的完整可复制批准话术。
- * 纯构造器，不改变 SEAL_APPROVAL_RE 的匹配语义；返回值必须能通过
- * sealApprovalHash 校验并取回同一 hash（r1-hotfix 测试双向锁定）。
- * hash 非 64 位十六进制时返回 null —— 不生成注定校验失败的话术。
- */
-export function buildSealApprovalText(hash) {
-  if (!/^[0-9a-f]{64}$/i.test(String(hash ?? ''))) return null;
-  return `我明确批准 SEAL_ANNOTATION_ONLY receipt exact hash:\n${hash}\n\n该批准仅授权当前 session / reveal / attempt 所绑定的\n这一份 exact receipt bytes，不授权任何其他 receipt、REVEAL、\noutcome 或 next ordinal。`;
-}
-
-/**
- * P-B 门位通用化：C2 类人闸（NEXT_REVEAL_ONLY）的冻结批准话术。与
- * SEAL_APPROVAL_RE 同级的严格语义：逐字模板 + proposal 64hex + 反授权扩张句。
- * receipt/proposal 在本管线一律 sha256（与任务书 receipt_sha256 一致）。
- */
-export const REVEAL_APPROVAL_RE = /^我明确批准 NEXT_REVEAL_ONLY proposal exact hash:\n([0-9a-f]{64})\n\n该批准仅授权当前 session \/ reveal \/ attempt 所绑定的\n这一份 exact proposal bytes，不授权任何其他 receipt、REVEAL、\noutcome 或 next ordinal。$/i;
-export const revealApprovalHash = (text) => String(text ?? '').trim().match(REVEAL_APPROVAL_RE)?.[1] ?? null;
-export function buildRevealApprovalText(hash) {
-  if (!/^[0-9a-f]{64}$/i.test(String(hash ?? ''))) return null;
-  return `我明确批准 NEXT_REVEAL_ONLY proposal exact hash:\n${hash}\n\n该批准仅授权当前 session / reveal / attempt 所绑定的\n这一份 exact proposal bytes，不授权任何其他 receipt、REVEAL、\noutcome 或 next ordinal。`;
-}
-
-/**
- * P-B：按门型分发的冻结话术注册表。kind 未识别 → approvalForGateKind
- * 返回 null（fail-closed：不匹配任何话术，也不构造话术）。
- */
-export const APPROVAL_PHRASES = {
-  SEAL: { re: SEAL_APPROVAL_RE, hashOf: sealApprovalHash, build: buildSealApprovalText, gateKind: 'SEAL_ANNOTATION_ONLY', noun: 'receipt' },
-  REVEAL: { re: REVEAL_APPROVAL_RE, hashOf: revealApprovalHash, build: buildRevealApprovalText, gateKind: 'NEXT_REVEAL_ONLY', noun: 'proposal' },
-};
-export const approvalForGateKind = (gateKind) => Object.values(APPROVAL_PHRASES).find((p) => p.gateKind === String(gateKind ?? '').toUpperCase()) ?? null;
+// 2026-09-30 业主指令（纯无人值守）：人工批准话术协议整体删除——
+// SEAL/REVEAL 批准正则与话术构造器（buildSealApprovalText 等）、
+// WAIT_HUMAN_APPROVAL 等待块解析均已移除。历史实现见 git（≤ commit 763f205）。
 
 export const EXECUTOR_MARKER_STATES = ['READY_FOR_AUDIT'];
-export const EXECUTOR_WAIT_STATES = ['WAIT_HUMAN_APPROVAL'];
 export const VERDICT_STATES = ['APPROVE', 'REVISE', 'NEED_USER'];
 
 /** 头段键白名单（封闭集合）。 */
@@ -162,13 +129,6 @@ export function parseAuditBlock(text, opts) {
     hostId: headers.has('HOST_ID') ? headers.get('HOST_ID') : null,
     sections,
   };
-}
-
-/** 解析 DSH executor 的人类批准等待块。HEAD 不应出现。 */
-export function parseHumanApprovalWait(text) {
-  const b = parseAuditBlock(text, { allowedStates: EXECUTOR_WAIT_STATES, requireHead: false });
-  if (!b.sections.QUESTION?.length) throw new ProtocolParseError('WAIT_HUMAN_APPROVAL requires QUESTION');
-  return { state: b.state, runId: b.runId, stage: b.stage, iteration: b.iteration, hostId: b.hostId, question: b.sections.QUESTION };
 }
 
 /** 解析 DSH executor 的 READY_FOR_AUDIT marker（§9）。HEAD 必填。 */

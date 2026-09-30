@@ -104,10 +104,8 @@ export function createManifest(raw, now = Date.now) {
     approvedPlan,
     taskPacketHash: raw.taskPacketHash ?? null,
     stageRequirements: raw.stageRequirements ?? null,
-    // P-B 门位声明（任务书 preauthorization 节派生）：stage → {kind, bindings}。
-    // 旧 run 无此字段 → null（executor 按 legacy /^B4$/ 回退推断）。
-    stageGates: raw.stageGates ?? null,
-    preauthorization: raw.preauthorization ?? null,
+    // 2026-09-30：stageGates/preauthorization 已随人工授权门删除；旧 run
+    // manifest 里的同名字段加载时被显式忽略（不再进内存 manifest）。
     stages: [...stages],
     currentStage,
     stopAfter,

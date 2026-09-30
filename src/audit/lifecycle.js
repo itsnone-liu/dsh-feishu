@@ -10,15 +10,12 @@
 import { AuditRun } from './state-machine.js';
 import { AuditExecutor } from './executor.js';
 import { GitRemoteGate } from './git-gate.js';
-import { buildSealApprovalText, buildRevealApprovalText, approvalForGateKind } from './protocol.js';
 import { loadTaskPacket } from './task-packet.js';
 import { AuditRetryScheduler } from './retry-scheduler.js';
-import { parsePreauthText } from './preauth-protocol.js';
-import { createHash } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+// 2026-09-30 业主指令（纯无人值守）：人工批准话术构造/预授权协议 import 已删除。
 
 export class AuditLifecycle {
-  constructor({ controller, driver, bindings, onProgress = null, watchdogMs = 5 * 60_000, gitGateFactory = (opts) => new GitRemoteGate(opts), executorFactory = (opts) => new AuditExecutor(opts), taskPacketLoader = loadTaskPacket, retryScheduler = null, onError = null, reviewTimeoutMs = 20 * 60_000, gitTimeoutMs = 120_000, preauthStore = null, approvalPolicy = 'MANUAL', gitSnapshotProvider = null,
+  constructor({ controller, driver, bindings, onProgress = null, watchdogMs = 5 * 60_000, gitGateFactory = (opts) => new GitRemoteGate(opts), executorFactory = (opts) => new AuditExecutor(opts), taskPacketLoader = loadTaskPacket, retryScheduler = null, onError = null, reviewTimeoutMs = 20 * 60_000, gitTimeoutMs = 120_000, approvalPolicy = 'MANUAL', gitSnapshotProvider = null,
     reviewRetryDelays = null, reviewInfraIncidentAfter = 3, logFileHint = null, incidentBridgeRoot = null,
   } = {}) {
     this.controller = controller;
@@ -29,9 +26,6 @@ export class AuditLifecycle {
     this.watchdogMs = watchdogMs;
     this.reviewTimeoutMs = reviewTimeoutMs; // R1 F4：reviewer.review 硬超时（默认 20min，可注入；测试传 1ms）
     this.gitTimeoutMs = gitTimeoutMs;       // R1 F4：git 子进程硬超时（透传 gitGateFactory）
-    // P-B §3：门位预授权消费只读候选 + 单事务消费（markConsumed）；登记权
-    //（append/revoke）仍只在 commands 层（I7）。null = 未装配 = 全走人工话术。
-    this.preauthStore = preauthStore;
     // AUTO is the production unattended policy. MANUAL remains an explicit
     // step-by-step compatibility mode for tests and deliberate re-audits.
     this.approvalPolicy = String(approvalPolicy ?? 'MANUAL').toUpperCase();
@@ -68,23 +62,8 @@ export class AuditLifecycle {
     try { this.onProgress?.({ runId: run.runId, chatId: run.manifest.chatId, stage: run.s.currentStage, state: run.s.state, event, ...detail }); } catch {}
   }
 
-  /**
-   * R1 止血 F1：人闸等待的完整通知 detail。此前 onProgress 只有一行状态摘要，
-   * 用户看不到问题、hash 与批准话术 —— 人闸等同静默死锁。话术由
-   * protocol.buildSealApprovalText 按 SEAL_APPROVAL_RE 冻结语义构造
-   * （sealApprovalHash 可校验回同一 hash）；旧 state 无 waitingQuestion 字段
-   * 读出 undefined → null，兼容。
-   */
-  #humanWaitDetail(run) {
-    const hash = run.s.waitingApprovalHash ?? null;
-    return {
-      reason: run.s.waitingReason ?? null,
-      question: run.s.waitingQuestion ?? null,
-      approvalHash: hash,
-      approvalTemplate: hash ? buildSealApprovalText(hash) : null,
-      stopHint: '/audit stop',
-    };
-  }
+  // 2026-09-30 业主指令（纯无人值守）：#humanWaitDetail（人闸等待卡）已随
+  // 人工授权门整体删除——执行器不再产生 WAIT_HUMAN_APPROVAL 等待态。
 
   #watchdog() {
     const now = Date.now();
@@ -238,7 +217,7 @@ export class AuditLifecycle {
       startingCommit: git.head, stageBaseCommit: git.head,
       goal: packet.goal, approvedPlan: packet.approvedPlan,
       taskPacketHash: packet.taskPacketHash, stageRequirements: packet.stageRequirements,
-      stageGates: packet.stageGates ?? {}, preauthorization: packet.preauthorization ?? null, // P-B 门位声明随 manifest 冻结
+      // 2026-09-30：stageGates/preauthorization 已随人工门删除，不再进 manifest。
     }, { maxReviewIterations: this.controller.maxReviewIterations, now: this.controller.now });
     const executor = this.executorFactory({
       driver: this.driver, gitGate: gate,
@@ -352,8 +331,8 @@ export class AuditLifecycle {
       stages, stopAfter: stopAfterStage, currentStage: nextStage,
       startingCommit: git.head, stageBaseCommit: parent.state.headCommit,
       goal: currentPacket.goal, approvedPlan: packet.approvedPlan,
-      taskPacketHash: currentPacket.taskPacketHash, stageRequirements: packet.stageRequirements,
-      stageGates: currentPacket.stageGates ?? {}, preauthorization: packet.preauthorization ?? null, // P-B 门位声明随 manifest 冻结
+      taskPacketHash: packet.taskPacketHash, stageRequirements: packet.stageRequirements,
+      // 2026-09-30：stageGates/preauthorization 已随人工门删除，不再进 manifest。
       parentRunId: pm.runId, rootRunId: pm.rootRunId ?? pm.runId, completedStages,
       ignorePaths: pm.ignorePaths,
     }, { maxReviewIterations: this.controller.maxReviewIterations, now: this.controller.now });
@@ -444,23 +423,7 @@ export class AuditLifecycle {
     if (run.s.state !== 'AUDITING' || !inFlight) throw Object.assign(new Error('audit packet unavailable outside AUDITING'), { code: 'AUDIT_REVIEW_NOT_READY' });
     const stage = inFlight.stage ?? run.s.currentStage;
     const packet = { runId, hostId: run.manifest.hostId, stage, iteration: inFlight.iteration ?? run.s.iteration, repo: run.manifest.repo, branch: run.manifest.branch, targetCommit: inFlight.headCommit, baseCommit: run.s.stageBaseCommit, goal: run.manifest.goal, stageRequirement: run.manifest.stageRequirements?.[stage] ?? null };
-    // P-C：人闸溯源注入（评审员据此认证"门已被人类授权"——EXACT/CONSTRAINT
-    // 预授权放行或人工话术放行都留事件；无门阶段不注入）。
-    const gateEvents = this.#chainEvents(run).filter((e) => ['GATE_PASSED', 'GATE_PASSED_BY_PREAUTH', 'GATE_PASSED_BY_POLICY', 'GATE_PREAUTH_MISMATCH'].includes(e.event)
-      && String(e.stage).toUpperCase() === String(stage).toUpperCase());
-    const stageGateDecl = run.manifest.stageGates?.[String(stage).toUpperCase()] ?? null;
-    if (stageGateDecl || gateEvents.length > 0) {
-      packet.gateProvenance = {
-        declaredGate: stageGateDecl,
-        preauthorizationSemantics: run.manifest.preauthorization?.semantics ?? null,
-        events: gateEvents.map((e) => ({
-          event: e.event, stage: e.stage, iteration: e.iteration,
-          approvalHash: e.approvalHash ?? null, preauthId: e.preauthId ?? null,
-          binding: e.binding ?? null, detail: e.detail ?? null,
-        })),
-        note: 'GATE_PASSED 携带被批准话术的 receipt sha256（approvalHash）；GATE_PASSED_BY_PREAUTH 为桥经验证的人类预授权记录放行（preauthId 可溯源 PreauthStore 登记话术与消息）；GATE_PREAUTH_MISMATCH 为未放电的失配尝试（审计留痕）。',
-      };
-    }
+    // 2026-09-30：gateProvenance 注入已随人工授权门删除（不再有 GATE_PASSED* 事件）。
     for (;;) {
       let verdict;
       try { verdict = await this.#reviewWithTimeout(packet, reviewer); }
@@ -662,212 +625,18 @@ export class AuditLifecycle {
       run: old,
       agent,
       gitGate: gate,
-      sendPrompt: old.s.state === 'EXECUTING' && !old.s.waitingForHuman,
+      sendPrompt: old.s.state === 'EXECUTING',
     });
     this.#notify(old, 'AUDIT_SESSION_REBOUND', { auditSessionId: agent.id, observerSessionId: binding.sessionId });
     return { run: old, agent, executor };
     });
   }
 
-  async submitHumanResponse(chatId, text) {
-    for (const [runId, run] of this.liveRuns) {
-      if (run.manifest.chatId !== chatId || !run.s.waitingForHuman) continue;
-      const executor = this.executors.get(runId);
-      if (!executor) return { handled: false, reason: 'executor_missing' };
-      // P-B §3：预授权先于人工话术尝试（先到先消费，两者并行）。
-      const gateHash = run.s.waitingApprovalHash;
-      let pre = null;
-      if (this.preauthStore) {
-        let parsed = null;
-        try { parsed = parsePreauthText(text); } catch { parsed = null; }
-        if (parsed) {
-          // §1/§4：用户发出逐字话术本身就是登记行为 —— 先落记录（本 run 链绑定、
-          // 24h 默认窗；EXACT 运行链取自话术），再走消费验证。单条消息即完成
-          // "登记+放行"；若与当前门位失配，记录保留给未来匹配该 hash/约束的布防。
-          this.#registerPreauthRecord(run, parsed, chatId, text);
-          pre = this.#verifyPreauthCandidates(run, { bindingFilter: parsed.binding, gateKindFilter: parsed.gateKind });
-        } else pre = null;
-      }
-      if (pre?.passed) {
-        const injected = this.#injectCanonicalApproval(run, runId, pre.record, gateHash);
-        if (injected) return { handled: true, runId, byPreauth: true, preauthId: pre.record.preauthId };
-        return { handled: false, runId, reason: 'canonical_phrase_rejected' };
-      }
-      if (pre?.mismatch) {
-        this.#appendRunEvent(run, 'GATE_PREAUTH_MISMATCH', { stage: run.s.currentStage, receiptHash: gateHash, detail: pre.detail });
-        this.#notify(run, 'GATE_PREAUTH_MISMATCH', { message: `预授权话术与门位事实不符（${pre.detail}），不放电；可人工话术批准或 /audit preauth list 检查。` });
-        // 失配不阻断人工话术并行路径（该文本若同时是合法人工话术仍可放行）。
-      }
-      const result = executor.submitHumanResponse(runId, text);
-      return { handled: Boolean(result.submitted), runId, byPreauth: false, ...result };
-    }
-    return { handled: false };
-  }
+  // 2026-09-30 业主指令（纯无人值守）：submitHumanResponse 与整个预授权
+  // 消费/登记/自动放行子系统（#registerPreauthRecord / #autoPreauthPass /
+  // #injectCanonicalApproval / #verifyPreauthCandidates / #consumePreauth /
+  // #chainEvents / #blobSha256）已整体删除。聊天文本不再被审计拦截。
 
-  /** §4 话术即登记：解析成功的预授权话术在发送瞬间落 PreauthStore 记录。 */
-  #registerPreauthRecord(run, parsed, chatId, text) {
-    const common = {
-      chatId, messageRef: `chat:${chatId}:${Date.now()}`, humanText: String(text ?? '').trim(),
-      binding: parsed.binding, gateKind: parsed.gateKind, stage: parsed.stage,
-      expiresAt: parsed.expiresAt ?? Date.now() + 24 * 3600_000,
-    };
-    try {
-      if (parsed.binding === 'EXACT') {
-        this.preauthStore.append({ ...common, receiptHash: parsed.receiptHash, runScope: parsed.runScope });
-      } else {
-        this.preauthStore.append({
-          ...common, constraints: parsed.constraints,
-          runScope: { rootRunId: run.manifest.rootRunId ?? run.runId },
-        });
-      }
-    } catch (e) {
-      this.onError?.(new Error(`preauth register-from-phrase failed: ${e.message}`), run.runId);
-    }
-  }
-
-  /**
-   * P-B §3 步骤 1-5：WAIT 布防即自动尝试预授权放行（无人值守触发点，不等
-   * 用户消息）。无候选/失配按步骤 5 静默走 NEED_USER 现状路径（通知由
-   * onEvent 的 WAITING_FOR_HUMAN 分支发 R1 卡，不重复失配细节）。
-   */
-  async #autoPreauthPass(run, runId) {
-    if (!run.s.waitingForHuman) return null;
-    const gateHash = run.s.waitingApprovalHash;
-    // A task packet PREAUTH declaration overrides unattended AUTO policy.
-    // B4/C2/C5 must be released only by a verified PreauthStore record;
-    // POLICY_AUTO is forbidden because it has no human message/preauthId.
-    const stageKey = String(run.s.currentStage ?? '').toUpperCase();
-    const declaredPreauth = run.manifest.preauthorization?.gates?.[stageKey] ?? null;
-    if (declaredPreauth) {
-      if (!this.preauthStore) return null;
-      const verified = this.#verifyPreauthCandidates(run, {});
-      if (verified?.passed) {
-        const injected = this.#injectCanonicalApproval(run, runId, verified.record, gateHash);
-        if (injected) return verified;
-      }
-      return null;
-    }
-    // For gates without an explicit PREAUTH declaration, AUTO retains the
-    // legacy unattended protocol behavior.
-    if (this.approvalPolicy === 'AUTO') {
-      const policyRecord = { preauthId: null, binding: 'POLICY_AUTO' };
-      const injected = this.#injectCanonicalApproval(run, runId, policyRecord, gateHash, 'GATE_PASSED_BY_POLICY');
-      return injected ? { passed: true, record: policyRecord, policy: true } : null;
-    }
-    if (!this.preauthStore) return null;
-    const verified = this.#verifyPreauthCandidates(run, {});
-    if (verified?.passed) {
-      const injected = this.#injectCanonicalApproval(run, runId, verified.record, gateHash);
-      if (injected) return verified;
-    }
-    return null;
-  }
-
-  /** 消费成功后的统一注入：规范批准话术 → executor.submitHumanResponse + 事件 + 通知。 */
-  #injectCanonicalApproval(run, runId, record, gateHash, passEvent = 'GATE_PASSED_BY_PREAUTH') {
-    const executor = this.executors.get(runId);
-    if (!executor) return false;
-    const gate = run.manifest.stageGates?.[String(run.s.currentStage).toUpperCase()];
-    const phrase = approvalForGateKind(gate?.kind === 'REVEAL' ? 'NEXT_REVEAL_ONLY' : 'SEAL_ANNOTATION_ONLY');
-    const canonical = (gate?.kind === 'REVEAL' ? buildRevealApprovalText : buildSealApprovalText)(gateHash);
-    if (!canonical || !phrase) return false;
-    const result = executor.submitHumanResponse(runId, canonical);
-    if (!result.submitted) return false;
-    this.#appendRunEvent(run, passEvent, { preauthId: record.preauthId, binding: record.binding, stage: run.s.currentStage, receiptHash: gateHash });
-    this.#notify(run, passEvent, { message: `阶段 ${run.s.currentStage} 人闸已由${record.binding === 'POLICY_AUTO' ? '无人值守策略' : `预授权 ${record.preauthId}`} 放行，继续执行。` });
-    return true;
-  }
-
-  /**
-   * P-B §3 门位候选核验（I2/I5/I6/ordinal；只读候选 + 单事务消费）。
-   * @param {object} run 等待中的 run
-   * @param {{bindingFilter?:string, gateKindFilter?:string}} opt 话术驱动路径带
-   *        过滤（话术声明的绑定型/门型必须与记录一致）；自动路径传 {}。
-   * @returns {{passed:true, record}|{mismatch:true, detail}|null}
-   *  null = 该门无可用候选（自动路径静默走 NEED_USER）。
-   */
-  #verifyPreauthCandidates(run, opt = {}) {
-    if (!this.preauthStore) return null;
-    const stage = String(run.s.currentStage).toUpperCase();
-    const gateDecl = run.manifest.stageGates?.[stage];
-    if (!gateDecl) return opt.bindingFilter ? { mismatch: true, detail: `阶段 ${stage} 未声明人闸` } : null;
-    if (opt.bindingFilter && !gateDecl.bindings?.includes(opt.bindingFilter)) {
-      return { mismatch: true, detail: `阶段 ${stage} 不接受 ${opt.bindingFilter} 预授权（声明：${(gateDecl.bindings ?? []).join('|')}）` };
-    }
-    const rootRunId = run.manifest.rootRunId ?? run.runId;
-    // 自动路径按门声明的 kind 推 gateKind；话术路径用话术声明的 gateKind。
-    const gateKind = opt.gateKindFilter ?? (gateDecl.kind === 'REVEAL' ? 'NEXT_REVEAL_ONLY' : 'SEAL_ANNOTATION_ONLY');
-    const candidates = this.preauthStore.findEligible({ stage, gateKind, rootRunId });
-    if (candidates.length === 0) {
-      return opt.bindingFilter ? { mismatch: true, detail: `无可用 ${gateKind}/${stage}@${rootRunId} 预授权记录` } : null;
-    }
-    const chainEvents = this.#chainEvents(run);
-    // ordinal = 本链在该阶段已布防的人闸次数（markWaitingForHuman 同步落
-    // NEED_USER 事件，当前等待已计入 —— 首门 ordinal=1）。
-    const waitOrdinal = chainEvents.filter((e) => (e.event === 'NEED_USER' || e.event === 'WAITING_FOR_HUMAN') && String(e.stage).toUpperCase() === stage).length;
-    for (const rec of candidates) {
-      if (opt.bindingFilter && rec.binding !== opt.bindingFilter) continue; // 话术声明的绑定型与记录必须一致
-      if (rec.binding === 'EXACT') {
-        // I2：精确 hash 比对（逐字符，小写归一）。
-        if (String(rec.receiptHash).toLowerCase() === String(run.s.waitingApprovalHash).toLowerCase()) {
-          return this.#consumePreauth(rec, run, stage, waitOrdinal);
-        }
-        continue;
-      }
-      // CONSTRAINT：I5 上游链 + I6 blob 溯源 + ordinal 上限。
-      const c = rec.constraints ?? {};
-      if (Number.isFinite(c.maxOrdinal) && waitOrdinal > c.maxOrdinal) continue;
-      const upstream = c.upstream?.[0];
-      if (!upstream) continue;
-      const upstreamPassed = chainEvents.some((e) => e.event === 'GATE_PASSED'
-        && String(e.stage).toUpperCase() === String(upstream.stage).toUpperCase()
-        && String(e.approvalHash ?? '').toLowerCase() === String(upstream.receiptHash).toLowerCase());
-      if (!upstreamPassed) continue;
-      const src = c.receiptSource;
-      if (!src?.path || !src?.commit) continue;
-      // I6：从 git object db 取 (commit, path) blob 字节，sha256 与门位 hash 比对。
-      const blobHash = this.#blobSha256(run.manifest.cwd, src.commit, src.path);
-      if (blobHash && blobHash === String(run.s.waitingApprovalHash).toLowerCase()) {
-        return this.#consumePreauth(rec, run, stage, waitOrdinal);
-      }
-    }
-    return { mismatch: true, detail: `${candidates.length} 条候选均未通过 I2/I5/I6/ordinal 核验` };
-  }
-
-  #consumePreauth(rec, run, stage, ordinal) {
-    try {
-      this.preauthStore.markConsumed(rec.preauthId, {
-        runId: run.runId, stage, ordinal, receiptHash: run.s.waitingApprovalHash,
-      });
-      return { passed: true, record: this.preauthStore.get(rec.preauthId) ?? rec };
-    } catch (e) {
-      // PreauthAlreadyConsumed / 已撤销已过期 → fail-closed 当作失配。
-      return { mismatch: true, detail: `消费失败：${e.code ?? e.message}` };
-    }
-  }
-
-  /** 运行链（本 run → parentRunId → … → root）事件证据（loadRun 只读；缺失容忍）。 */
-  #chainEvents(run) {
-    const out = [];
-    const seen = new Set();
-    let cursor = run.runId;
-    while (cursor && !seen.has(cursor)) {
-      seen.add(cursor);
-      const st = this.controller.store.loadRun(cursor);
-      if (st?.events) out.push(...(st.events ?? []));
-      const parent = st?.manifest?.parentRunId;
-      if (!parent || seen.has(parent)) break;
-      cursor = parent;
-    }
-    return out;
-  }
-
-  #blobSha256(cwd, commit, path) {
-    try {
-      const stdout = execFileSync('git', ['-c', 'core.autocrlf=false', 'show', `${commit}:${path}`], { cwd, maxBuffer: 16 * 1024 * 1024 });
-      return createHash('sha256').update(stdout).digest('hex');
-    } catch { return null; }
-  }
 
   /** lifecycle 级事件（镜像 state-machine #emit 形态；dedupeKey 必填唯一）。 */
   #appendRunEvent(run, event, extra = {}) {
@@ -917,25 +686,9 @@ export class AuditLifecycle {
         // 非绑定 session 的事件返回 {ignored:true}，不得误触 reviewer。
         if (r?.turnEnded === true) await this.#maybeAutoReviewLocked(runId);
         const current = this.liveRuns.get(runId);
-        // P-B §3 步骤 1-5：WAIT 布防即自动尝试预授权放行（无人值守触发点 ——
-        // 不等用户发话术）。放行成功不落 NEED_USER 通知（门已过）；无候选或
-        // 失配按 §3 步骤 5 走现状 NEED_USER 路径（R1 卡）。
-        let autoGate = null;
-        if (current && r?.waitingForHuman) autoGate = await this.#autoPreauthPass(current, runId);
-        if (autoGate?.policy) r = { ...r, autoPolicyPassed: true };
-        if (current && (r?.turnEnded || r?.ready || r?.advanced || r?.retry || r?.paused || r?.waitingForHuman || r?.waitingQuota)) {
-          const cur2 = this.liveRuns.get(runId);
-          const stillWaiting = cur2?.s?.waitingForHuman === true;
-          const evName = r?.waitingQuota ? 'DSH_QUOTA_WAIT' : (r?.ready ? 'READY_FOR_AUDIT' : (r?.waitingForHuman ? 'WAITING_FOR_HUMAN' : (r?.paused ? 'PAUSED' : 'EXECUTOR_EVENT')));
-          if (evName === 'WAITING_FOR_HUMAN' && !stillWaiting) {
-            // 门在自动预授权中已放行：结果行改记 GATE_PASSED_BY_PREAUTH，避免误报等待。
-            this.#notify(cur2, 'GATE_PASSED_BY_PREAUTH', { result: r, message: `阶段 ${cur2.s.currentStage} 人闸由预授权自动放行（无人值守）。` });
-          } else {
-            this.#notify(current, evName, {
-              result: r,
-              ...(evName === 'WAITING_FOR_HUMAN' ? this.#humanWaitDetail(current) : {}), // R1 F1
-            });
-          }
+        if (current && (r?.turnEnded || r?.ready || r?.advanced || r?.retry || r?.paused || r?.waitingQuota)) {
+          const evName = r?.waitingQuota ? 'DSH_QUOTA_WAIT' : (r?.ready ? 'READY_FOR_AUDIT' : (r?.paused ? 'PAUSED' : 'EXECUTOR_EVENT'));
+          this.#notify(current, evName, { result: r });
         }
         return r;
       });
@@ -1012,6 +765,9 @@ export class AuditLifecycle {
     }
     const run = AuditRun.open(this.controller.store, { now: this.controller.now })(runId);
     if (!run) throw Object.assign(new Error(`run not found: ${runId}`), { code: 'AUDIT_RUN_NOT_FOUND' });
+    // 2026-09-30：旧持久化人闸等待态在 open→recoverTransientState 内被解除
+    //（事件 HUMAN_GATE_REMOVED）；此处记住，供下方恢复分支补发阶段 prompt。
+    const humanGateCleared = Boolean(run.humanGateCleared);
     const binding = this.bindings?.get(run.manifest.chatId);
     if (!binding || (run.manifest.observerSessionId && binding.sessionId !== run.manifest.observerSessionId)) {
       throw Object.assign(new Error('persisted observerSessionId does not match the owner chat binding'), { code: 'AUDIT_SESSION_BINDING_MISMATCH' });
@@ -1087,15 +843,17 @@ export class AuditLifecycle {
       && run.s.headCommit === run.s.lastVerdict.headCommit;
     if (reviseRecovery) {
       executor.startStage(runId);
-    } else if ((resumedFromPause || preIncident)
+    } else if ((resumedFromPause || preIncident || humanGateCleared)
       && run.s.state === 'EXECUTING'
       && agent.status === 'idle'
-      && !run.s.pendingRemoteSync
-      && !run.s.waitingForHuman) {
+      && !run.s.pendingRemoteSync) {
       // R1 止血 F5（D4 同款）：暂停/事故停机被取消或死掉的 turn 不会再有
       // 事件 —— 人工恢复后若执行端 idle 静坐，必须补发当前阶段 prompt，
       // 否则没人再驱动该 run。范围仅限显式恢复路径：EXECUTING 的重启重挂
       // 必须保持「不重复发送 stage prompt」的既有冻结语义（lifecycle-e2e）。
+      // 2026-09-30 追加 humanGateCleared：旧持久化人闸等待态在加载时被
+      // recoverTransientState 解除（HUMAN_GATE_REMOVED），该 turn 早已死亡，
+      // 必须补发阶段 prompt 才能无人值守续跑。
       executor.startStage?.(runId);
     }
     // P-E 简化版：人工 resume = 确认事故已修复。关闭事故 + 汇报，
@@ -1117,11 +875,6 @@ export class AuditLifecycle {
     }
     if (run.s.pendingRemoteSync) {
       this.#scheduleRetry(runId, run.s.retry.pushAttempts);
-    }
-    // Crash/restart-safe unattended gate: a persisted WAIT must not depend on
-    // a future assistant event to trigger the automatic policy pass.
-    if (this.approvalPolicy === 'AUTO' && run.s.waitingForHuman) {
-      await this.#autoPreauthPass(run, runId);
     }
     if (run.s.state === 'AUDITING') await this.#maybeAutoReviewLocked(runId);
     return { run, agent, executor };

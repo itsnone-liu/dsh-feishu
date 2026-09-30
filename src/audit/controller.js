@@ -336,8 +336,6 @@ export class AuditController {
           maxReviewIterations: run.s.runOptions.maxReviewIterations,
           cause: run.s.cause,
           lastPauseCause: run.s.lastPauseCause ?? null,
-          waitingForHuman: Boolean(run.s.waitingForHuman),
-          waitingReason: run.s.waitingReason ?? null,
           lastExecutorEventAt: run.s.lastExecutorEventAt ?? null,
           lastExecutorEvent: run.s.lastExecutorEvent ?? null,
           lastExecutorTurn: run.s.lastExecutorTurn ?? null,

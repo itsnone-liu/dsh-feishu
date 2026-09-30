@@ -1831,3 +1831,28 @@ Auditor 对测试的职责 = 核对入库报告与代码 / diff 的一致性、�
 - **A3**：DSH lifecycle hook 在 READY_FOR_AUDIT 后执行真实 `git push` + `git ls-remote` 校验；
 - **A5**：Web GPT 审计输入从「本地 workspace」改为「GitHub @ TARGET_COMMIT」；
 - **A8**：故障矩阵追加 push 网络中断、非快进、外部 push 污染分支、force-push 改写已审历史四类注入。
+
+## 30. 修订 v2 —— 纯无人值守（2026-09-30 业主指令，取代 §"预授权" 全部设计）
+
+**背景**：PREAUTH v1（P-A~P-D）上线后仍连续发生人闸通道事故——最近一次
+2026-09-30：run `audit_20260930021152297` 在 B4 布防等待人类批准，用户输入
+未通过冻结话术校验，桥回「❌ 审计人工输入未转交」并丢消息，run 卡死约 8
+小时。业主裁决：**审计程序不得含任何人工授权门禁；除非异常事故不停机；
+任务书若强制人工批准则修改任务书。**
+
+**已删除（commit 见 2026-09-30）**：
+- 人工批准协议：SEAL/REVEAL 批准话术正则与构造器、`WAIT_HUMAN_APPROVAL`
+  等待块解析、executor 的 `submitHumanResponse`、READY 防绕过守卫；
+- PREAUTH v1 全套：`preauth-protocol.js`、`preauth-store.js`、任务书
+  `preauthorization` 节解析、`/audit preauth add|list|revoke`、
+  `GATE_PASSED_BY_PREAUTH/POLICY/MISMATCH` 事件与 gateProvenance 注入；
+- router 对同 chat 普通文本的批准转交（「审计人工输入未转交」事故机制）。
+
+**保留**：HARD STOP 阶段边界与独立审计、REVISE 迭代、身份四元组 fail-closed、
+停-报-修-续事故语义（WATCHDOG/执行异常/审核基础设施故障仍会停机汇报——
+这属"异常事故"，不属人工授权门禁）、`/audit pause|resume|stop` 止损控制。
+
+**迁移**：旧持久化 `waitingForHuman=true` 的 run 在加载时被
+`recoverTransientState` 确定性解除（事件 `HUMAN_GATE_REMOVED`），lifecycle
+据此补发阶段 prompt，run 无人值守续跑（B4/C2/C5 按修订后任务书自动落
+`approved_by=UNATTENDED_POLICY` 批准工件，hash 绑定与机器实测校验照旧）。

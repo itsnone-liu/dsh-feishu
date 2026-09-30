@@ -152,7 +152,7 @@ export class Commands {
       const raw = (arg ?? '').trim();
       const first = raw.split(/\s+/)[0]?.toLowerCase();
       const second = raw.split(/\s+/)[1] ?? null;
-      const management = new Set(['', 'status', 'pause', 'resume', 'stop', 'until', 'next', 'retry', 'rebind', 'preauth']);
+      const management = new Set(['', 'status', 'pause', 'resume', 'stop', 'until', 'next', 'retry', 'rebind']);
       if (first === 'rebind' && this.auditLifecycle) {
         const result = await this.auditController.rebind(chatId);
         if (!result.ok) {
@@ -216,7 +216,7 @@ export class Commands {
       } else {
         const { title, body, template } = await handleAuditCommand(
           this.auditController, arg ?? '', chatId,
-          { preauthStore: this.auditPreauthStore ?? null, lifecycle: this.auditLifecycle },
+          { lifecycle: this.auditLifecycle }, // 2026-09-30：preauthStore 已删除
         );
         card = buildInfoCard(title, body, template ? { template } : undefined);
       }

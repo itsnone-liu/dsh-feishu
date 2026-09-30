@@ -28,7 +28,6 @@ import { GitRemoteGate } from '../../src/audit/git-gate.js';
 import { GitEvidenceProvider } from '../../src/audit/git-evidence.js';
 import {
   buildExecutorMarkerText, parseExecutorMarker,
-  sealApprovalHash, buildSealApprovalText,
 } from '../../src/audit/protocol.js';
 
 let pass = 0, fail = 0;
@@ -79,45 +78,29 @@ const event = (m, type, data) => m.life.onEvent({ id: m.agent.id }, { type, data
 const assistantText = (m, text) => event(m, 'assistant/message', { message: { content: [{ type: 'text', text }] } });
 
 // ---------------------------------------------------------------- t1 (F1)
-await ok('t1 F1: NEED_USER 人闸通知含 question+hash+可复制话术（sealApprovalHash 双向校验）', async () => {
-  // 话术构造器与 SEAL_APPROVAL_RE 冻结语义双向一致
-  const hash = 'a'.repeat(64);
-  assert.equal(buildSealApprovalText(hash).includes(hash), true);
-  assert.equal(sealApprovalHash(buildSealApprovalText(hash)), hash);
-  assert.equal(buildSealApprovalText('not-a-hash'), null);
-
+// 2026-09-30 业主指令（纯无人值守）：人闸（WAIT_HUMAN_APPROVAL/批准话术/
+// submitHumanResponse/clearHumanWait）已整体删除，原 t1 F1 人闸通知用例随之
+// 移除。替代回归：旧持久化 waitingForHuman=true 的 state 在加载时被确定性
+// 解除（HUMAN_GATE_REMOVED），且不再产生任何等待通知。
+await ok('t1 F1(重写): 旧 waitingForHuman state 加载即解除且无等待通知', async () => {
   const m = makeLife({ stages: ['B4', 'G'] });
   const started = await startRun(m, { stopAfter: 'G' });
   const run = started.run;
   assert.equal(run.s.currentStage, 'B4');
-  await event(m, 'turn/start', { turn: 1 });
-  await assistantText(m, `[DSH-AUDIT]\nSTATE: WAIT_HUMAN_APPROVAL\nRUN_ID: ${run.runId}\nSTAGE: B4\nITERATION: 1\nHOST_ID: h1\nQUESTION:\nreceipt_sha256: ${hash}\n等待人工批准（仅授权本 receipt）`);
-
-  const p = m.progress.find((x) => x.event === 'WAITING_FOR_HUMAN');
-  assert.ok(p, 'WAITING_FOR_HUMAN 通知必须发出');
-  assert.equal(p.reason, 'B4_SEAL_APPROVAL');
-  assert.ok(String(p.question).includes(hash), 'question 必须携带 WAIT 块 QUESTION 段原文');
-  assert.equal(p.approvalHash, hash);
-  assert.equal(sealApprovalHash(p.approvalTemplate), hash, '可复制话术必须通过 sealApprovalHash 且取回同一 hash');
-  assert.equal(p.stopHint, '/audit stop');
-  assert.ok(String(p.question).includes('等待人工批准'));
-  assert.equal(run.s.waitingForHuman, true);
-
-  // waitingQuestion 随 state 持久化，随 clearHumanWait 清空
-  assert.ok(String(run.s.waitingQuestion).includes(hash));
-  const routed = await m.life.submitHumanResponse('chat-a', p.approvalTemplate);
-  assert.equal(routed.handled, true);
-  assert.equal(run.s.waitingQuestion, null);
-  assert.equal(run.s.waitingApprovalHash, null);
-
-  // 序列化兼容：旧 state 无 waitingQuestion 字段 → 读出 undefined，操作不崩
-  const stateFile = path.join(m.store.root, 'runs', run.runId, 'state.json');
-  const s = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
-  delete s.waitingQuestion;
-  fs.writeFileSync(stateFile, `${JSON.stringify(s, null, 2)}\n`);
-  const legacy = AuditRun.open(m.store)('nonexistent' === 'x' ? run.runId : run.runId);
-  assert.equal('waitingQuestion' in legacy.s, false);
-  legacy.clearHumanWait();
+  // 手工把持久化 state 摆成旧人闸等待形态（模拟 2026-09-30 卡死事故现场）
+  run.s.waitingForHuman = true;
+  run.s.waitingReason = 'B4_SEAL_APPROVAL';
+  run.s.waitingApprovalHash = 'a'.repeat(64);
+  run.s.waitingQuestion = 'receipt_sha256: ...';
+  m.store.saveState(run.s);
+  const reloaded = AuditRun.open(m.store)(run.runId);
+  assert.equal(reloaded.s.waitingForHuman, false, '加载即解除人闸等待');
+  assert.equal(reloaded.s.waitingApprovalHash, null);
+  assert.equal(reloaded.humanGateCleared, true, '供 lifecycle 补发阶段 prompt');
+  const loaded = m.store.loadRun(run.runId);
+  const ev = (loaded?.events ?? []).map((e) => e.event);
+  assert.ok(ev.includes('HUMAN_GATE_REMOVED'), '解除留事件痕迹');
+  assert.ok(!ev.includes('NEED_USER'), '人闸不再发 NEED_USER');
 });
 
 // ---------------------------------------------------------------- t2 (F2)

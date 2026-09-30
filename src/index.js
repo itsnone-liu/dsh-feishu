@@ -116,14 +116,12 @@ function apply(ctx, config) {
       // 话术、退出/下一步提示）；其余事件保持单行进度镜像。
       const auditNoticeCard = (p) => {
         const lines = [`run：\`${p.runId}\`（阶段 **${p.stage}** · ${p.state}）`];
-        if (p.reason) lines.push(`等待原因：\`${p.reason}\``);
+        if (p.reason) lines.push(`原因：\`${p.reason}\``);
         if (p.question) lines.push('', '**问题**', '```', String(p.question), '```');
-        if (p.approvalHash) lines.push('', `批准 hash：\`${p.approvalHash}\``);
-        if (p.approvalTemplate) lines.push('', '**如批准，请整段复制以下话术直接回复本会话**（必须一字不差）：', '```', p.approvalTemplate, '```');
         if (p.summary) lines.push('', '**审核摘要**', '```', String(p.summary), '```');
         if (p.nextStep) lines.push('', `下一步：${p.nextStep}`);
         if (p.stopHint) lines.push('', `退出审计：\`${p.stopHint}\``);
-        const title = p.event === 'WAITING_FOR_HUMAN' || p.event === 'NEED_USER' || p.event === 'VERDICT_NEED_USER'
+        const title = p.event === 'NEED_USER' || p.event === 'VERDICT_NEED_USER'
           ? '⏸ 审计等待人工处理'
           : (p.event === 'AUDIT_INCIDENT_RAISED' ? '🛑 审计异常停机（已汇报，等人工修复）'
             : (p.event === 'AUDIT_INCIDENT_RESOLVED' ? '✅ 事故已由人工确认修复，审计恢复'
@@ -132,23 +130,19 @@ function apply(ctx, config) {
         return buildInfoCard(title, lines.join('\n'), { template: p.event === 'VERDICT_TARGET_REACHED' || p.event === 'AUDIT_INCIDENT_RESOLVED' ? 'green' : 'orange' });
       };
       const AUDIT_NOTICE_EVENTS = new Set([
-        'NEED_USER', 'WAITING_FOR_HUMAN', 'REVIEW_TIMEOUT',
+        'NEED_USER', 'REVIEW_TIMEOUT',
         'VERDICT_NEED_USER', 'VERDICT_REVISE_LOOP_EXHAUSTED', 'VERDICT_TARGET_REACHED', 'VERDICT_STAGE_ADVANCED',
-        'GATE_PASSED_BY_PREAUTH', 'GATE_PASSED_BY_POLICY', 'GATE_PREAUTH_MISMATCH', 'DSH_QUOTA_WAIT', 'DSH_QUOTA_RECOVER',
+        'DSH_QUOTA_WAIT', 'DSH_QUOTA_RECOVER',
         'WATCHDOG_TIMEOUT', 'AUDIT_AUTO_RECOVER', 'AUDIT_REVIEW_RETRY', 'WEB_QUOTA_WAIT',
         'AUDIT_INCIDENT_RAISED', 'AUDIT_INCIDENT_RESOLVED', // P-E 简化版：停-报，等人工
       ]);
-      // P-B §3：预授权 store 与 AuditStore 同根（<root>/preauth/records.jsonl）。
-      const { PreauthStore } = await import('./audit/preauth-store.js');
-      const preauthStore = new PreauthStore(commands.auditController.store.root);
-      commands.auditPreauthStore = preauthStore; // P-C /audit preauth add|list|revoke 登记层用
+      // 2026-09-30 业主指令（纯无人值守）：PreauthStore 装配已删除。
       commands.auditLifecycle = new AuditLifecycle({
         controller: commands.auditController,
         driver,
         bindings: store,
         reviewTimeoutMs: cfg.audit?.reviewTimeoutMs, // R1 F4
         gitTimeoutMs: cfg.audit?.gitTimeoutMs,       // R1 F4
-        preauthStore,                                 // P-B 门位消费（commands 层同实例登记）
         approvalPolicy: cfg.audit?.approvalPolicy ?? 'AUTO',
         // P-E 简化版参数（重试-停机-汇报；无自动修复）
         reviewRetryDelays: cfg.audit?.reviewRetryDelaysMs,
