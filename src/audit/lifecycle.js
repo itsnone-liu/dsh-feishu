@@ -765,8 +765,15 @@ export class AuditLifecycle {
         continue;
         }
       }
-      try { restored.push(await this.resume(item.runId)); }
-      catch (error) { errors.push({ runId: item.runId, code: error.code ?? 'AUDIT_RESTORE_FAILED', message: error.message }); this.onError?.(error, item.runId); }
+      try {
+        const current = this.controller.store.loadRun(item.runId);
+        const autoResumeMarker = current?.state?.state === 'PAUSED_NEEDS_USER'
+          && current?.state?.cause === 'MARKER_PARSE_FAILED';
+        restored.push(await this.resume(item.runId, { human: autoResumeMarker }));
+      } catch (error) {
+        errors.push({ runId: item.runId, code: error.code ?? 'AUDIT_RESTORE_FAILED', message: error.message });
+        this.onError?.(error, item.runId);
+      }
     }
     return { restored, errors };
   }
