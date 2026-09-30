@@ -750,9 +750,10 @@ export class AuditLifecycle {
         if (persistedIncident.trigger === 'WATCHDOG_TIMEOUT' && loaded.state.state === 'EXECUTING') {
           const repaired = { ...persistedIncident, status: 'resolved', resolvedAt: Date.now(), resolution: 'auto-resolved: watchdog no longer interrupts running executor' };
           this.controller.store.writeIncident(item.runId, repaired);
-          continue;
-        }
-        this.incidents.set(item.runId, { ...persistedIncident });
+          // fall through: immediately restore the executor below; resolving the
+          // stale incident must not skip the resume path.
+        } else {
+          this.incidents.set(item.runId, { ...persistedIncident });
         try { this.retryScheduler.cancel(item.runId); } catch { /* 无排程可取消 */ }
         const ghost = AuditRun.open(this.controller.store, { now: this.controller.now })(item.runId);
         if (ghost) this.#notify(ghost, 'AUDIT_INCIDENT_RAISED', {
@@ -762,6 +763,7 @@ export class AuditLifecycle {
           nextStep: '人工排查修复后发送 /audit resume 续跑。',
         });
         continue;
+        }
       }
       try { restored.push(await this.resume(item.runId)); }
       catch (error) { errors.push({ runId: item.runId, code: error.code ?? 'AUDIT_RESTORE_FAILED', message: error.message }); this.onError?.(error, item.runId); }
