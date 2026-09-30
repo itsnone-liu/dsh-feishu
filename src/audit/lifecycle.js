@@ -733,10 +733,22 @@ export class AuditLifecycle {
   async #autoPreauthPass(run, runId) {
     if (!run.s.waitingForHuman) return null;
     const gateHash = run.s.waitingApprovalHash;
-    // Pure unattended mode: the declared gate is an automatic protocol step,
-    // never a human stop. Keep the canonical phrase injection so downstream
-    // seal/reveal artifacts remain byte-verifiable, but do not require a
-    // PreauthStore record or a chat message.
+    // A task packet PREAUTH declaration overrides unattended AUTO policy.
+    // B4/C2/C5 must be released only by a verified PreauthStore record;
+    // POLICY_AUTO is forbidden because it has no human message/preauthId.
+    const stageKey = String(run.s.currentStage ?? '').toUpperCase();
+    const declaredPreauth = run.manifest.preauthorization?.gates?.[stageKey] ?? null;
+    if (declaredPreauth) {
+      if (!this.preauthStore) return null;
+      const verified = this.#verifyPreauthCandidates(run, {});
+      if (verified?.passed) {
+        const injected = this.#injectCanonicalApproval(run, runId, verified.record, gateHash);
+        if (injected) return verified;
+      }
+      return null;
+    }
+    // For gates without an explicit PREAUTH declaration, AUTO retains the
+    // legacy unattended protocol behavior.
     if (this.approvalPolicy === 'AUTO') {
       const policyRecord = { preauthId: null, binding: 'POLICY_AUTO' };
       const injected = this.#injectCanonicalApproval(run, runId, policyRecord, gateHash, 'GATE_PASSED_BY_POLICY');
