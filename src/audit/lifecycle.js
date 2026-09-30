@@ -810,6 +810,19 @@ export class AuditLifecycle {
       agent = this.driver.ensureAuditSession
         ? await this.driver.ensureAuditSession({ cwd: run.manifest.cwd, sessionId: previousAuditSessionId, allowCreate: this.approvalPolicy === 'AUTO' })
         : await this.driver.ensure({ sessionId: run.manifest.dshSessionId, cwd: run.manifest.cwd }, { allowCreate: this.approvalPolicy === 'AUTO' });
+      // SessionDriver may recover a missing persisted session internally by
+      // creating a new agent instead of throwing. Detect that replacement here;
+      // otherwise the run keeps the dead dshSessionId and every restart repeats
+      // the same silent EXECUTING/step-start stall.
+      if (agent.id && agent.id !== previousAuditSessionId) {
+        auditSessionReplaced = true;
+        run.rebindAuditSession(binding.sessionId, agent.id);
+        this.#notify(run, 'AUDIT_AUTO_RECOVER', {
+          message: `原审计 session 不可用，已自动重绑定新 session：${agent.id}`,
+          previousSessionId: previousAuditSessionId,
+          auditSessionId: agent.id,
+        });
+      }
     } catch (error) {
       // A lost/occupied executor session is an infrastructure fault. In AUTO
       // mode create a replacement durable session and rebind the run; never
