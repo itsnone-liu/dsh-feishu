@@ -801,6 +801,7 @@ export class AuditLifecycle {
     }
     let agent;
     const previousAuditSessionId = run.manifest.dshSessionId;
+    let auditSessionReplaced = false;
     try {
       agent = this.driver.ensureAuditSession
         ? await this.driver.ensureAuditSession({ cwd: run.manifest.cwd, sessionId: previousAuditSessionId, allowCreate: this.approvalPolicy === 'AUTO' })
@@ -813,7 +814,8 @@ export class AuditLifecycle {
       agent = this.driver.ensureAuditSession
         ? await this.driver.ensureAuditSession({ cwd: run.manifest.cwd, allowCreate: true })
         : await this.driver.ensure({ cwd: run.manifest.cwd }, { allowCreate: true });
-      run.rebindAuditSession(binding.sessionId, agent.id);
+      auditSessionReplaced = true;
+       run.rebindAuditSession(binding.sessionId, agent.id);
       this.#notify(run, 'AUDIT_AUTO_RECOVER', {
         message: `原审计 session 不可用，已自动重绑定新 session：${agent.id}`,
         previousSessionId: previousAuditSessionId,
@@ -876,7 +878,7 @@ export class AuditLifecycle {
       && run.s.lastVerdict?.state === 'REVISE'
       && run.s.iteration > (run.s.lastVerdict.iteration ?? 0)
       && run.s.headCommit === run.s.lastVerdict.headCommit;
-    if (reviseRecovery || replayDshQuotaPrompt) {
+    if (reviseRecovery || replayDshQuotaPrompt || auditSessionReplaced) {
       // quota 状态恢复时 executor 的旧 turn 已结束，必须重新发当前阶段 prompt；
       // 普通 AUDITING/EXECUTING 重挂仍维持不重复发 prompt 的语义。
       executor.startStage(runId);
