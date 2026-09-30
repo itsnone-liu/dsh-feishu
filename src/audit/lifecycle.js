@@ -314,10 +314,14 @@ export class AuditLifecycle {
     if (!binding?.sessionId || !binding?.cwd) {
       throw Object.assign(new Error('当前聊天必须已有绑定的 DSH session 和 workspace；/audit next 不会偷偷创建新 session'), { code: 'AUDIT_SESSION_REQUIRED' });
     }
-    if (!this.driver?.ensure) throw Object.assign(new Error('DSH driver unavailable'), { code: 'AUDIT_EXECUTOR_CONFIG_INVALID' });
+    if (!this.driver?.ensureAuditSession && !this.driver?.ensure) throw Object.assign(new Error('DSH driver unavailable'), { code: 'AUDIT_EXECUTOR_CONFIG_INVALID' });
     let agent;
     try {
-      agent = await this.driver.ensure({ ...binding }, { allowCreate: false });
+      // 观察 session 与审计 executor 必须隔离。retry/continuation 不能把
+      // binding.sessionId 直接交给 ensure，否则普通聊天消息会进入审计上下文。
+      agent = this.driver.ensureAuditSession
+        ? await this.driver.ensureAuditSession({ cwd: binding.cwd, allowCreate: true })
+        : await this.driver.ensure({ cwd: binding.cwd }, { allowCreate: true });
     } catch (e) {
       if (e?.occupied) throw Object.assign(e, { code: 'AUDIT_SESSION_OCCUPIED' });
       throw Object.assign(e, { code: e.code ?? 'AUDIT_SESSION_RESUME_FAILED' });
