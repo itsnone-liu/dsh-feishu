@@ -122,18 +122,19 @@ function apply(ctx, config) {
         if (p.nextStep) lines.push('', `下一步：${p.nextStep}`);
         if (p.stopHint) lines.push('', `退出审计：\`${p.stopHint}\``);
         const title = p.event === 'NEED_USER' || p.event === 'VERDICT_NEED_USER'
-          ? '⏸ 审计等待人工处理'
+          ? '🔄 审计自动核验中'
           : (p.event === 'AUDIT_INCIDENT_RAISED' ? '🛑 审计异常停机（已汇报，等人工修复）'
             : (p.event === 'AUDIT_INCIDENT_RESOLVED' ? '✅ 事故已由人工确认修复，审计恢复'
               : (p.event === 'VERDICT_REVISE_LOOP_EXHAUSTED' ? '⚠️ 审计 REVISE 轮次耗尽'
                 : (p.event === 'VERDICT_TARGET_REACHED' ? '✅ 审计到达停止点' : '🧾 审计裁决'))));
         return buildInfoCard(title, lines.join('\n'), { template: p.event === 'VERDICT_TARGET_REACHED' || p.event === 'AUDIT_INCIDENT_RESOLVED' ? 'green' : 'orange' });
       };
+      // Only critical audit milestones are mirrored to Feishu; high-frequency executor events stay silent.
       const AUDIT_NOTICE_EVENTS = new Set([
-        'NEED_USER', 'REVIEW_TIMEOUT',
-        'VERDICT_NEED_USER', 'VERDICT_REVISE_LOOP_EXHAUSTED', 'VERDICT_TARGET_REACHED', 'VERDICT_STAGE_ADVANCED',
+        'AUDIT_AUTO_RECOVER', 'READY_FOR_AUDIT', 'AUDIT_REMOTE_READY', 'AUDIT_STARTED',
+        'AUDIT_REVISE', 'VERDICT_REVISE_LOOP_EXHAUSTED', 'VERDICT_TARGET_REACHED', 'VERDICT_STAGE_ADVANCED',
         'DSH_QUOTA_WAIT', 'DSH_QUOTA_RECOVER',
-        'WATCHDOG_TIMEOUT', 'AUDIT_AUTO_RECOVER', 'AUDIT_REVIEW_RETRY', 'WEB_QUOTA_WAIT',
+        'WATCHDOG_TIMEOUT', 'AUDIT_REVIEW_RETRY', 'WEB_QUOTA_WAIT',
         'AUDIT_INCIDENT_RAISED', 'AUDIT_INCIDENT_RESOLVED', // P-E 简化版：停-报，等人工
       ]);
       // 2026-09-30 业主指令（纯无人值守）：PreauthStore 装配已删除。
