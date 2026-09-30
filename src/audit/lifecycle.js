@@ -82,7 +82,9 @@ export class AuditLifecycle {
       // 只要专用 agent 仍处于 running，就代表有真实进展，不能把长步骤
       // 误报成事故；只有 idle 且无 executor 事件才进入 watchdog。
       const executorEntry = this.executors.get(run.runId)?.runs?.get?.(run.runId);
-      if (executorEntry?.agent?.status === 'running') continue;
+      // restore/attach 尚未完成时没有 executor entry；这是启动窗口，交给
+      // restoreActive 完成 session 重绑，禁止 watchdog 把半初始化 run 误报事故。
+      if (!executorEntry || executorEntry.agent?.status === 'running') continue;
       const a = this.activity.get(run.runId) ?? { at: run.s.updatedAt ?? now, warned: false };
       const last = run.s.lastExecutorEventAt ?? a.at;
       if (now - last < this.watchdogMs) continue;
