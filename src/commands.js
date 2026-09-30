@@ -152,7 +152,7 @@ export class Commands {
       const raw = (arg ?? '').trim();
       const first = raw.split(/\s+/)[0]?.toLowerCase();
       const second = raw.split(/\s+/)[1] ?? null;
-      const management = new Set(['', 'status', 'pause', 'resume', 'stop', 'until', 'next', 'rebind', 'preauth']);
+      const management = new Set(['', 'status', 'pause', 'resume', 'stop', 'until', 'next', 'retry', 'rebind', 'preauth']);
       if (first === 'rebind' && this.auditLifecycle) {
         const result = await this.auditController.rebind(chatId);
         if (!result.ok) {
@@ -185,10 +185,12 @@ export class Commands {
           '',
           'A3：已绑定现有 DSH session，等待 Executor 输出 READY_FOR_AUDIT。',
         ].join('\n'));
-      } else if (first === 'next' && this.auditLifecycle) {
-        // /audit next [阶段]：真实 continuation —— 继承父链已完成阶段，从下一阶段起步。
-        const result = await this.auditLifecycle.startContinuation({ chatId, stopAfter: second });
-        card = buildInfoCard('⏭ 审计链已延续', [
+      } else if ((first === 'next' || first === 'retry') && this.auditLifecycle) {
+        // /audit next：只续 STOPPED_TARGET_REACHED 父链；/audit retry：
+        // 人工确认后从最近 STOPPED run 的当前阶段重开，不自动恢复。
+        const retryStopped = first === 'retry';
+        const result = await this.auditLifecycle.startContinuation({ chatId, stopAfter: second, retryStopped });
+        card = buildInfoCard(retryStopped ? '🔁 已人工确认重试当前阶段' : '⏭ 审计链已延续', [
           `run：\`${result.run.runId}\``,
           `父运行：\`${result.parentRunId}\`（已完成阶段继承，不重审）`,
           `session：\`${result.agent.id}\``,

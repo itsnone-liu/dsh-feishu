@@ -259,7 +259,7 @@ export class AuditLifecycle {
    * - 继承 goal/approvedPlan/stageRequirements/completedStages，从下一阶段 iteration 1 起步；
    * - 与 start() 同一套 session 绑定与 executor 接线（发送阶段 prompt，驱动执行端）。
    */
-  async startContinuation({ chatId, stopAfter = null } = {}) {
+  async startContinuation({ chatId, stopAfter = null, retryStopped = false } = {}) {
     if (!chatId) throw Object.assign(new Error('chatId is required'), { code: 'AUDIT_ARG_INVALID' });
     const active = this.controller.activeRun();
     if (active) {
@@ -270,33 +270,41 @@ export class AuditLifecycle {
         code: owned ? 'AUDIT_RUN_ACTIVE' : 'AUDIT_RUN_OWNED_BY_OTHER_CHAT',
       });
     }
-    // 定位父 run：最近一条 owner 的 STOPPED_TARGET_REACHED。
+    // 默认只延续 STOPPED_TARGET_REACHED 父链。显式 /audit retry 才允许
+    // 从 STOPPED 事故/人工终止的当前阶段重开；这是人工选择，不是自动恢复。
     let parent = null;
+    let retryingStopped = false;
     for (const r of this.controller.store.listRuns().slice().reverse()) {
       const loaded = this.controller.store.loadRun(r.runId);
-      if (loaded
-        && (loaded.manifest.chatId ?? null) === chatId
-        && loaded.state.state === 'STOPPED_TARGET_REACHED') {
+      if (!loaded || (loaded.manifest.chatId ?? null) !== chatId) continue;
+      if (loaded.state.state === 'STOPPED_TARGET_REACHED'
+        || (retryStopped && loaded.state.state === 'STOPPED')) {
         parent = loaded;
+        retryingStopped = loaded.state.state === 'STOPPED';
         break;
       }
     }
     if (!parent) {
-      throw Object.assign(new Error('没有已到达停止点的审计运行可延续；先 /audit <阶段> 或 /audit 创建。'), { code: 'AUDIT_NO_CONTINUATION' });
+      throw Object.assign(new Error(retryStopped
+        ? '没有可重试的 STOPPED 审计运行。'
+        : '没有已到达停止点的审计运行可延续；先 /audit <阶段> 或 /audit 创建。'), { code: 'AUDIT_NO_CONTINUATION' });
     }
     const pm = parent.manifest;
-    const lastDoneIdx = pm.stages.indexOf(parent.state.stopAfter ?? pm.stopAfter);
-    const nextStage = pm.stages[lastDoneIdx + 1];
+    const packet = this.taskPacketLoader(parent.manifest.cwd);
+    const stages = retryingStopped ? packet.stages : pm.stages;
+    const lastIdx = stages.indexOf(parent.state.currentStage);
+    const lastDoneIdx = retryingStopped ? lastIdx - 1 : stages.indexOf(parent.state.stopAfter ?? pm.stopAfter);
+    const nextStage = retryingStopped ? parent.state.currentStage : stages[lastDoneIdx + 1];
     if (nextStage == null) {
       throw Object.assign(new Error(`任务链 \`${pm.rootRunId ?? pm.runId}\` 最后阶段 ${pm.stopAfter} 已 APPROVE，没有后续阶段。`), { code: 'AUDIT_ALREADY_COMPLETE' });
     }
     let stopAfterStage = nextStage;
     if (stopAfter != null) {
-      const resolved = pm.stages.includes(stopAfter) ? stopAfter : null;
+      const resolved = stages.includes(stopAfter) ? stopAfter : null;
       if (!resolved) {
-        throw Object.assign(new Error(`停止点 ${stopAfter} 不在阶段表 [${pm.stages.join(', ')}] 中`), { code: 'AUDIT_MANIFEST_INVALID' });
+        throw Object.assign(new Error(`停止点 ${stopAfter} 不在阶段表 [${stages.join(', ')}] 中`), { code: 'AUDIT_MANIFEST_INVALID' });
       }
-      if (pm.stages.indexOf(resolved) < pm.stages.indexOf(nextStage)) {
+      if (stages.indexOf(resolved) < stages.indexOf(nextStage)) {
         throw Object.assign(new Error(`延续运行不能停在已完成阶段之前：下一起点为 ${nextStage}，请求停止点 ${resolved} 早于它。`), { code: 'AUDIT_CONTINUATION_STAGE_INVALID' });
       }
       stopAfterStage = resolved;
@@ -318,27 +326,30 @@ export class AuditLifecycle {
       throw Object.assign(new Error('绑定的 DSH session 当前正在运行；/audit next 不会并发或偷偷 fork'), { code: 'AUDIT_SESSION_OCCUPIED' });
     }
     const gate = this.gitGateFactory({ cwd: binding.cwd, timeoutMs: this.gitTimeoutMs });
-    const packet = this.taskPacketLoader(binding.cwd);
-    // 任务链一致性：工作区任务书哈希必须与父链一致（改了任务书 → 显式拒绝，fail closed）。
-    if (pm.taskPacketHash && packet.taskPacketHash !== pm.taskPacketHash) {
+    const currentPacket = this.taskPacketLoader(binding.cwd);
+    // 正常 /audit next 必须沿用父链任务包。/audit retry 是显式人工重试，
+    // 允许采用当前工作区任务包（哈希变化会冻结到新 manifest）。
+    if (!retryingStopped && pm.taskPacketHash && currentPacket.taskPacketHash !== pm.taskPacketHash) {
       throw Object.assign(new Error(
-        `工作区任务书哈希 \`${packet.taskPacketHash}\` 与父链 \`${pm.taskPacketHash}\` 不一致；延续运行不得更换任务书。`,
+        `工作区任务书哈希 \`${currentPacket.taskPacketHash}\` 与父链 \`${pm.taskPacketHash}\` 不一致；延续运行不得更换任务书。`,
       ), { code: 'AUDIT_PACKET_MISMATCH' });
     }
     const git = await gate.inspect({});
     const stamp = new Date(this.controller.now()).toISOString().replace(/[-:TZ.]/g, '').slice(0, 17);
     let runId = `audit_${stamp}`;
     for (let n = 2; this.controller.store.loadRun(runId); n += 1) runId = `audit_${stamp}_${n}`;
-    const completedStages = [...(pm.completedStages ?? []), pm.stages[lastDoneIdx]];
+    const completedStages = retryingStopped
+      ? (pm.completedStages ?? []).slice()
+      : [...(pm.completedStages ?? []), pm.stages[lastDoneIdx]];
     const run = AuditRun.create(this.controller.store, {
       runId, hostId: this.controller.hostId, chatId,
       observerSessionId: binding.sessionId ?? null, dshSessionId: agent.id,
       cwd: git.cwd, repo: git.repo, branch: git.branch,
-      stages: pm.stages, stopAfter: stopAfterStage, currentStage: nextStage,
+      stages, stopAfter: stopAfterStage, currentStage: nextStage,
       startingCommit: git.head, stageBaseCommit: parent.state.headCommit,
-      goal: pm.goal, approvedPlan: pm.approvedPlan,
-      taskPacketHash: pm.taskPacketHash, stageRequirements: pm.stageRequirements,
-      stageGates: pm.stageGates ?? {}, preauthorization: packet.preauthorization ?? null, // P-B 门位声明随 manifest 冻结
+      goal: currentPacket.goal, approvedPlan: packet.approvedPlan,
+      taskPacketHash: currentPacket.taskPacketHash, stageRequirements: packet.stageRequirements,
+      stageGates: currentPacket.stageGates ?? {}, preauthorization: packet.preauthorization ?? null, // P-B 门位声明随 manifest 冻结
       parentRunId: pm.runId, rootRunId: pm.rootRunId ?? pm.runId, completedStages,
       ignorePaths: pm.ignorePaths,
     }, { maxReviewIterations: this.controller.maxReviewIterations, now: this.controller.now });

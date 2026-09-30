@@ -58,7 +58,7 @@ export async function handleAuditCommand(controller, arg, chatId, ctx = {}) {
   const raw = arg.trim();
   const [first, ...rest] = raw.split(/\s+/);
   const word = (first ?? '').toLowerCase();
-  const management = new Set(['status', 'pause', 'resume', 'stop', 'until', 'next', 'rebind', 'preauth']);
+  const management = new Set(['status', 'pause', 'resume', 'stop', 'until', 'next', 'retry', 'rebind', 'preauth']);
 
   if (word === 'preauth') {
     return handlePreauthSubcommand(controller, rest, chatId, ctx);
