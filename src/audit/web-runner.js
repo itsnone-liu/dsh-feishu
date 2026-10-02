@@ -186,6 +186,21 @@ function classifyStreamError(se) {
   return 'AUDIT_WEB_UPSTREAM_ERROR'; // 识别不了也按 infrastructure 处理，绝不降级成协议错误
 }
 
+/**
+ * Normalize ChatGPT-web reviewer text into the frozen protocol's plain format.
+ * Two web-channel artifacts (live-observed 2026-10-02, run audit_20261001135212538):
+ *  1. The sidecar's banner text can swallow the verdict marker's line break,
+ *     gluing "[DSH-AUDIT]" onto the end of a banner line.
+ *  2. The web DOM copy carries markdown escapes (\[ \] \_ \*) into the reply,
+ *     so "[DSH-AUDIT]" arrives as "\[DSH-AUDIT\]" and "RUN_ID:" as "RUN\_ID:".
+ * Pure web-output format conversion; verdict semantics are untouched.
+ */
+export function normalizeWebVerdictText(text) {
+  return String(text)
+    .replace(/\\([_[\]*`\\])/g, '$1')
+    .replace(/([^\n])(\[DSH-AUDIT\])/g, '$1\n$2');
+}
+
 export class WebAuditRunner {
   constructor({
     baseUrl = process.env.DSH_AUDIT_WEB_BASE_URL ?? 'http://127.0.0.1:8787',
@@ -337,7 +352,7 @@ export class WebAuditRunner {
       throw webError('AUDIT_VERDICT_MISSING', 'web reviewer returned no output text');
     }
     let verdict;
-    try { verdict = parseAuditorVerdict(text); }
+    try { verdict = parseAuditorVerdict(normalizeWebVerdictText(text)); }
     catch (e) {
       if (e instanceof ProtocolParseError) {
         this.#dumpRaw(packet, text, `AUDIT_VERDICT_MALFORMED: ${e.message}`);
