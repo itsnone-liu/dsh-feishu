@@ -303,15 +303,29 @@ export class WebAuditRunner {
     });
     // 2026-09-30：gateProvenance 注入已随人工授权门删除（恒为空）。
     const userText = `${handoff}${evidenceBlock}${execTestBlock}\n\n${verdictTemplate(packet)}`;
+    // codex-chatgpt-web browser routes require the native Codex lifecycle identity
+    // even for direct Responses API callers.  This metadata is only a synthetic,
+    // packet-scoped transport identity; it does not grant production authority and
+    // is never used as an audit verdict identity.
+    const identityBase = String(packet.runId).replace(/[^A-Za-z0-9_-]/g, '_');
+    const threadId = `audit_review_${identityBase}`.slice(0, 128);
+    const turnId = `review_${identityBase}_${String(packet.stage).replace(/[^A-Za-z0-9_-]/g, '_')}_${packet.iteration}`.slice(0, 128);
+    const turnMetadata = JSON.stringify({ thread_id: threadId, turn_id: turnId });
+    const turnItem = (item) => ({
+      ...item,
+      internal_chat_message_metadata_passthrough: { turn_id: turnId },
+    });
     const body = {
       model: this.model,
       reasoning: { effort: this.reasoningEffort },
+      prompt_cache_key: threadId,
+      client_metadata: { 'x-codex-turn-metadata': turnMetadata },
       input: [
-        { type: 'message', role: 'developer', content: SYSTEM_PROMPT },
-        { type: 'message', role: 'user', content: userText },
+        turnItem({ type: 'message', role: 'developer', content: SYSTEM_PROMPT }),
+        turnItem({ type: 'message', role: 'user', content: userText }),
       ],
       store: false,
-      stream: true, // headroom :8787 强制流式（live 实测 HTTP 400 "Stream must be set to true"）
+      stream: true, // Responses proxy requires streaming for browser-turn retry budgeting.
     };
     const record = { packet, attempts: 0, outcome: null };
     this.calls.push(record);
