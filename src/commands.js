@@ -30,6 +30,7 @@ const HELP = [
   '- 订阅额度耗尽时桥会**自动等待恢复并继续**；配置了备用模型时会**自动切换**（主模型限额→备用模型接管续跑，探针探到恢复自动切回）',
   '- `/gpt` `/glm` `/auto` 手动快切模型（调试用）：gpt=切备用并暂停自动 · glm=切回主模型 · auto=恢复自动切换',
   '- `/ds` 切到阿里云 DeepSeek-V4.1-Flash（百炼订阅 TokenPlan；手动模式，/glm 切回）',
+  '- `/mimo` 切到 MiMo v2.5（手动模式）；`/model mimo/mimo-v2.5` 或 `/model mimo/mimo-v2.6-pro` 切换 MiMo 模型',
   '- `/new [cwd]` 新会话 · `/stop` 停止本轮 · `/status` 状态 · `/doctor` 诊断（识图链路体检）',
   '- `/mode` 查看/切换权限模式（`/mode ro` 只读 · `/mode rw` 工作区可写 · `/mode full` 全权）',
   '- `/model` 查看/切换模型（如 `/model glm-5.3`；跨厂商用 `厂商/模型` 全称；📷 标记原生支持识图）',
@@ -108,6 +109,8 @@ export class Commands {
           return await this.cmdQuickSwitch(chatId, 'auto');
         case 'ds':
           return await this.cmdQuickSwitch(chatId, 'ds');
+        case 'mimo':
+          return await this.cmdQuickSwitch(chatId, 'mimo');
         case 'preset':
         case 'presets':
           return await this.cmdPreset(chatId, arg);
@@ -522,13 +525,18 @@ export class Commands {
     // resolve the target
     let provider;
     let model;
+    // MiMo convenience alias: catalog exposes the actual v2.6 model as -pro.
+    if (arg === 'mimo26' || arg === 'mimo-v2.6' || arg === 'mimo/mimo-v2.6') {
+      provider = 'mimo';
+      model = 'mimo-v2.6-pro';
+    }
     if (arg === 'gpt' || arg === 'glm') {
       // 快捷别名 → 手动快切（保证 fallback 状态机同步，不能裸 setModel）
       return await this.cmdQuickSwitch(chatId, arg);
     }
-    if (arg.includes('/')) {
+    if (!provider && arg.includes('/')) {
       [provider, model] = arg.split('/').map((x) => x.trim());
-    } else {
+    } else if (!provider) {
       const catalog = await this.#modelCatalog();
       const hits = catalog.filter((r) => r.models.some((m) => m.id === arg));
       if (hits.length === 1) {
@@ -897,7 +905,7 @@ export class Commands {
     // （2026-09-05 restart.log 实录）。CODEX_PROXY_API_KEY 同属必需（限额
     // fallback 的备用模型 key，丢了重启后切不了 gpt）。
     const envLines = Object.entries(env)
-      .filter(([k]) => /^(FEISHU_.*|DSH_.*|GLM_.*|DASHSCOPE_.*|CODEX_PROXY_.*|PATH|HOME|LANG|LC_.*|NODE_.*|http_proxy|https_proxy|no_proxy|OPENAI_API_KEY)$/i.test(k))
+      .filter(([k]) => /^(FEISHU_.*|DSH_.*|GLM_.*|DASHSCOPE_.*|MIMO_.*|CODEX_PROXY_.*|PATH|HOME|LANG|LC_.*|NODE_.*|http_proxy|https_proxy|no_proxy|OPENAI_API_KEY)$/i.test(k))
       .map(([k, v]) => `${JSON.stringify(k + '=' + v)}`)
       .join(' ');
     const argvQ = argv.map((a) => JSON.stringify(a)).join(' ');

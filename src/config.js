@@ -102,6 +102,7 @@ const DEFAULTS = {
    *  providers 里配好）。与 /gpt 同语义：手动模式，/glm 或 /auto 恢复。 */
   manualModels: {
     ds: 'dashscope-tokenplan/deepseek-v4.1-flash',
+    mimo: 'mimo/mimo-v2.5',
   },
   /** A5：/audit 审核器选择。''（默认，无自动审核，A4 行为）| 'web'（真实网页额度池）。
    * web 子块只含传输参数，不含任何 orchestration 语义（A4 冻结边界）。 */
