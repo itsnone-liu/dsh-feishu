@@ -204,7 +204,7 @@ export function normalizeWebVerdictText(text) {
 export class WebAuditRunner {
   constructor({
     baseUrl = process.env.DSH_AUDIT_WEB_BASE_URL ?? 'http://127.0.0.1:8787',
-    model = process.env.DSH_AUDIT_WEB_MODEL ?? 'gpt-5.6-sol',
+    model = process.env.DSH_AUDIT_WEB_MODEL ?? 'gpt-6.1-sol',
     reasoningEffort = process.env.DSH_AUDIT_WEB_REASONING_EFFORT ?? 'high',
     authJsonPath = process.env.DSH_AUDIT_WEB_AUTH ?? `${process.env.HOME ?? '/root'}/.codex/auth.json`,
     timeoutMs = 300_000,

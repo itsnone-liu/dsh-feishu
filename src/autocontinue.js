@@ -14,7 +14,7 @@
  *  - **限额自动换模型（fallback）**：配置了 fallbackBackup 且处于自动模式时，
  *    判定窗口打满（首次 long）不再傻等 ——
  *      ① 快照所有 live 会话当前模型；
- *      ② 全部切到备用模型（如 codex-gpt/gpt-5.6-luna）并设 driver.defaultOverride
+ *      ② 全部切到备用模型（如 codex-gpt/gpt-6-luna）并设 driver.defaultOverride
  *         （fallback 期间新建/resume 的会话也走备用模型，不再踩已限额的主模型）；
  *      ③ 对被打断的会话立即补发「继续」—— 原任务无缝换脑续跑。注意
  *         turn/end 是在 session.append() 里同步分发的，此刻 agent 的 phase

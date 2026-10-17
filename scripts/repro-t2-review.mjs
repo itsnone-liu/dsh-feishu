@@ -22,7 +22,7 @@ const packet = {
 
 const runner = new WebAuditRunner({
   baseUrl: 'http://127.0.0.1:8787',
-  model: 'gpt-5.6-sol',
+  model: 'gpt-6.1-sol',
   reasoningEffort: 'high',
   timeoutMs: 300_000,
   transientRetries: 0,

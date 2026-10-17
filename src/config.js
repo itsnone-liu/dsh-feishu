@@ -91,7 +91,7 @@ const DEFAULTS = {
    *  同时探测主模型恢复，探通后切回。'' 或 null = 关闭（纯等待老行为）。 */
   fallbackPrimary: 'glm-coding/glm-5.3',
   /** 备用模型（须已在 dsh settings.yaml providers 里配好）。 */
-  fallbackBackup: 'codex-gpt/gpt-5.6-luna',
+  fallbackBackup: 'codex-gpt/gpt-6-luna',
   /** 探测主模型恢复用的最小请求（同 key 同窗口，1 token 消耗可忽略）。 */
   fallbackProbe: {
     url: 'https://open.bigmodel.cn/api/coding/paas/v4/chat/completions',
@@ -127,7 +127,7 @@ const DEFAULTS = {
     incidentLogHint: '',
     web: {
       baseUrl: 'http://127.0.0.1:8787',
-      model: 'gpt-5.6-luna',
+      model: 'gpt-6.1-sol',
       timeoutMs: 300000,
       transientRetries: 2,
       retryDelayMs: 5000,

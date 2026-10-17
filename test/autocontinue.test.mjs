@@ -266,7 +266,7 @@ function fbHarness(cfgOver = {}) {
     autoContinueShortMax: 2,
     autoContinuePatterns: [],
     fallbackPrimary: 'glm-coding/glm-5.3',
-    fallbackBackup: 'codex-gpt/gpt-5.6-luna',
+    fallbackBackup: 'codex-gpt/gpt-6-luna',
     fallbackProbe: { url: 'http://probe/none', apiKeyEnv: 'PROBE_KEY', model: 'glm-5-turbo' },
     ...cfgOver,
   };
@@ -285,8 +285,8 @@ await ok('fallback: long quota error → switch to backup + resume + orange card
   const { ac, cards, submitted, applied, driver, turnEnd } = fbHarness();
   turnEnd({ kind: 'error', error: { code: '429', message: '已达到5小时的使用上限，额度耗尽' } });
   assert.ok(ac.fallbackActive, 'fallback active');
-  assert.ok(applied.some((x) => x === 'ALL:codex-gpt/gpt-5.6-luna'), 'all sessions switched to backup');
-  assert.deepEqual(driver.defaultOverride, { provider: 'codex-gpt', model: 'gpt-5.6-luna' }, 'default override set');
+  assert.ok(applied.some((x) => x === 'ALL:codex-gpt/gpt-6-luna'), 'all sessions switched to backup');
+  assert.deepEqual(driver.defaultOverride, { provider: 'codex-gpt', model: 'gpt-6-luna' }, 'default override set');
   await sleep(30);   // resume 已异步化：等宏任务越过重入锁窗口
   assert.ok(submitted.some((s) => s.text === '继续'), 'interrupted task auto-resumed on backup');
   assert.ok(cards.some((c) => /切换备用模型/.test(c.header.title.content)), 'switch card');
@@ -400,7 +400,7 @@ await ok('fallback: backup-side quota error is tracked and continued on exit', a
   const { ac, submitted, turnEnd, agent, driver } = fbHarness();
   turnEnd({ kind: 'error', error: { code: '429', message: '额度耗尽 quota exhausted' } });
   // 备用模型上也限额（currentModel 现在报备用）→ 记入中断清单
-  driver.currentModel = () => ({ provider: 'codex-gpt', model: 'gpt-5.6-luna' });
+  driver.currentModel = () => ({ provider: 'codex-gpt', model: 'gpt-6-luna' });
   turnEnd({ kind: 'error', error: { code: '429', message: 'usage limit reached (额度耗尽)' } });
   assert.equal(ac.interrupted.size, 1, 'backup-side failure tracked');
   agent.status = 'idle';
@@ -483,7 +483,7 @@ await ok('manual: /gpt switches + suppresses automation; /glm restores auto', as
   const r1 = ac.manualSwitch('gpt');
   assert.ok(r1.ok);
   assert.equal(ac.mode, 'manual');
-  assert.ok(applied.some((x) => x === 'ALL:codex-gpt/gpt-5.6-luna'));
+  assert.ok(applied.some((x) => x === 'ALL:codex-gpt/gpt-6-luna'));
   // manual + 会话仍在主模型侧（mock 未跟着切）→ quota 错误保持静默：
   // 新语义下手动模式只对「备用侧」的额度耗尽动作（规则5）。
   driver.currentModel = () => ({ provider: 'glm-coding', model: 'glm-5.3' });
@@ -548,7 +548,7 @@ await ok('manual rule5: backup-side quota error + GLM ok → auto switch back + 
 await ok('manual rule4: backup quota + GLM also limited → dual-limit wait, then auto switch back on recovery', async () => {
   const { ac, cards, submitted, turnEnd, driver } = fbHarness();
   ac.manualSwitch('gpt');
-  driver.currentModel = () => ({ provider: 'codex-gpt', model: 'gpt-5.6-luna' });
+  driver.currentModel = () => ({ provider: 'codex-gpt', model: 'gpt-6-luna' });
   ac.probeFn = async () => false;   // GLM 也受限
   turnEnd({ kind: 'error', error: { code: '429', message: 'usage_limit_reached: usage limit reached' } });
   await sleep(40);
@@ -568,7 +568,7 @@ await ok('manual rule4: backup quota + GLM also limited → dual-limit wait, the
 await ok('manual: transient 429 on backup does NOT switch (short ≠ quota)', async () => {
   const { ac, driver, turnEnd } = fbHarness();
   ac.manualSwitch('gpt');
-  driver.currentModel = () => ({ provider: 'codex-gpt', model: 'gpt-5.6-luna' });
+  driver.currentModel = () => ({ provider: 'codex-gpt', model: 'gpt-6-luna' });
   turnEnd({ kind: 'error', error: { code: '429', message: 'HTTP 429 too many requests' } });
   await sleep(40);
   assert.equal(ac.mode, 'manual', 'transient error keeps manual mode');

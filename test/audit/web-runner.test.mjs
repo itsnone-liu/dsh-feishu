@@ -26,7 +26,7 @@ const verdictText = (state) => buildVerdictText({
 
 // Responses API 非流式应答形状（headroom :8787 实测链路）
 const responsesBody = (text) => ({
-  id: 'rs_1', object: 'response', status: 'completed', model: 'gpt-5.6-luna',
+  id: 'rs_1', object: 'response', status: 'completed', model: 'gpt-6.1-sol',
   output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] }],
 });
 // Chat Completions 兼容形状
@@ -76,7 +76,7 @@ await ok('request shape: model/stream/store/input + bearer from injected auth', 
   assert.equal(seen.url, 'http://127.0.0.1:8787/v1/responses');
   assert.equal(seen.method, 'POST');
   assert.equal(seen.headers.Authorization, 'Bearer tok-test');
-  assert.equal(seen.body.model, 'gpt-5.6-sol');
+  assert.equal(seen.body.model, 'gpt-6.1-sol');
   assert.equal(seen.body.reasoning.effort, 'high');
   assert.equal(seen.body.stream, true);
   assert.equal(seen.body.store, false);
