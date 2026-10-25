@@ -9,16 +9,22 @@
  *
  * 2026-08-26: default engine switched to Alibaba Cloud Qwen-VL via the
  * DashScope OpenAI-compatible endpoint (verified working with qwen3-vl-plus).
- * Configuration lives in the bridge config.json:
+ * 2026-10-25: multi-engine chain — primary codex-proxy gpt-6-sol (GPT Plus
+ * subscription, vision-capable luna/sol/astra generations), DashScope qwen3-vl
+ * as fallback. Configuration lives in the bridge config.json:
  *
  *   "vision": {
- *     "baseURL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
- *     "apiKey": "sk-...",                      // inline key (file is 0600)
- *     "apiKeyEnv": "DASHSCOPE_API_KEY",        // used when apiKey absent
- *     "model": "qwen3-vl-plus",
- *     "maxTokens": 1024,
- *     "timeoutMs": 60000
+ *     "engines": [                       // tried in order, first success wins
+ *       { "name": "gpt",  "baseURL": "http://127.0.0.1:8788/v1",
+ *         "apiKeyEnv": "CODEX_PROXY_API_KEY", "model": "gpt-6-sol",
+ *         "maxTokens": 1024, "timeoutMs": 90000 },
+ *       { "name": "qwen", "baseURL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+ *         "apiKey": "sk-...", "model": "qwen3-vl-plus",
+ *         "maxTokens": 1024, "timeoutMs": 60000 }
+ *     ], "maxImageBytes": 10485760       // global
  *   }
+ *
+ * A flat `vision` block (no engines array) still works as a single engine.
  *
  * Images reach the agent as durable attachment references (the router
  * persists Feishu images through the attachment service). Two ways to point
@@ -43,9 +49,32 @@ const DEFAULTS = {
   maxImageBytes: 10 * 1024 * 1024,
 };
 
-/** Resolve the effective vision config (config.json `vision` over DEFAULTS). */
+/**
+ * Resolve the effective vision config into an ENGINE CHAIN.
+ *   config.json `vision.engines: [...]` → try in order, first success wins
+ *     (e.g. codex-proxy gpt-6-sol primary, DashScope qwen3-vl fallback).
+ *   legacy flat `vision` block → single engine (unchanged behavior).
+ * Global knob: `maxImageBytes`. Each engine: name/baseURL/apiKey/apiKeyEnv/
+ * model/maxTokens/timeoutMs.
+ */
 export function resolveVisionConfig(visionCfg) {
-  return { ...DEFAULTS, ...(visionCfg ?? {}) };
+  const global = { maxImageBytes: DEFAULTS.maxImageBytes, ...(visionCfg ?? {}) };
+  const mkEngine = (e, i, fallbackName) => ({
+    name: e?.name || fallbackName || `engine${i + 1}`,
+    baseURL: e?.baseURL || DEFAULTS.baseURL,
+    apiKey: e?.apiKey || '',
+    apiKeyEnv: e?.apiKeyEnv || DEFAULTS.apiKeyEnv,
+    model: e?.model || DEFAULTS.model,
+    maxTokens: e?.maxTokens || DEFAULTS.maxTokens,
+    timeoutMs: e?.timeoutMs || DEFAULTS.timeoutMs,
+  });
+  let engines;
+  if (Array.isArray(visionCfg?.engines) && visionCfg.engines.length) {
+    engines = visionCfg.engines.map((e, i) => mkEngine(e, i, `engine${i + 1}`));
+  } else {
+    engines = [mkEngine(visionCfg, 0, 'primary')];
+  }
+  return { maxImageBytes: global.maxImageBytes, engines };
 }
 
 const stringOutput = {
@@ -218,13 +247,26 @@ export function installVisionTool(ctx, visionCfg) {
           ? file
           : await localImageDataUrl(path.resolve(file), cfg.maxImageBytes);
       }
-      const answer = await callVisionEndpoint(cfg, imageUrl, question, exec?.signal);
-      log.info(`inspect_image ok (${cfg.model}, ${label})`);
-      return `[inspect_image ${cfg.model}]\n${answer}`;
+      // Engine chain: first success wins; a failing engine falls through to the
+      // next (network/timeout/HTTP/empty all count as failure).
+      let lastErr;
+      for (const eng of cfg.engines) {
+        if (exec?.signal?.aborted) throw new Error('inspect_image: 已取消');
+        try {
+          const answer = await callVisionEndpoint(eng, imageUrl, question, exec?.signal);
+          log.info(`inspect_image ok (${eng.name}/${eng.model}, ${label})`);
+          return `[inspect_image ${eng.model}]\n${answer}`;
+        } catch (e) {
+          if (exec?.signal?.aborted) throw e;
+          lastErr = e;
+          log.warn(`vision engine ${eng.name} (${eng.model}) 失败: ${e.message}${cfg.engines.length > 1 ? '，尝试下一引擎' : ''}`);
+        }
+      }
+      throw lastErr;
     },
   };
   const dispose = tools.register(def);
-  const keySource = cfg.apiKey ? 'config' : (process.env[cfg.apiKeyEnv] ? cfg.apiKeyEnv : '未配置');
-  log.info(`inspect_image tool registered (vision=${cfg.model} @ ${cfg.baseURL}, key=${keySource})`);
+  const keySource = (eng) => eng.apiKey ? 'config' : (process.env[eng.apiKeyEnv] ? eng.apiKeyEnv : '未配置');
+  log.info(`inspect_image tool registered (${cfg.engines.map((e) => `${e.name}=${e.model} @ ${e.baseURL} [key=${keySource(e)}]`).join(' → ')})`);
   return typeof dispose === 'function' ? dispose : null;
 }
