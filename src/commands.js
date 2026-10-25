@@ -372,7 +372,15 @@ export class Commands {
       if (entry) {
         lines.push(`agent 状态：**${entry.agent.status}**`, `模型：\`${entry.agent.options?.provider ?? ''}/${entry.agent.options?.model ?? ''}\``);
       } else {
-        lines.push('agent：未在本进程运行（重启后首条消息会 resume）');
+        // 进程内没有 live agent 时，至少显示「下一条消息会用的模型」
+        // 手动快切的 override 优先于 config 的默认值
+        const ov = this.driver.defaultOverride;
+        const configured = ov
+          ? `${ov.provider}/${ov.model}（手动）`
+          : (this.config.provider && this.config.model
+              ? `${this.config.provider}/${this.config.model}`
+              : `${this.config.fallbackPrimary || '默认'}`);
+        lines.push('agent：未在本进程运行（重启后首条消息会 resume）', `模型（下条消息）：\`${configured}\``);
       }
     }
     lines.push(`审批模式：\`${this.config.approval}\``);
@@ -410,6 +418,18 @@ export class Commands {
     return `- \`${name}\`（${label}）：sandbox \`${spec.sandbox}\` · 审批 \`${spec.approval}\`${desc}${mark}`;
   }
 
+  /**
+   * rc.7: permissionPresets.current(events)  ·  0.2.1: current(session)
+   * 探测式兼容：session 形式失败时退回 events 形式。
+   */
+  #modeCurrent(service, session) {
+    try {
+      return service.current(session);
+    } catch {
+      return service.current(session.events);
+    }
+  }
+
   async cmdMode(chatId, arg) {
     const service = this.permissionPresets;
     if (!service) {
@@ -426,7 +446,7 @@ export class Commands {
 
     if (!arg) {
       // bare /mode — current + table
-      const current = service.current(agent.session.events);
+      const current = this.#modeCurrent(service, agent.session);
       const names = [...service.names];
       if (!names.includes(current)) names.push(current); // e.g. 'custom'
       const lines = [
@@ -449,9 +469,9 @@ export class Commands {
       await this.transport.sendCard(chatId, buildErrorCard('未知模式', `\`${arg}\`\n可用：${service.names.join('、')}\n别名：ro / rw / full`));
       return true;
     }
-    const before = service.current(agent.session.events);
+    const before = this.#modeCurrent(service, agent.session);
     service.set(agent.session, target);
-    const after = service.current(agent.session.events);
+    const after = this.#modeCurrent(service, agent.session);
     const spec = service.resolve(target);
     const lines = [
       `${before} → **${after}**`,
@@ -608,7 +628,9 @@ export class Commands {
         ...presets.map((p) => {
           const mark = p.id === current ? ' ← 当前' : '';
           const broken = p.broken ? ` ⚠️ ${p.broken}` : '';
-          return `- \`${p.id}\`[${p.trust}]${broken}${mark}`;
+          // 0.2.1 的预设行没有 trust 字段（名字可选），两者都做缺省处理
+          const trust = p.trust ?? p.name ?? '';
+          return `- \`${p.id}\`${trust ? `[${trust}]` : ''}${broken}${mark}`;
         }),
         '',
         '空白会话直接切换；有历史的会话将自动以该预设**开新会话**（旧会话保留在盘上）。',
@@ -687,9 +709,16 @@ export class Commands {
       for (const id of fs.readdirSync(projDir)) {
         const dir = path.join(projDir, id);
         try {
-          const f = path.join(dir, 'session.jsonl.zstd');
-          const existsZ = fs.existsSync(f);
-          const existsRaw = !existsZ && fs.existsSync(path.join(dir, 'session.jsonl'));
+          // dsh 0.2.1 起会话文件按格式版本命名（session.v4.jsonl.zstd）；rc.7 是 session.jsonl.zstd。
+          // 取该目录下最新的会话日志，兼容两代命名。
+          const logs = fs.readdirSync(dir)
+            .filter((n) => /^session(\.[a-z0-9]+)?\.jsonl(\.zstd)?$/.test(n))
+            .map((n) => ({ n, m: fs.statSync(path.join(dir, n)).mtimeMs }))
+            .sort((a, b) => b.m - a.m);
+          const newest = logs[0]?.n;
+          const f = newest ? path.join(dir, newest) : path.join(dir, 'session.jsonl.zstd');
+          const existsZ = Boolean(newest && newest.endsWith('.zstd'));
+          const existsRaw = Boolean(newest && !newest.endsWith('.zstd'));
           if (!existsZ && !existsRaw) continue;
           let header;
           if (existsZ) {
@@ -697,7 +726,7 @@ export class Commands {
             const first = zlib.zstdDecompressSync(fs.readFileSync(f)).toString('utf8').split('\n')[0];
             header = JSON.parse(first);
           } else {
-            const first = fs.readFileSync(path.join(dir, 'session.jsonl'), 'utf8').split('\n')[0];
+            const first = fs.readFileSync(f, 'utf8').split('\n')[0];
             header = JSON.parse(first);
           }
           out.push({ id, cwd: header.cwd, createdAt: header.createdAt, preset: header.agentPreset });

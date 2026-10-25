@@ -227,7 +227,7 @@ export class FakeAgent {
           source: { provider: 'mock', model: 'mock-1' },
         }),
         usage: { inputTokens: 100, outputTokens: 20, cacheReadTokens: 512 },
-      }, { surfaceOp: 'append', sourceEventSeqs: [...chunkSeqs] });
+      }, { surfaceOp: 'append' });
 
       // 6) tool execution
       if (wantsTool) {

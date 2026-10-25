@@ -213,12 +213,29 @@ function apply(ctx, config) {
       const router = new ChatRouter({ config: cfg, store, driver, renderer, transport, interactions, commands, visionReady, autoContinue });
 
       // ---- outbound seams ----
-      ctx.userQuestions.registerProvider({
-        ask: (request) => interactions.handleAsk(request).catch((e) => {
-          log.error(`ask provider failed: ${e?.stack ?? e}`);
-          throw e;
-        }),
-      });
+      // dsh 0.2.1 把 userQuestions 改成 typert 远程服务（answer/attachWait），
+      // registerProvider 已移除。按能力探测降级：0.2.1 下 ask 卡片暂不可用
+      // （问题走默认答案），approval 卡片不受影响；后续按新协议移植。
+      if (typeof ctx.userQuestions?.registerProvider === 'function') {
+        ctx.userQuestions.registerProvider({
+          ask: (request) => interactions.handleAsk(request).catch((e) => {
+            log.error(`ask provider failed: ${e?.stack ?? e}`);
+            throw e;
+          }),
+        });
+      } else if (typeof ctx.on === 'function') {
+        // dsh 0.2.1: user-questions is a waterfall seam ("user-questions/request").
+        // Pass through with next() whenever the question is not ours.
+        log.info('userQuestions.registerProvider unavailable: registering waterfall answerer');
+        ctx.on('user-questions/request', (request, next) => {
+          const chatId = request?.agent ? renderer.chatOf(request.agent.id) : null;
+          if (!chatId) return next();
+          return Promise.resolve(interactions.handleAsk(request)).catch((e) => {
+            log.error(`ask waterfall failed, delegating: ${e?.stack ?? e}`);
+            return next();
+          });
+        });
+      }
       ctx.on('approval/request', (req, next) => {
         // 必须 return waterfall answerer 的 Promise；旧代码未 return，导致
         // DSH user-approval 收到默认 unavailable，自动放行永远无法生效。
