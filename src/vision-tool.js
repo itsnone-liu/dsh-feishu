@@ -48,6 +48,41 @@ export function resolveVisionConfig(visionCfg) {
   return { ...DEFAULTS, ...(visionCfg ?? {}) };
 }
 
+/**
+ * Resolve the vision ENGINE CHAIN (2026-10-25: GPT primary, Bailian qwen fallback).
+ * `vision.engines: [ {...}, {...} ]` in config.json → tried in order, first
+ * success wins; a failure (auth / HTTP error / timeout / empty content) falls
+ * through to the next engine. Without `engines`, the flat legacy config is a
+ * single-engine chain (previous behaviour, unchanged).
+ */
+export function resolveVisionEngines(visionCfg) {
+  if (Array.isArray(visionCfg?.engines) && visionCfg.engines.length > 0) {
+    return visionCfg.engines.map((e, i) => ({ ...DEFAULTS, ...e, _i: i }));
+  }
+  return [resolveVisionConfig(visionCfg)];
+}
+
+/**
+ * Run the engine chain: first engine that returns content wins. Errors are
+ * collected; when every engine fails the combined message is thrown. An
+ * aborted outer signal (turn cancelled) is rethrown immediately.
+ * @returns {{answer: string, engine: object}}
+ */
+export async function callVisionWithFallback(engines, imageUrl, question, signal) {
+  const errors = [];
+  for (const engine of engines) {
+    try {
+      const answer = await callVisionEndpoint(engine, imageUrl, question, signal);
+      return { answer, engine };
+    } catch (err) {
+      if (signal?.aborted) throw err;
+      errors.push(`${engine.model}: ${err.message}`);
+      log.warn(`vision engine #${engine._i ?? 0} (${engine.model}) failed → ${engines.length > 1 ? 'trying next engine' : 'no fallback'}`);
+    }
+  }
+  throw new Error(`所有识图引擎均失败（${errors.join(' | ')}）`);
+}
+
 const stringOutput = {
   schema: { type: 'string' },
   render: (_args, value) => [{ type: 'text', text: value }],
@@ -174,6 +209,7 @@ export function installVisionTool(ctx, visionCfg) {
     return null;
   }
   const cfg = resolveVisionConfig(visionCfg);
+  const engines = resolveVisionEngines(visionCfg);
   const attachments = ctx.get?.('attachments') ?? ctx.attachments ?? null;
 
   const def = {
@@ -218,13 +254,14 @@ export function installVisionTool(ctx, visionCfg) {
           ? file
           : await localImageDataUrl(path.resolve(file), cfg.maxImageBytes);
       }
-      const answer = await callVisionEndpoint(cfg, imageUrl, question, exec?.signal);
-      log.info(`inspect_image ok (${cfg.model}, ${label})`);
-      return `[inspect_image ${cfg.model}]\n${answer}`;
+      const { answer, engine } = await callVisionWithFallback(engines, imageUrl, question, exec?.signal);
+      log.info(`inspect_image ok (${engine.model}, ${label})`);
+      return `[inspect_image ${engine.model}]\n${answer}`;
     },
   };
   const dispose = tools.register(def);
-  const keySource = cfg.apiKey ? 'config' : (process.env[cfg.apiKeyEnv] ? cfg.apiKeyEnv : '未配置');
-  log.info(`inspect_image tool registered (vision=${cfg.model} @ ${cfg.baseURL}, key=${keySource})`);
+  const keyOf = (e) => (e.apiKey ? 'config' : (process.env[e.apiKeyEnv] ? e.apiKeyEnv : '未配置'));
+  const chain = engines.map((e) => `${e.model}@${e.baseURL.replace(/^https?:\/\//, '')} (key=${keyOf(e)})`).join(' → ');
+  log.info(`inspect_image tool registered (vision chain: ${chain})`);
   return typeof dispose === 'function' ? dispose : null;
 }

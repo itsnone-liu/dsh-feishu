@@ -248,6 +248,13 @@ export class Commands {
     const v = this.config.vision;
     if (v === false || v?.enabled === false) {
       rows.push('⚠️ 外挂识图：config.json 已禁用（vision:false）');
+    } else if (Array.isArray(v?.engines) && v.engines.length > 0) {
+      rows.push('🛡️ 外挂识图引擎链（按序降级）：');
+      v.engines.forEach((e, i) => {
+        const envName = e.apiKeyEnv ?? 'DASHSCOPE_API_KEY';
+        const hasKey = Boolean(e.apiKey || process.env[envName]);
+        rows.push(`  ${i === 0 ? '①主' : `⑵备${i > 1 ? i : ''}`} ${hasKey ? '✅' : '❌'} \`${e.model ?? 'qwen3-vl-plus'}\` @ \`${e.baseURL ?? 'https://dashscope.aliyuncs.com/compatible-mode/v1'}\`${hasKey ? '' : `（密钥缺失：apiKey 或环境变量 ${envName}）`}`);
+      });
     } else {
       const base = v?.baseURL ?? 'https://dashscope.aliyuncs.com/compatible-mode/v1';
       const model = v?.model ?? 'qwen3-vl-plus';
