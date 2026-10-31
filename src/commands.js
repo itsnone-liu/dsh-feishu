@@ -30,7 +30,7 @@ const HELP = [
   '- 订阅额度耗尽时桥会**自动等待恢复并继续**；配置了备用模型时会**自动切换**（主模型限额→备用模型接管续跑，探针探到恢复自动切回）',
   '- `/gpt` `/glm` `/auto` 手动快切模型（调试用）：gpt=切备用并暂停自动 · glm=切回主模型 · auto=恢复自动切换',
   '- `/ds` 切到阿里云 DeepSeek-V4.1-Flash（百炼订阅 TokenPlan；手动模式，/glm 切回）',
-  '- `/mimo` 切到 MiMo v2.5（手动模式）；`/model mimo/mimo-v2.5` 或 `/model mimo/mimo-v2.6-pro` 切换 MiMo 模型',
+  '- `/mimo` 切到 MiMo v2.6 Pro（手动模式）；`/model mimo/mimo-v2.6-flash` 或 `/model mimo/mimo-v2.6-pro` 切换 MiMo 模型',
   '- `/new [cwd]` 新会话 · `/stop` 停止本轮 · `/status` 状态 · `/doctor` 诊断（识图链路体检）',
   '- `/mode` 查看/切换权限模式（`/mode ro` 只读 · `/mode rw` 工作区可写 · `/mode full` 全权）',
   '- `/model` 查看/切换模型（如 `/model glm-5.3`；跨厂商用 `厂商/模型` 全称；📷 标记原生支持识图）',
