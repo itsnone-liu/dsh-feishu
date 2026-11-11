@@ -91,7 +91,7 @@ function apply(ctx, config) {
         config: cfg,
         chatOfSession: (sessionId) => renderer.chatOf(sessionId),
       });
-      const commands = new Commands({ config: cfg, store, driver, renderer, transport, permissionPresets: ctx.permissionPresets, llm: ctx.llm, agentPresets: ctx.agentPresets, visionReady, autoContinue: null });
+      const commands = new Commands({ config: cfg, store, driver, renderer, transport, permissionPresets: ctx.permissionPresets, llm: ctx.llm, agentPresets: ctx.agentPresets, visionReady, autoContinue: null, dshCommands: (typeof ctx.get === 'function' ? ctx.get('commands') : ctx.commands) ?? null });
       const autoContinue = new AutoContinue({ config: cfg, driver, renderer, transport });
       commands.autoContinue = autoContinue; // 注入（构造顺序：Commands 先建，AutoContinue 需要 transport 就绪）
       // P-E（2026-09-29 用户拍板）：桥内不再做 LLM 枚举恢复 / 自动代码修复。

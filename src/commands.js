@@ -39,6 +39,7 @@ const HELP = [
   '- `/cwd <路径>` 设定下次新会话的工作区',
   '- `/restart` 安全重启桥（在进程外拉起新进程；会话可接续）',
   '',
+  '- **dsh 内核命令**（桥自动转发）：`/compact` 压缩上下文 · `/plan` 计划模式 · `/goal` 长任务目标 · `/export` 导出会话日志',
   'agent 提问或请求审批时会弹出按钮卡片；直接回复文字等于自由输入。',
 ].join('\n');
 
@@ -57,7 +58,7 @@ const MODE_ALIASES = {
 };
 
 export class Commands {
-  constructor({ config, store, driver, renderer, transport, permissionPresets, llm, agentPresets, visionReady = false, autoContinue = null, auditController = null }) {
+  constructor({ config, store, driver, renderer, transport, permissionPresets, llm, agentPresets, visionReady = false, autoContinue = null, auditController = null, dshCommands = null }) {
     this.config = config;
     this.store = store;
     this.driver = driver;
@@ -68,10 +69,54 @@ export class Commands {
     this.agentPresets = agentPresets;
     this.visionReady = visionReady;
     this.autoContinue = autoContinue;
+    /** dsh 内置命令服务（ctx.get('commands')）；用于转发 /compact /plan /goal /export 等 */
+    this.dshCommands = dshCommands;
     this.auditController = auditController; // A2：/audit 命令面
     this.auditLifecycle = null; // A3：真实 session/git 启动器（可选，旧装配兼容）
   }
 
+
+
+  /**
+   * 把桥不认识的斜杠命令转交给 dsh 命令服务执行。
+   * 命中返回 true（已回复卡片）；未命中返回 false，由调用方回"未知命令"。
+   */
+  async tryDshCommand(chatId, line) {
+    const svc = this.dshCommands;
+    if (!svc || typeof svc.execute !== 'function') return false;
+    const binding = this.store.get(chatId);
+    if (!binding) return false;
+    let agent;
+    try {
+      agent = await this.driver.ensure(binding, { allowCreate: false });
+    } catch {
+      return false;
+    }
+    if (!agent) return false;
+    const name = line.slice(1).trim().split(/\s+/)[0];
+    const def = typeof svc.find === 'function' ? svc.find(agent, name) : undefined;
+    if (!def) return false;
+    const ctl = new AbortController();
+    let exec;
+    try {
+      exec = await svc.execute(agent, line, [], ctl.signal);
+    } catch (e) {
+      await this.transport.sendCard(chatId, buildErrorCard(`/${name} 执行失败`, e.message));
+      return true;
+    }
+    if (!exec) return false;
+    const r = exec.result ?? {};
+    const text = typeof r.text === 'string' ? r.text
+      : typeof r.message === 'string' ? r.message
+      : JSON.stringify(r).slice(0, 800);
+    const ok = r.kind !== 'error';
+    await this.transport.sendCard(
+      chatId,
+      ok ? buildInfoCard(`/${name}`, text || '（无输出）')
+         : buildErrorCard(`/${name} 出错`, text || '未知错误'),
+    );
+    return true;
+  }
 
   /** Returns true when the text was a command (and has been answered). */
   async handle(chatId, text) {
@@ -129,6 +174,9 @@ export class Commands {
         case 'restart':
           return await this.cmdRestart(chatId);
         default:
+          // 桥没实现的命令：先问 dsh 有没有（/compact /plan /goal /export …）
+          // 这样 dsh 将来新增内置命令，桥无需再改。
+          if (await this.tryDshCommand(chatId, text)) return true;
           await this.transport.sendCard(chatId, buildInfoCard('未知命令', `没有 \`${cmd}\`，试试 /help`, { template: 'grey' }));
           return true;
       }
