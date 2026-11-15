@@ -70,7 +70,8 @@ function harness({ chatId = 'chat-1', sessionId = 's-1', running = false } = {})
   // idle by default: an ask on an idle agent is a normal followup. Tests that
   // need the steer path set status explicitly.
   const agent = { id: sessionId, status: 'idle' };
-  const live = new Map([[sessionId, agent]]);
+  // Real shape: live maps sessionId → {agent} wrapper (see driver.js live.set).
+  const live = new Map([[sessionId, { agent }]]);
   const driver = {
     live,
     stop: (agent) => stopped.push(agent?.id),

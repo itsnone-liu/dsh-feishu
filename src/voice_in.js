@@ -114,7 +114,12 @@ export function createVoiceIn({ router, driver, store, config, log, socketPath }
     // end first, and only then does the user's new turn start. Treating that
     // first turn/end as ours answered an interrupting question with an empty
     // `done` -- the exact failure seen on the first live device turn.
-    const agentNow = sessionId ? driver?.live?.get?.(sessionId) : null;
+    // driver.live maps sessionId → {handle, agent} (or {agent}), not the agent
+    // itself. Reading .status off the wrapper is always undefined, so steer
+    // detection silently never fired -- exposed by the missing log line on the
+    // first real steering turn.
+    const entry = sessionId ? driver?.live?.get?.(sessionId) : null;
+    const agentNow = entry?.agent ?? entry ?? null;
     const steering = Boolean(agentNow && agentNow.status === 'running');
     active = {
       id, chatId, sessionId, socket, blockKinds: new Map(),
