@@ -60,14 +60,17 @@ function collector(sock) {
   };
 }
 
-function harness({ chatId = 'chat-1', sessionId = 's-1' } = {}) {
+function harness({ chatId = 'chat-1', sessionId = 's-1', running = false } = {}) {
   const submitted = [];
   const stopped = [];
   const router = { onMessage: (msg) => submitted.push(msg) };
   const store = {
     get: (id) => (id === chatId ? { chatId: id, sessionId, cwd: '/tmp' } : null),
   };
-  const live = new Map([[sessionId, { id: sessionId, status: 'running' }]]);
+  // idle by default: an ask on an idle agent is a normal followup. Tests that
+  // need the steer path set status explicitly.
+  const agent = { id: sessionId, status: 'idle' };
+  const live = new Map([[sessionId, agent]]);
   const driver = {
     live,
     stop: (agent) => stopped.push(agent?.id),
@@ -81,7 +84,8 @@ function harness({ chatId = 'chat-1', sessionId = 's-1' } = {}) {
     log: quiet,
     socketPath: tmpSock('t'),
   });
-  return { voice, submitted, stopped, sessionId, chatId };
+  if (running) agent.status = 'running';
+  return { voice, submitted, stopped, sessionId, chatId, agent };
 }
 
 /** Synthesises the bridge's session/event stream for one turn. */
@@ -241,5 +245,37 @@ test('an unwhitelisted sender is refused before reaching the agent', async () =>
   const err = await c.waitFor((m) => m.type === 'error');
   assert.match(err.message, /openId/);
   voice.stop();
+  sock.destroy();
+});
+
+
+test("interrupting a running turn: the old turn's end is not our answer", async () => {
+  // The first live device turn failed exactly here: the user spoke while the
+  // previous turn was still generating, the submit became a steer, and the
+  // in-flight turn's turn/end was answered as OUR done with zero deltas.
+  const h = harness({ running: true });
+  h.voice.start();
+  const sock = await connect(h.voice._state().socketPath);
+  const c = collector(sock);
+  sock.write(JSON.stringify({ id: 30, op: 'ask', text: '插话：先回答我' }) + '\n');
+  await c.waitFor((m) => m.type === 'ack');
+
+  const emit = (type, data) => h.voice.onSessionEvent({ id: h.sessionId }, { type, data });
+  // the old turn ends first — must be skipped, not treated as our answer
+  emit('turn/end', { reason: { kind: 'completed' } });
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(c.out.filter((m) => m.type === 'done').length, 0,
+    'the steered-away turn\'s end must not close our ask');
+
+  // then OUR turn starts and streams
+  emit('turn/start', { turn: 2 });
+  emit('assistant/chunk', { chunk: { type: 'block-start', blockType: 'text', index: 0 } });
+  emit('assistant/chunk', { chunk: { type: 'text-delta', index: 0, text: '好的，先答你' } });
+  emit('turn/end', { reason: { kind: 'completed' } });
+  const done = await c.waitFor((m) => m.type === 'done');
+  assert.equal(done.cancelled, false);
+  const text = c.out.filter((m) => m.type === 'delta').map((m) => m.text).join('');
+  assert.equal(text, '好的，先答你');
+  h.voice.stop();
   sock.destroy();
 });

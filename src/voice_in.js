@@ -110,7 +110,18 @@ export function createVoiceIn({ router, driver, store, config, log, socketPath }
       return;
     }
     const sessionId = sessionOf(chatId);
-    active = { id, chatId, sessionId, socket, blockKinds: new Map(), timer: null, firstTimer: null };
+    // If the agent is mid-turn, our submit is a *steer*: the running turn will
+    // end first, and only then does the user's new turn start. Treating that
+    // first turn/end as ours answered an interrupting question with an empty
+    // `done` -- the exact failure seen on the first live device turn.
+    const agentNow = sessionId ? driver?.live?.get?.(sessionId) : null;
+    const steering = Boolean(agentNow && agentNow.status === 'running');
+    active = {
+      id, chatId, sessionId, socket, blockKinds: new Map(),
+      timer: null, firstTimer: null,
+      skipEnds: steering ? 1 : 0,   // ignore the in-flight turn's end(s)
+    };
+    if (steering) log?.info?.(`voice: ask#${id} steers a running turn; its end is not ours`);
     active.firstTimer = setTimeout(() => {
       if (!active || active.id !== id) return;
       finish({ type: 'error', id, message: '提交后没有任何事件（turn/start 未到达）' });
@@ -173,6 +184,10 @@ export function createVoiceIn({ router, driver, store, config, log, socketPath }
           clearTimeout(active.firstTimer);
           active.firstTimer = null;
         }
+        // A turn that starts *while we are skipping ends* is still the old one
+        // finishing its tail; only a start after the skipped end is ours.
+        if (active.skipEnds > 0 && active.started) return;
+        active.started = true;
         return;
       }
       if (type === 'assistant/chunk') {
@@ -189,6 +204,12 @@ export function createVoiceIn({ router, driver, store, config, log, socketPath }
         return;
       }
       if (type === 'turn/end') {
+        if (active.skipEnds > 0) {
+          active.skipEnds -= 1;
+          active.started = false;      // next turn/start is the steered one
+          log?.info?.(`voice: ask#${active.id} skipped the steered turn's end`);
+          return;
+        }
         finish({ type: 'done', id: active.id, cancelled: false, reason: event.data?.reason });
       }
     } catch (e) {
