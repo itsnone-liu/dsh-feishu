@@ -71,6 +71,7 @@ export function createVoiceIn({ router, driver, store, config, log, socketPath }
     if (!active) return;
     if (active.timer) clearTimeout(active.timer);
     if (active.firstTimer) clearTimeout(active.firstTimer);
+    if (active.textTimer) clearTimeout(active.textTimer);
     active.timer = null;
     active.firstTimer = null;
   }
@@ -127,6 +128,11 @@ export function createVoiceIn({ router, driver, store, config, log, socketPath }
       skipEnds: steering ? 1 : 0,   // ignore the in-flight turn's end(s)
     };
     if (steering) log?.info?.(`voice: ask#${id} steers a running turn; its end is not ours`);
+    active.textTimer = setTimeout(() => {
+      if (!active || active.id !== id || active.textLogged) return;
+      log?.warn?.(`voice: ask#${id} no text within 45 s; failing the turn`);
+      finish({ type: 'error', id, message: '桥 45 s 内没有产出文本' });
+    }, 45_000);
     active.firstTimer = setTimeout(() => {
       if (!active || active.id !== id) return;
       finish({ type: 'error', id, message: '提交后没有任何事件（turn/start 未到达）' });
@@ -213,7 +219,20 @@ export function createVoiceIn({ router, driver, store, config, log, socketPath }
           .filter((part) => part?.type === 'text' && typeof part.text === 'string')
           .map((part) => part.text)
           .join('');
+        if (!text) {
+          active.emptyMessages = (active.emptyMessages ?? 0) + 1;
+          if (active.emptyMessages === 1) {
+            const kinds = parts.map((part) => part?.type ?? '?').join(',');
+            log?.info?.(`voice: ask#${active.id} assistant/message without text (parts: ${kinds})`);
+          }
+          return;
+        }
         if (text) {
+          if (!active.textLogged) {
+            active.textLogged = true;
+            log?.info?.(`voice: ask#${active.id} text ${text.length} chars: `
+              + JSON.stringify(text.slice(0, 40)));
+          }
           if (active.sawChunks) {
             // chunks already streamed this text; only send the remainder
             const rest = text.startsWith(active.chunkText) ? text.slice(active.chunkText.length) : '';
