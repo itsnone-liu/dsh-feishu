@@ -25,6 +25,7 @@ import { BindingStore } from './store.js';
 import { TurnRenderer } from './renderer.js';
 import { SessionDriver } from './driver.js';
 import { ChatRouter } from './router.js';
+import { createVoiceIn } from './voice_in.js';
 import { Commands } from './commands.js';
 import { InteractionManager } from './ask.js';
 import { AutoContinue } from './autocontinue.js';
@@ -81,6 +82,8 @@ function apply(ctx, config) {
 
   const store = new BindingStore(cfg.dataDir);
   const driver = new SessionDriver({ ctx, config: cfg });
+  /** Set once the transport is up; the session/event listener reads it each event. */
+  let voiceIn = null;
 
   // Transport first — renderer and interactions need it.
   createTransport(cfg)
@@ -211,6 +214,11 @@ function apply(ctx, config) {
         log.error(`audit lifecycle restore failed: ${e?.stack ?? e}`);
       });
       const router = new ChatRouter({ config: cfg, store, driver, renderer, transport, interactions, commands, visionReady, autoContinue });
+      // Voice ingress is opt-in (config.voice.enabled) and local-only. It is
+      // created even when disabled so a later config flip needs no code change.
+      voiceIn = createVoiceIn({ router, driver, store, config: cfg, log });
+      if (cfg.voice?.enabled) voiceIn.start();
+      else log.info('voice ingress disabled (config.voice.enabled=false)');
 
       // ---- outbound seams ----
       // dsh 0.2.1 把 userQuestions 改成 typert 远程服务（answer/attachWait），
@@ -259,6 +267,14 @@ function apply(ctx, config) {
         } catch (e) {
           log.error(`auto-continue event ${event?.type} failed (contained): ${e?.stack ?? e}`);
         }
+        // Voice ingress sees the same durable feed as the cards. Contained for
+        // the same reason as everything else in this listener: a throw here
+        // would happen inside dsh's synchronous session.append().
+        try {
+          voiceIn?.onSessionEvent(session, event);
+        } catch (e) {
+          log.error(`voice event ${event?.type} failed (contained): ${e?.stack ?? e}`);
+        }
         // A3 executor observer: never throw through synchronous DSH append.
         Promise.resolve(commands.auditLifecycle?.onEvent(session, event)).catch((e) => {
           log.error(`audit executor event ${event?.type} failed (contained): ${e?.stack ?? e}`);
@@ -276,6 +292,7 @@ function apply(ctx, config) {
         for (const d of disposers) { try { d(); } catch {} }
         autoContinue.dispose();
         transport.stop().catch(() => {});
+        try { voiceIn?.stop(); } catch {}
         driver.disposeAll().catch((e) => log.warn(`driver dispose: ${e.message}`));
       };
       if (typeof ctx.effect === 'function') ctx.effect(() => cleanup);

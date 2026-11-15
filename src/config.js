@@ -35,6 +35,11 @@ const DEFAULTS = {
   defaultCwd: '',
   /** cwd whitelist — chat bindings and /cwd may only use these. */
   allowedWorkspaces: [],
+  /** Voice ingress (see src/voice_in.js). Off by default; local unix socket
+   *  only, and only the whitelisted chatId can be driven through it.
+   *  enabled: start the socket · chatId: which binding the voice lands in
+   *  (the same session the user types into) · socketPath: override path. */
+  voice: { enabled: false, chatId: '', socketPath: '', openId: 'voice' },
   /** Agent preset for new sessions ('minimal' | 'standard' | ...). */
   agentPreset: 'minimal',
   /** Model override; empty = use the harness default selection. */
