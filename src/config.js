@@ -48,7 +48,7 @@ const DEFAULTS = {
     // is asked to answer in one short spoken sentence before it starts working;
     // without this the first audible sentence was "让我先查一下" twelve seconds
     // in. Set to '' to disable.
-    promptPrefix: '【语音通道】这条提问来自语音，答复会被直接念出来：先用一句话口语作答（不超过 30 字、不要 markdown/代码/路径/链接），再执行你需要的工具；最终结论单独用一句话说。',
+    promptPrefix: '【语音通道·硬约束】这条提问来自语音，用户正等着听声音：\n1. 你的第一个步骤只输出文本、不得调用任何工具，用一句口语回应（不超过 30 字，不要 markdown/代码/路径/链接）；\n2. 然后再调用工具；\n3. 最终结论单独用一句话说，不要重复过程。',
   },
   /** Agent preset for new sessions ('minimal' | 'standard' | ...). */
   agentPreset: 'minimal',

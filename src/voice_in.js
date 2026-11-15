@@ -134,11 +134,15 @@ export function createVoiceIn({ router, driver, store, config, log, socketPath }
       skipEnds: steering ? 1 : 0,   // ignore the in-flight turn's end(s)
     };
     if (steering) log?.info?.(`voice: ask#${id} steers a running turn; its end is not ours`);
+    // Long enough for a tool-heavy turn: measured 58 s to the first text on a
+    // real question. A watchdog shorter than the agent's own working time
+    // converts a healthy turn into "语音入口暂时不可用".
+    const noTextMs = cfg.noTextTimeoutMs ?? 150_000;
     active.textTimer = setTimeout(() => {
       if (!active || active.id !== id || active.textLogged) return;
-      log?.warn?.(`voice: ask#${id} no text within 45 s; failing the turn`);
-      finish({ type: 'error', id, message: '桥 45 s 内没有产出文本' });
-    }, 45_000);
+      log?.warn?.(`voice: ask#${id} no text within ${noTextMs} ms; failing the turn`);
+      finish({ type: 'error', id, message: `桥 ${Math.round(noTextMs / 1000)} s 内没有产出文本` });
+    }, noTextMs);
     active.firstTimer = setTimeout(() => {
       if (!active || active.id !== id) return;
       finish({ type: 'error', id, message: '提交后没有任何事件（turn/start 未到达）' });
