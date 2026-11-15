@@ -213,7 +213,15 @@ export function createVoiceIn({ router, driver, store, config, log, socketPath }
         if (active.skipEnds > 0) {
           active.skipEnds -= 1;
           active.started = false;      // next turn/start is the steered one
-          log?.info?.(`voice: ask#${active.id} skipped the steered turn's end`);
+          // The skipped end proves the pipeline is alive; the steered turn has
+          // not started yet. Letting the first-event timer keep running killed
+          // a healthy steer whose old turn simply took longer than the timer
+          // (a long reply in flight at ask time).
+          if (active.firstTimer) {
+            clearTimeout(active.firstTimer);
+            active.firstTimer = null;
+          }
+          log?.info?.(`voice: ask#${active.id} skipped the steered turn's end (still waiting for our turn)`);
           return;
         }
         finish({ type: 'done', id: active.id, cancelled: false, reason: event.data?.reason });
