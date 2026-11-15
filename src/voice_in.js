@@ -180,7 +180,7 @@ export function createVoiceIn({ router, driver, store, config, log, socketPath }
       if (!active) return;
       // Diagnostic (first few events per ask): without this, "voice asked and
       // heard nothing" is invisible from outside the bridge process.
-      if ((active.debugSeen = (active.debugSeen ?? 0) + 1) <= 5) {
+      if ((active.debugSeen = (active.debugSeen ?? 0) + 1) <= 20) {
         log?.info?.(`voice: ask#${active.id} saw ${event?.type} `
           + `session=${String(session?.id ?? '?').slice(-8)} `
           + `want=${String(active.sessionId ?? '(any)').slice(-8)}`);
@@ -203,6 +203,27 @@ export function createVoiceIn({ router, driver, store, config, log, socketPath }
         active.started = true;
         return;
       }
+      if (type === 'assistant/message') {
+        // This dsh version does not emit token-level `assistant/chunk`; the
+        // step's text arrives once as `assistant/message` (measured: 534
+        // messages, 0 chunks in a live session). Without this branch the bridge
+        // received every other event and answered the ask with silence.
+        const parts = event.data?.message?.content ?? [];
+        const text = parts
+          .filter((part) => part?.type === 'text' && typeof part.text === 'string')
+          .map((part) => part.text)
+          .join('');
+        if (text) {
+          if (active.sawChunks) {
+            // chunks already streamed this text; only send the remainder
+            const rest = text.startsWith(active.chunkText) ? text.slice(active.chunkText.length) : '';
+            if (rest) send(active.socket, { type: 'delta', id: active.id, text: rest });
+          } else {
+            send(active.socket, { type: 'delta', id: active.id, text });
+          }
+        }
+        return;
+      }
       if (type === 'assistant/chunk') {
         const chunk = event.data?.chunk;
         if (!chunk) return;
@@ -212,7 +233,11 @@ export function createVoiceIn({ router, driver, store, config, log, socketPath }
         }
         if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
           if (active.blockKinds.get(chunk.index) === 'reasoning') return;
-          if (chunk.text) send(active.socket, { type: 'delta', id: active.id, text: chunk.text });
+          if (chunk.text) {
+            active.sawChunks = true;
+            active.chunkText = (active.chunkText ?? '') + chunk.text;
+            send(active.socket, { type: 'delta', id: active.id, text: chunk.text });
+          }
         }
         return;
       }

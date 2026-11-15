@@ -280,3 +280,28 @@ test("interrupting a running turn: the old turn's end is not our answer", async 
   h.voice.stop();
   sock.destroy();
 });
+
+test('a step message is spoken when the harness emits no chunks', async () => {
+  // This dsh does not emit assistant/chunk; text arrives once per step as
+  // assistant/message. Missing this branch made the bridge answer every ask
+  // with silence while the screen showed the transcript.
+  const h = harness();
+  h.voice.start();
+  const sock = await connect(h.voice._state().socketPath);
+  const c = collector(sock);
+  sock.write(JSON.stringify({ id: 40, op: 'ask', text: '你好' }) + '\n');
+  await c.waitFor((m) => m.type === 'ack');
+  const emit = (type, data) => h.voice.onSessionEvent({ id: h.sessionId }, { type, data });
+  emit('turn/start', { turn: 1 });
+  emit('assistant/message', {
+    message: { content: [{ type: 'reasoning', text: '内心独白' },
+                         { type: 'text', text: '今天下午可能有雨。' }] },
+  });
+  emit('turn/end', { reason: { kind: 'completed' } });
+  await c.waitFor((m) => m.type === 'done');
+  const text = c.out.filter((m) => m.type === 'delta').map((m) => m.text).join('');
+  assert.equal(text, '今天下午可能有雨。');
+  assert.ok(!text.includes('内心独白'), 'reasoning part must not be spoken');
+  h.voice.stop();
+  sock.destroy();
+});
