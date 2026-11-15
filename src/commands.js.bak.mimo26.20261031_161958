@@ -1,0 +1,978 @@
+/**
+ * Slash commands (private chats). Everything else goes to the agent.
+ *
+ *   /help              this card
+ *   /new [cwd]         start a fresh session (old one stays on disk)
+ *   /stop              cancel the active turn (queued work survives)
+ *   /status            binding + live agent state
+ *   /mode [name]       show / switch permission mode (read-only · workspace-write · danger-full-access)
+ *   /model [p/m]       show / switch model (/model glm-5.3, /model glm-coding/glm-5.3)
+ *   /preset [id]       show / switch agent preset (blank session switches live;
+ *                      a session with history starts a fresh one on the preset)
+ *   /sessions          list persisted sessions for this workspace (headers only)
+ *   /resume <prefix>   rebind this chat to a persisted session
+ *   /cwd <path>        set the workspace for the NEXT /new (whitelisted)
+ */
+import fs from 'node:fs';
+import path from 'node:path';
+import zlib from 'node:zlib';
+import { execFile } from 'node:child_process';
+import { buildInfoCard, buildErrorCard } from './cards.js';
+import { isWorkspaceAllowed, dshHome } from './config.js';
+import { log } from './log.js';
+import { handleAuditCommand } from './audit/commands.js';
+
+const HELP = [
+  '**dsh-feishu 桥**',
+  '',
+  '- 直接发文字 = 和 agent 说话（运行中发送会作为下一步转向输入）',
+  '- **直接发图片 = 识图**：无需切模型 —— 文本模型会自动调用 `inspect_image` 外挂识图（Qwen-VL）；若当前模型本身支持视觉则原生识图。连发多张图会自动合并为一个回合（1.5 秒窗口）',
+  '- 订阅额度耗尽时桥会**自动等待恢复并继续**；配置了备用模型时会**自动切换**（主模型限额→备用模型接管续跑，探针探到恢复自动切回）',
+  '- `/gpt` `/glm` `/auto` 手动快切模型（调试用）：gpt=切备用并暂停自动 · glm=切回主模型 · auto=恢复自动切换',
+  '- `/ds` 切到阿里云 DeepSeek-V4.1-Flash（百炼订阅 TokenPlan；手动模式，/glm 切回）',
+  '- `/mimo` 切到 MiMo v2.5（手动模式）；`/model mimo/mimo-v2.5` 或 `/model mimo/mimo-v2.6-pro` 切换 MiMo 模型',
+  '- `/new [cwd]` 新会话 · `/stop` 停止本轮 · `/status` 状态 · `/doctor` 诊断（识图链路体检）',
+  '- `/mode` 查看/切换权限模式（`/mode ro` 只读 · `/mode rw` 工作区可写 · `/mode full` 全权）',
+  '- `/model` 查看/切换模型（如 `/model glm-5.3`；跨厂商用 `厂商/模型` 全称；📷 标记原生支持识图）',
+  '- `/preset` 查看/切换预设（极简 minimal · 标准 standard · code · cordis；有历史的会话自动开新会话）',
+  '- `/sessions` 列出本工作区会话 · `/resume <id前缀>` 接续旧会话',
+  '- `/cwd <路径>` 设定下次新会话的工作区',
+  '- `/restart` 安全重启桥（在进程外拉起新进程；会话可接续）',
+  '',
+  'agent 提问或请求审批时会弹出按钮卡片；直接回复文字等于自由输入。',
+].join('\n');
+
+/** Friendly aliases → preset table keys (applied only when the key exists). */
+const MODE_ALIASES = {
+  ro: 'read-only',
+  readonly: 'read-only',
+  read: 'read-only',
+  rw: 'workspace-write',
+  write: 'workspace-write',
+  ww: 'workspace-write',
+  ws: 'workspace-write',
+  full: 'danger-full-access',
+  danger: 'danger-full-access',
+  god: 'danger-full-access',
+};
+
+export class Commands {
+  constructor({ config, store, driver, renderer, transport, permissionPresets, llm, agentPresets, visionReady = false, autoContinue = null, auditController = null }) {
+    this.config = config;
+    this.store = store;
+    this.driver = driver;
+    this.renderer = renderer;
+    this.transport = transport;
+    this.permissionPresets = permissionPresets;
+    this.llm = llm;
+    this.agentPresets = agentPresets;
+    this.visionReady = visionReady;
+    this.autoContinue = autoContinue;
+    this.auditController = auditController; // A2：/audit 命令面
+    this.auditLifecycle = null; // A3：真实 session/git 启动器（可选，旧装配兼容）
+  }
+
+
+  /** Returns true when the text was a command (and has been answered). */
+  async handle(chatId, text) {
+    if (!text.startsWith('/')) return false;
+    const [rawCmd, ...rest] = text.slice(1).trim().split(/\s+/);
+    const arg = rest.join(' ');
+    // singular/plural + lowercase normalization so /session, /Models … all work
+    const cmd = rawCmd.toLowerCase();
+    log.debug(`command /${cmd} in chat ${chatId}`);
+    try {
+      switch (cmd) {
+        case 'help':
+        case 'start':
+          await this.transport.sendCard(chatId, buildInfoCard('dsh-feishu 帮助', HELP));
+          return true;
+        case 'new':
+          return await this.cmdNew(chatId, arg);
+        case 'stop':
+          return await this.cmdStop(chatId);
+        case 'audit':
+          return await this.cmdAudit(chatId, arg);
+        case 'status':
+          return await this.cmdStatus(chatId);
+        case 'mode':
+        case 'permission':
+          return await this.cmdMode(chatId, arg);
+        case 'model':
+        case 'models':
+          return await this.cmdModel(chatId, arg);
+        case 'gpt':
+          return await this.cmdQuickSwitch(chatId, 'gpt');
+        case 'glm':
+          return await this.cmdQuickSwitch(chatId, 'glm');
+        case 'auto':
+          return await this.cmdQuickSwitch(chatId, 'auto');
+        case 'ds':
+          return await this.cmdQuickSwitch(chatId, 'ds');
+        case 'mimo':
+          return await this.cmdQuickSwitch(chatId, 'mimo');
+        case 'preset':
+        case 'presets':
+          return await this.cmdPreset(chatId, arg);
+        case 'sessions':
+        case 'session':
+        case 'ls':
+          return await this.cmdSessions(chatId);
+        case 'resume':
+        case 'switch':
+          return await this.cmdResume(chatId, arg);
+        case 'cwd':
+          return await this.cmdCwd(chatId, arg);
+        case 'doctor':
+        case 'diag':
+          return await this.cmdDoctor(chatId);
+        case 'restart':
+          return await this.cmdRestart(chatId);
+        default:
+          await this.transport.sendCard(chatId, buildInfoCard('未知命令', `没有 \`${cmd}\`，试试 /help`, { template: 'grey' }));
+          return true;
+      }
+    } catch (e) {
+      log.error(`command ${cmd}: ${e.stack ?? e}`);
+      await this.transport.sendCard(chatId, buildErrorCard(`/${cmd} 失败`, e.message));
+      return true;
+    }
+  }
+
+  /**
+   * /audit — 审计模式命令面（A2）：创建/查看/暂停/恢复/终止/改停止点。
+   * 全部语义由 A1 冻结内核执行；这里只解析参数并发卡片。
+   */
+  async cmdAudit(chatId, arg) {
+    if (!this.auditController) {
+      await this.transport.sendCard(chatId, buildErrorCard(
+        new Error('/audit 未启用：本装配未注入 AuditController（A2 功能）。'),
+      ));
+      return true;
+    }
+    let card;
+    try {
+      const raw = (arg ?? '').trim();
+      const first = raw.split(/\s+/)[0]?.toLowerCase();
+      const second = raw.split(/\s+/)[1] ?? null;
+      const management = new Set(['', 'status', 'pause', 'resume', 'stop', 'until', 'next', 'retry', 'rebind']);
+      if (first === 'rebind' && this.auditLifecycle) {
+        const result = await this.auditController.rebind(chatId);
+        if (!result.ok) {
+          card = buildErrorCard(new Error(result.message));
+        } else {
+          card = buildInfoCard('🔗 审计 session 已迁移', [
+            `run：\`${result.runId}\``,
+            `状态：**${result.result.state}**`,
+            `审计 session：\`${result.result.auditSessionId}\``,
+            '普通对话 session 保留为观察/控制入口。',
+          ].join('\n'));
+        }
+      } else if (!raw && this.auditLifecycle) {
+        // 裸 /audit 也必须走真实 A3 lifecycle；不得回落到 A2 stub。
+        // 停止点由冻结 task packet 的最后阶段解析，避免 DEFAULT_STAGES 漂移。
+        const packet = this.auditLifecycle.taskPacketLoader(
+          this.auditLifecycle.bindings?.get(chatId)?.cwd,
+        );
+        const result = await this.auditController.createRealRun({
+          stopAfter: packet.stages.at(-1), chatId,
+        });
+        card = buildInfoCard('🧾 审计运行已启动', [
+          `run：\`${result.run.runId}\``,
+          `session：\`${result.agent.id}\``,
+          `状态：**${result.run.s.state}**`,
+          `阶段：**${result.run.s.currentStage}**`,
+          `停止点：**${result.run.s.stopAfter}**`,
+          `HEAD：\`${result.git.head}\``,
+          `任务包：\`${result.run.manifest.taskPacketHash}\``,
+          '',
+          'A3：已绑定现有 DSH session，等待 Executor 输出 READY_FOR_AUDIT。',
+        ].join('\n'));
+      } else if ((first === 'next' || first === 'retry') && this.auditLifecycle) {
+        // /audit next：只续 STOPPED_TARGET_REACHED 父链；/audit retry：
+        // 人工确认后从最近 STOPPED run 的当前阶段重开，不自动恢复。
+        const retryStopped = first === 'retry';
+        const result = await this.auditLifecycle.startContinuation({ chatId, stopAfter: second, retryStopped });
+        card = buildInfoCard(retryStopped ? '🔁 已人工确认重试当前阶段' : '⏭ 审计链已延续', [
+          `run：\`${result.run.runId}\``,
+          `父运行：\`${result.parentRunId}\`（已完成阶段继承，不重审）`,
+          `session：\`${result.agent.id}\``,
+          `状态：**${result.run.s.state}**`,
+          `阶段：**${result.run.s.currentStage}**（iteration 1 起）`,
+          `停止点：**${result.run.s.stopAfter}**`,
+          `HEAD：\`${result.git.head}\``,
+          '',
+          'A3：已绑定现有 DSH session，等待 Executor 输出 READY_FOR_AUDIT。',
+        ].join('\n'));
+      } else if (raw && !management.has(first) && this.auditLifecycle) {
+        const result = await this.auditController.createRealRun({ stopAfter: raw, chatId });
+        card = buildInfoCard('🧾 审计运行已启动', [
+          `run：\`${result.run.runId}\``,
+          `session：\`${result.agent.id}\``,
+          `状态：**${result.run.s.state}**`,
+          `阶段：**${result.run.s.currentStage}**`,
+          `停止点：**${result.run.s.stopAfter}**`,
+          `HEAD：\`${result.git.head}\``,
+          '',
+          'A3：已绑定现有 DSH session，等待 Executor 输出 READY_FOR_AUDIT。',
+        ].join('\n'));
+      } else {
+        const { title, body, template } = await handleAuditCommand(
+          this.auditController, arg ?? '', chatId,
+          { lifecycle: this.auditLifecycle }, // 2026-09-30：preauthStore 已删除
+        );
+        card = buildInfoCard(title, body, template ? { template } : undefined);
+      }
+    } catch (e) {
+      log.error(`/audit handler crashed: ${e?.stack ?? e}`);
+      card = buildErrorCard(e);
+    }
+    await this.transport.sendCard(chatId, card);
+    return true;
+  }
+
+  async cmdNew(chatId, cwdArg) {
+    const binding = this.store.get(chatId) ?? { sessionId: null, cwd: this.config.defaultCwd };
+    let cwd = cwdArg || binding.cwd || this.config.defaultCwd;
+    cwd = path.resolve(cwd);
+    if (!isWorkspaceAllowed(this.config, cwd)) {
+      await this.transport.sendCard(chatId, buildErrorCard('工作区不在白名单', `${cwd}\n允许：${this.config.allowedWorkspaces.join(', ')}`));
+      return true;
+    }
+    if (binding.sessionId) await this.driver.unload(binding.sessionId).catch(() => {});
+    binding.sessionId = null;
+    binding.cwd = cwd;
+    const agent = await this.driver.ensure(binding);
+    // persist AFTER ensure() minted the session id (ensure mutates binding)
+    this.store.update(chatId, { sessionId: binding.sessionId, cwd: binding.cwd });
+    this.renderer.attach(agent.id, chatId);
+    await this.transport.sendCard(chatId, buildInfoCard('新会话已就绪', [
+      `session：\`${agent.id}\``,
+      `工作区：\`${cwd}\``,
+      `预设：\`${this.config.agentPreset}\``,
+      '',
+      '直接发消息开始。',
+    ].join('\n'), { template: 'green' }));
+    return true;
+  }
+
+  async cmdStop(chatId) {
+    const binding = this.store.get(chatId);
+    const agent = binding?.sessionId ? this.driver.live.get(binding.sessionId)?.agent : null;
+    if (!agent) {
+      await this.transport.sendCard(chatId, buildInfoCard('没有运行中的会话', '当前聊天没有绑定活动 agent。', { template: 'grey' }));
+      return true;
+    }
+    this.driver.stop(agent);
+    await this.transport.sendCard(chatId, buildInfoCard('已请求停止', '当前回合将被取消；排队中的输入保留。', { template: 'orange' }));
+    return true;
+  }
+
+  // ---------------------------------------------------------------- /doctor
+
+  /** 1×1 transparent PNG (67 bytes) — attachment-service probe payload. */
+  static PROBE_PNG = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
+    'base64',
+  );
+
+  async cmdDoctor(chatId) {
+    const rows = [];
+
+    // transport mode
+    const t = this.config.transport === 'auto'
+      ? (this.config.appId ? 'auto → sdk（长连接）' : 'auto → 未配置 FEISHU_APP_ID')
+      : this.config.transport;
+    rows.push(`${this.config.transport === 'mock' ? '⚠️' : '✅'} 传输模式：\`${t}\`${this.config.mockAgent ? '（mockAgent 测试模式）' : ''}`);
+    const gm = this.config.groups;
+    rows.push(`ℹ️ 群聊模式：\`${gm}\`${
+      gm === 'off' ? '（仅私聊响应）'
+      : gm === 'mention' ? '（仅群内 @机器人 的文本消息；机器人身份运行时经 bot/v3/info 解析）'
+      : '（群内全部消息，发送者白名单仍生效）'}`);
+
+    // current session model + image capability
+    const binding = this.store.get(chatId);
+    const entry = binding?.sessionId ? this.driver.live.get(binding.sessionId) : null;
+    if (entry) {
+      const cur = this.driver.currentModel(entry.agent);
+      const accepts = await this.driver.modelAcceptsImages(entry.agent);
+      const cap = accepts === true
+        ? '✅ 模型原生支持图片'
+        : this.visionReady
+          ? '✅ 仅文本，但已注册 inspect_image 外挂识图（发图自动走外挂，无需切模型）'
+          : accepts === false
+            ? '❌ 仅文本且无外挂识图（发图会收到切换模型提示卡）'
+            : '❓ 无法判定（fail-open，交由服务端裁决）';
+      rows.push(`ℹ️ 当前会话模型：${cur ? `\`${cur.provider}/${cur.model}\`` : '—'}\n　　识图：${cap}`);
+    } else {
+      rows.push('ℹ️ 当前会话模型：本聊天暂无活动会话（新会话用默认模型）');
+    }
+
+    // vision engine status (config + key presence; no network call here)
+    const v = this.config.vision;
+    if (v === false || v?.enabled === false) {
+      rows.push('⚠️ 外挂识图：config.json 已禁用（vision:false）');
+    } else {
+      const base = v?.baseURL ?? 'https://dashscope.aliyuncs.com/compatible-mode/v1';
+      const model = v?.model ?? 'qwen3-vl-plus';
+      const envName = v?.apiKeyEnv ?? 'DASHSCOPE_API_KEY';
+      const hasKey = Boolean(v?.apiKey || process.env[envName]);
+      rows.push(`${hasKey ? '✅' : '❌'} 外挂识图引擎：\`${model}\` @ \`${base}\`${hasKey ? '' : `（密钥缺失：config.json vision.apiKey 或环境变量 ${envName}）`}`);
+    }
+
+    // vision-capable models
+    const vision = await this.driver.imageModels();
+    rows.push(vision.length
+      ? `ℹ️ 原生视觉模型（/model 可切）：${vision.map((x) => `\`${x}\``).join('、')}`
+      : 'ℹ️ 原生视觉模型：未发现（settings.yaml 中需为视觉模型声明 `input: [text, image]`）');
+
+    // attachment service probe (writes one 1×1 test image)
+    try {
+      await this.driver.admitImages([{
+        data: new Uint8Array(Commands.PROBE_PNG),
+        mediaType: 'image/png',
+        name: 'doctor-1x1.png',
+      }]);
+      rows.push('✅ 附件服务：可用（已写入 1×1 测试图）');
+    } catch (e) {
+      rows.push(`❌ 附件服务：不可用：${e.message}`);
+    }
+
+    rows.push('', '**需人工核对**（服务端探测不到）：');
+    rows.push('- ⚠️ 飞书开放平台 → 权限管理：`im:resource`（获取消息中的资源文件）——发图提示无权限时开启');
+    rows.push('- ℹ️ 卡片更新限速 / 文件上传参数：待 research（R2）结果接入后自动校准');
+
+    await this.transport.sendCard(chatId, buildInfoCard('🔍 诊断', rows.join('\n')));
+    return true;
+  }
+
+  /** /gpt /glm /auto — 限额自动切换的手动快切（调试利器）。
+   *  /gpt = 切备用模型并暂停自动切换；/glm = 切回主模型并恢复自动；
+   *  /auto = 仅恢复自动（模型不动）。 */
+  async cmdQuickSwitch(chatId, target) {
+    if (!this.autoContinue?.manualSwitch) {
+      await this.transport.sendCard(chatId, buildErrorCard('切换服务不可用', '桥未加载 auto-continue 模块。'));
+      return true;
+    }
+    const res = this.autoContinue.manualSwitch(target);
+    await this.transport.sendCard(chatId, res.ok
+      ? buildInfoCard('模型快切', res.text, { template: 'green' })
+      : buildErrorCard('切换失败', res.text));
+    return true;
+  }
+
+  async cmdStatus(chatId) {
+    const binding = this.store.get(chatId);
+    const lines = [`chat：\`${chatId}\``];
+    if (!binding) {
+      lines.push('未绑定会话（首条消息会创建）');
+    } else {
+      lines.push(`session：\`${binding.sessionId ?? '—'}\``, `工作区：\`${binding.cwd ?? '—'}\``);
+      const entry = binding.sessionId ? this.driver.live.get(binding.sessionId) : null;
+      if (entry) {
+        lines.push(`agent 状态：**${entry.agent.status}**`, `模型：\`${entry.agent.options?.provider ?? ''}/${entry.agent.options?.model ?? ''}\``);
+      } else {
+        // 进程内没有 live agent 时，至少显示「下一条消息会用的模型」
+        // 手动快切的 override 优先于 config 的默认值
+        const ov = this.driver.defaultOverride;
+        const configured = ov
+          ? `${ov.provider}/${ov.model}（手动）`
+          : (this.config.provider && this.config.model
+              ? `${this.config.provider}/${this.config.model}`
+              : `${this.config.fallbackPrimary || '默认'}`);
+        lines.push('agent：未在本进程运行（重启后首条消息会 resume）', `模型（下条消息）：\`${configured}\``);
+      }
+    }
+    lines.push(`审批模式：\`${this.config.approval}\``);
+    if (this.autoContinue?.statusLine) lines.push(this.autoContinue.statusLine());
+    await this.transport.sendCard(chatId, buildInfoCard('桥状态', lines.join('\n')));
+    return true;
+  }
+
+  /** Resolve the live session behind a chat for mode switching (ensure if needed). */
+  async #sessionForMode(chatId) {
+    const binding = this.store.get(chatId);
+    if (!binding?.sessionId && !binding?.cwd) {
+      return { error: '当前聊天还没有会话；先发条消息或 /new 创建，模式随会话生效。' };
+    }
+    try {
+      const agent = await this.driver.ensure(binding);
+      this.store.update(chatId, { sessionId: binding.sessionId, cwd: binding.cwd });
+      if (this.renderer.chatOf(agent.id) !== chatId) this.renderer.attach(agent.id, chatId);
+      return { agent };
+    } catch (e) {
+      return { error: `无法恢复会话：${e.message}` };
+    }
+  }
+
+  #modeLine(service, name, current) {
+    let spec;
+    try {
+      spec = service.resolve(name);
+    } catch {
+      return `- \`${name}\``;
+    }
+    const label = service.optionOf(name)?.label ?? name;
+    const desc = spec.description ? ` — ${spec.description}` : '';
+    const mark = name === current ? ' ← 当前' : '';
+    return `- \`${name}\`（${label}）：sandbox \`${spec.sandbox}\` · 审批 \`${spec.approval}\`${desc}${mark}`;
+  }
+
+  /**
+   * rc.7: permissionPresets.current(events)  ·  0.2.1: current(session)
+   * 探测式兼容：session 形式失败时退回 events 形式。
+   */
+  #modeCurrent(service, session) {
+    try {
+      return service.current(session);
+    } catch {
+      return service.current(session.events);
+    }
+  }
+
+  async cmdMode(chatId, arg) {
+    const service = this.permissionPresets;
+    if (!service) {
+      await this.transport.sendCard(chatId, buildErrorCard('模式服务不可用', '本 composition 未加载 dsh-permission-presets。'));
+      return true;
+    }
+
+    const res = await this.#sessionForMode(chatId);
+    if (res.error) {
+      await this.transport.sendCard(chatId, buildInfoCard('模式', res.error, { template: 'grey' }));
+      return true;
+    }
+    const { agent } = res;
+
+    if (!arg) {
+      // bare /mode — current + table
+      const current = this.#modeCurrent(service, agent.session);
+      const names = [...service.names];
+      if (!names.includes(current)) names.push(current); // e.g. 'custom'
+      const lines = [
+        `当前会话：\`${agent.id.replace(/^session-/, '').slice(0, 8)}\``,
+        `当前模式：**${current}**`,
+        '',
+        '可切换：',
+        ...names.map((n) => this.#modeLine(service, n, current)),
+        '',
+        '用法：`/mode <名称或别名>`（ro / rw / full）',
+      ];
+      await this.transport.sendCard(chatId, buildInfoCard('权限模式', lines.join('\n')));
+      return true;
+    }
+
+    // resolve alias → table key
+    const key = arg.toLowerCase();
+    const target = service.names.includes(key) ? key : MODE_ALIASES[key];
+    if (!target || !service.names.includes(target)) {
+      await this.transport.sendCard(chatId, buildErrorCard('未知模式', `\`${arg}\`\n可用：${service.names.join('、')}\n别名：ro / rw / full`));
+      return true;
+    }
+    const before = this.#modeCurrent(service, agent.session);
+    service.set(agent.session, target);
+    const after = this.#modeCurrent(service, agent.session);
+    const spec = service.resolve(target);
+    const lines = [
+      `${before} → **${after}**`,
+      `sandbox：\`${spec.sandbox}\` · 审批：\`${spec.approval}\``,
+      '',
+      after === 'danger-full-access'
+        ? '⚠️ 全权模式：沙箱不限制文件写入，审批自动拒绝改为直通。'
+        : '下一回合起生效（模型会收到模式切换通知）。',
+    ];
+    await this.transport.sendCard(chatId, buildInfoCard('模式已切换', lines.join('\n'), { template: 'orange' }));
+    return true;
+  }
+
+  // ------------------------------------------------------------------ /model
+
+  /** All advertised (provider, model) pairs, tolerating slow/unavailable discovery. */
+  async #modelCatalog() {
+    const providers = this.llm?.listProviders?.() ?? [];
+    const rows = [];
+    await Promise.all(
+      providers.map(async (p) => {
+        const id = p.id ?? p.name ?? p.provider ?? String(p);
+        let models = [];
+        try {
+          models = await Promise.race([
+            this.llm.listModels(id),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 2500)),
+          ]);
+        } catch {}
+        rows.push({
+          provider: id,
+          models: (models ?? []).map((m) => ({
+            id: m.id ?? m.name ?? String(m),
+            image: Boolean(m?.inputModalities?.includes('image')),
+          })),
+        });
+      })
+    );
+    return rows;
+  }
+
+  async cmdModel(chatId, arg) {
+    if (!this.llm) {
+      await this.transport.sendCard(chatId, buildErrorCard('模型服务不可用', '本 composition 未加载 dsh-llm。'));
+      return true;
+    }
+    const res = await this.#sessionForMode(chatId);
+    if (res.error) {
+      await this.transport.sendCard(chatId, buildInfoCard('模型', res.error, { template: 'grey' }));
+      return true;
+    }
+    const { agent } = res;
+    const current = this.driver.currentModel(agent);
+
+    if (!arg) {
+      const catalog = await this.#modelCatalog();
+      const lines = [`当前模型：**${current ? `${current.provider}/${current.model}` : '—'}**`, ''];
+      for (const row of catalog) {
+        const mark = current?.provider === row.provider ? ' ←' : '';
+        if (row.models.length === 0) {
+          lines.push(`- \`${row.provider}\`${mark}（未列举出模型）`);
+        } else {
+          lines.push(`- \`${row.provider}\`${mark}：${row.models.map((m) => `\`${m.id}\`${m.image ? '📷' : ''}`).join(' · ')}`);
+        }
+      }
+      lines.push('', '📷 = 支持图片输入（识图模型）。用法：`/model <模型>`（唯一时）或 `/model <厂商>/<模型>`');
+      await this.transport.sendCard(chatId, buildInfoCard('模型', lines.join('\n')));
+      return true;
+    }
+
+    // resolve the target
+    let provider;
+    let model;
+    // MiMo convenience alias: catalog exposes the actual v2.6 model as -pro.
+    if (arg === 'mimo26' || arg === 'mimo-v2.6' || arg === 'mimo/mimo-v2.6') {
+      provider = 'mimo';
+      model = 'mimo-v2.6-pro';
+    }
+    if (arg === 'gpt' || arg === 'glm') {
+      // 快捷别名 → 手动快切（保证 fallback 状态机同步，不能裸 setModel）
+      return await this.cmdQuickSwitch(chatId, arg);
+    }
+    if (!provider && arg.includes('/')) {
+      [provider, model] = arg.split('/').map((x) => x.trim());
+    } else if (!provider) {
+      const catalog = await this.#modelCatalog();
+      const hits = catalog.filter((r) => r.models.some((m) => m.id === arg));
+      if (hits.length === 1) {
+        provider = hits[0].provider;
+        model = arg;
+      } else if (hits.length > 1) {
+        await this.transport.sendCard(chatId, buildErrorCard('模型名不唯一', `多个厂商都有 \`${arg}\`：\n${hits.map((h) => `- ${h.provider}/${arg}`).join('\n')}\n请用全称。`));
+        return true;
+      } else {
+        await this.transport.sendCard(chatId, buildErrorCard('未找到模型', `\`${arg}\` 不在已列举模型中。用 \`/model\` 查看列表，或 \`/model <厂商>/<模型>\` 直接指定。`));
+        return true;
+      }
+    }
+    if (!provider || !model) {
+      await this.transport.sendCard(chatId, buildErrorCard('用法', '/model <模型> 或 /model <厂商>/<模型>'));
+      return true;
+    }
+    if (!this.llm.listProviders().some((p) => (p.id ?? p.name ?? p.provider) === provider)) {
+      await this.transport.sendCard(chatId, buildErrorCard('无法切换', `厂商 \`${provider}\` 未注册（/model 查看可用厂商）`));
+      return true;
+    }
+    this.driver.setModel(agent, provider, model);
+    await this.transport.sendCard(chatId, buildInfoCard('模型已切换', [
+      `${current ? `${current.provider}/${current.model}` : '—'} → **${provider}/${model}**`,
+      '',
+      '下一回合起生效（prompt 变量与请求路由同步切换）。',
+    ].join('\n'), { template: 'green' }));
+    return true;
+  }
+
+  // ---------------------------------------------------------------- /preset
+
+  #sessionIsBlank(session) {
+    return !(session.events ?? []).some((e) => e.type === 'turn/start' || e.type === 'user/message');
+  }
+
+  #currentPreset(agent) {
+    if (this.agentPresets?.composedPreset && agent.ctx) {
+      const live = this.agentPresets.composedPreset(agent.ctx);
+      if (live) return live;
+    }
+    const events = agent.session?.events ?? [];
+    for (let i = events.length - 1; i >= 0; i--) {
+      if (events[i].type === 'agent-preset/selected') return events[i].data.agentPreset;
+    }
+    return agent.session?.header?.agentPreset ?? null;
+  }
+
+  async cmdPreset(chatId, arg) {
+    if (!this.agentPresets) {
+      await this.transport.sendCard(chatId, buildErrorCard('预设服务不可用', '本 composition 未加载 dsh-agent-presets。'));
+      return true;
+    }
+    let presets = [];
+    try {
+      presets = await this.agentPresets.list();
+    } catch (e) {
+      await this.transport.sendCard(chatId, buildErrorCard('预设列表读取失败', e.message));
+      return true;
+    }
+
+    if (!arg) {
+      const binding = this.store.get(chatId);
+      const entry = binding?.sessionId ? this.driver.live.get(binding.sessionId) : null;
+      const current = entry ? this.#currentPreset(entry.agent) : null;
+      const lines = [
+        `当前预设：**${current ?? '—'}**（新会话默认 \`${this.config.agentPreset}\`）`,
+        '',
+        ...presets.map((p) => {
+          const mark = p.id === current ? ' ← 当前' : '';
+          const broken = p.broken ? ` ⚠️ ${p.broken}` : '';
+          // 0.2.1 的预设行没有 trust 字段（名字可选），两者都做缺省处理
+          const trust = p.trust ?? p.name ?? '';
+          return `- \`${p.id}\`${trust ? `[${trust}]` : ''}${broken}${mark}`;
+        }),
+        '',
+        '空白会话直接切换；有历史的会话将自动以该预设**开新会话**（旧会话保留在盘上）。',
+      ];
+      await this.transport.sendCard(chatId, buildInfoCard('Agent 预设', lines.join('\n')));
+      return true;
+    }
+
+    // resolve + validate the target preset
+    let preset;
+    try {
+      preset = await this.agentPresets.resolve(arg);
+      if (preset.broken) throw new Error(`预设损坏：${preset.broken}`);
+    } catch (e) {
+      await this.transport.sendCard(chatId, buildErrorCard('未知预设', `\`${arg}\`：${e.message}\n可用：${presets.filter((p) => !p.broken).map((p) => p.id).join('、')}`));
+      return true;
+    }
+
+    const binding = this.store.get(chatId) ?? { sessionId: null, cwd: this.config.defaultCwd };
+    const entry = binding.sessionId ? this.driver.live.get(binding.sessionId) : null;
+
+    // Blank live session → real in-place recompose (official supported path).
+    if (entry && this.#sessionIsBlank(entry.agent.session) && entry.agent.ctx && !this.config.mockAgent) {
+      try {
+        await this.agentPresets.recompose(entry.agent.ctx, preset.id);
+      } catch (e) {
+        await this.transport.sendCard(chatId, buildErrorCard('切换失败', e.message));
+        return true;
+      }
+      await this.transport.sendCard(chatId, buildInfoCard('预设已切换', [
+        `${this.#currentPreset(entry.agent)} → **${preset.id}**`,
+        '',
+        '会话仍为空白，已原地重组（工具与提示词即刻更换）。',
+      ].join('\n'), { template: 'green' }));
+      return true;
+    }
+
+    // Mock approximation of the blank switch: record the selection event only.
+    if (entry && this.#sessionIsBlank(entry.agent.session) && this.config.mockAgent) {
+      try {
+        entry.agent.session.append('agent-preset/selected', { agentPreset: preset.id });
+      } catch {}
+      await this.transport.sendCard(chatId, buildInfoCard('预设已切换（mock）', `${preset.id}（事件已记录）`));
+      return true;
+    }
+
+    // Session with history (or no live agent): start a fresh session on the preset.
+    if (binding.sessionId) await this.driver.unload(binding.sessionId).catch(() => {});
+    binding.sessionId = null;
+    binding.cwd = binding.cwd ?? this.config.defaultCwd;
+    this.store.update(chatId, binding);
+    try {
+      const agent = await this.driver.ensure(binding, { preset: preset.id });
+      this.renderer.attach(agent.id, chatId);
+      this.store.update(chatId, { sessionId: binding.sessionId, cwd: binding.cwd });
+      await this.transport.sendCard(chatId, buildInfoCard('已用新预设开会话', [
+        `预设：\`${preset.id}\` · session：\`${agent.id.replace(/^session-/, '').slice(0, 8)}\``,
+        `工作区：\`${binding.cwd}\``,
+        '',
+        '原会话有历史，预设不能原地切换（会破坏工具/提示词与历史的对应）；旧会话保留，`/sessions` 可回。',
+      ].join('\n'), { template: 'green' }));
+    } catch (e) {
+      await this.transport.sendCard(chatId, buildErrorCard('新会话创建失败', e.message));
+    }
+    return true;
+  }
+
+  /** List persisted sessions by reading only their header frames. */
+  #listPersistedSessions() {
+    const root = path.join(dshHome(), 'sessions');
+    const out = [];
+    if (!fs.existsSync(root)) return out;
+    for (const proj of fs.readdirSync(root)) {
+      const projDir = path.join(root, proj);
+      if (!fs.statSync(projDir).isDirectory()) continue;
+      for (const id of fs.readdirSync(projDir)) {
+        const dir = path.join(projDir, id);
+        try {
+          // dsh 0.2.1 起会话文件按格式版本命名（session.v4.jsonl.zstd）；rc.7 是 session.jsonl.zstd。
+          // 取该目录下最新的会话日志，兼容两代命名。
+          const logs = fs.readdirSync(dir)
+            .filter((n) => /^session(\.[a-z0-9]+)?\.jsonl(\.zstd)?$/.test(n))
+            .map((n) => ({ n, m: fs.statSync(path.join(dir, n)).mtimeMs }))
+            .sort((a, b) => b.m - a.m);
+          const newest = logs[0]?.n;
+          const f = newest ? path.join(dir, newest) : path.join(dir, 'session.jsonl.zstd');
+          const existsZ = Boolean(newest && newest.endsWith('.zstd'));
+          const existsRaw = Boolean(newest && !newest.endsWith('.zstd'));
+          if (!existsZ && !existsRaw) continue;
+          let header;
+          if (existsZ) {
+            // the header is its own leading zstd frame — single-frame decode is enough
+            const first = zlib.zstdDecompressSync(fs.readFileSync(f)).toString('utf8').split('\n')[0];
+            header = JSON.parse(first);
+          } else {
+            const first = fs.readFileSync(f, 'utf8').split('\n')[0];
+            header = JSON.parse(first);
+          }
+          out.push({ id, cwd: header.cwd, createdAt: header.createdAt, preset: header.agentPreset });
+        } catch (e) {
+          out.push({ id, cwd: null, createdAt: 0, preset: null, error: e.message });
+        }
+      }
+    }
+    return out.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+  }
+
+  async cmdSessions(chatId) {
+    const binding = this.store.get(chatId);
+    const cwd = binding?.cwd ?? this.config.defaultCwd;
+    const all = this.#listPersistedSessions();
+    const mine = all.filter((s) => s.cwd && (s.cwd === cwd || s.cwd.startsWith(cwd + path.sep)));
+    const lines = mine.length === 0
+      ? [`工作区 \`${cwd}\` 下没有持久会话。`]
+      : mine.slice(0, 15).map((s) => {
+          const when = s.createdAt ? new Date(s.createdAt).toISOString().slice(0, 16).replace('T', ' ') : '?';
+          const mark = binding?.sessionId === s.id ? ' ← 当前' : '';
+          return `- \`${s.id.replace(/^session-/, '').slice(0, 8)}\` ${when} [${s.preset ?? '-'}]${mark}`;
+        });
+    if (mine.length > 15) lines.push(`… 共 ${mine.length} 个`);
+    await this.transport.sendCard(chatId, buildInfoCard(`会话（${mine.length}）· ${cwd}`, lines.join('\n')));
+    return true;
+  }
+
+  async cmdResume(chatId, prefix) {
+    if (!prefix) {
+      await this.transport.sendCard(chatId, buildErrorCard('用法', '/resume <session-id 前 8 位>（先 /sessions 查看列表）'));
+      return true;
+    }
+    const all = this.#listPersistedSessions();
+    const hits = all.filter((s) => s.id.includes(prefix));
+    if (hits.length === 0) {
+      await this.transport.sendCard(chatId, buildErrorCard('没找到', `没有匹配 ${prefix} 的持久会话`));
+      return true;
+    }
+    if (hits.length > 1) {
+      await this.transport.sendCard(chatId, buildErrorCard('歧义', `前缀匹配多个会话，再加几位：\n${hits.map((h) => h.id.slice(0, 18)).join('\n')}`));
+      return true;
+    }
+    const target = hits[0];
+    if (target.cwd && !isWorkspaceAllowed(this.config, target.cwd)) {
+      await this.transport.sendCard(chatId, buildErrorCard('会话工作区不在白名单', `${target.cwd}`));
+      return true;
+    }
+    const binding = this.store.get(chatId) ?? { sessionId: null, cwd: target.cwd };
+    if (binding.sessionId) await this.driver.unload(binding.sessionId).catch(() => {});
+    binding.sessionId = target.id;
+    binding.cwd = target.cwd ?? binding.cwd;
+    this.store.update(chatId, binding);
+    // verify it can actually come alive (fake mode needs a live session object)
+    try {
+      const agent = await this.driver.ensure(binding, { allowCreate: false });
+      this.renderer.attach(agent.id, chatId);
+      const when = target.createdAt ? new Date(target.createdAt).toISOString().slice(0, 16).replace('T', ' ') : '?';
+      await this.transport.sendCard(chatId, buildInfoCard('已接续会话', `\`${target.id}\`\n创建于 ${when}\n工作区 \`${target.cwd}\``, { template: 'green' }));
+    } catch (e) {
+      await this.transport.sendCard(chatId, buildErrorCard('接续失败', e.message));
+    }
+    return true;
+  }
+
+  async cmdCwd(chatId, arg) {
+    if (!arg) {
+      const binding = this.store.get(chatId);
+      await this.transport.sendCard(chatId, buildInfoCard('工作区', `当前：\`${binding?.cwd ?? this.config.defaultCwd}\`\n白名单：${this.config.allowedWorkspaces.map((w) => `\`${w}\``).join(', ')}`));
+      return true;
+    }
+    const cwd = path.resolve(arg);
+    if (!isWorkspaceAllowed(this.config, cwd)) {
+      await this.transport.sendCard(chatId, buildErrorCard('工作区不在白名单', `${cwd}`));
+      return true;
+    }
+    const binding = this.store.update(chatId, { cwd });
+    await this.transport.sendCard(chatId, buildInfoCard('工作区已设定（对下一个 /new 生效）', `\`${cwd}\``, { template: 'green' }));
+    return true;
+  }
+
+  // ------------------------------------------------------------- /restart
+
+  /** Locate the launcher script for a fresh bridge process. */
+  #findLauncher() {
+    if (this.config.restartLauncher && fs.existsSync(this.config.restartLauncher)) {
+      return this.config.restartLauncher;
+    }
+    if (process.env.DSH_FEISHU_LAUNCHER && fs.existsSync(process.env.DSH_FEISHU_LAUNCHER)) {
+      return process.env.DSH_FEISHU_LAUNCHER;
+    }
+    // The harness runs with cwd = the directory that holds node_modules/@deepseek-ai/dsh
+    const candidates = [
+      path.join(process.cwd(), 'start_bridge.ps1'),
+      path.join(process.cwd(), 'start-dsh-feishu.ps1'),
+      path.join(process.cwd(), 'start-dsh-feishu.bat'),
+    ];
+    return candidates.find((c) => fs.existsSync(c)) ?? null;
+  }
+
+  /**
+   * Safe restart: the restart runs from OUTSIDE this process (a one-shot
+   * scheduled task), so killing the old bridge cannot also kill the restarter
+   * — the exact failure mode of the 2026-08-23 14:43 incident, where an agent
+   * Stop-Process'd its own host and the follow-up start never ran.
+   */
+  async cmdRestart(chatId) {
+    if (this.config.transport === 'mock') {
+      await this.transport.sendCard(chatId, buildInfoCard('mock 模式不支持 /restart'));
+      return true;
+    }
+    if (process.platform !== 'win32') return await this.#restartUnix(chatId);
+
+    const launcher = this.#findLauncher();
+    if (!launcher) {
+      await this.transport.sendCard(chatId, buildErrorCard(
+        '找不到启动脚本',
+        '在 config.json 里设置 `restartLauncher` 指向启动脚本（如 `D:\\dsh-install\\start_bridge.ps1`）后重试。',
+      ));
+      return true;
+    }
+
+    const pid = process.pid;
+    const dir = this.config.dataDir;
+    const wrapper = path.join(dir, 'restart-now.ps1');
+    const logFile = path.join(dir, 'restart.log');
+    const stamp = new Date().toISOString();
+    // Self-contained restarter: wait for the old PID to exit, force-kill it if
+    // stuck, then launch the new bridge. Everything is logged for auditing.
+    const script = [
+      `$ErrorActionPreference = 'Continue'`,
+      `"restart requested ${stamp} oldPid=$pid launcher='$launcher'" | Add-Content -Path '${logFile.replace(/'/g, "''")}' -Encoding UTF8`,
+      `$deadline = (Get-Date).AddSeconds(15)`,
+      `while ((Get-Date) -lt $deadline) { $p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if (-not $p) { break }; Start-Sleep -Milliseconds 500 }`,
+      `$p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if ($p) { try { Stop-Process -Id ${pid} -Force } catch {} }`,
+      `Start-Sleep 1`,
+      `& '${launcher.replace(/'/g, "''")}' *>&1 | Add-Content -Path '${logFile.replace(/'/g, "''")}' -Encoding UTF8`,
+      `"restart finished $(Get-Date -Format o)" | Add-Content -Path '${logFile.replace(/'/g, "''")}' -Encoding UTF8`,
+    ].join('\n');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(wrapper, script, 'utf8');
+
+    const run = (args) => new Promise((resolve) => {
+      execFile('schtasks', args, { windowsHide: true }, (err, stdout, stderr) => {
+        resolve({ err, stdout: String(stdout ?? ''), stderr: String(stderr ?? '') });
+      });
+    });
+    const tn = 'dsh-feishu-restart';
+    const future = new Date(Date.now() + 5 * 60_000);
+    const hhmm = `${String(future.getHours()).padStart(2, '0')}:${String(future.getMinutes()).padStart(2, '0')}`;
+    const tr = `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${wrapper}"`;
+    const created = await run(['/Create', '/TN', tn, '/TR', tr, '/SC', 'ONCE', '/ST', hhmm, '/F']);
+    if (created.err) {
+      await this.transport.sendCard(chatId, buildErrorCard('重启任务创建失败', `${created.err.message}\n${created.stderr}`.slice(0, 900)));
+      return true;
+    }
+    const ran = await run(['/Run', '/TN', tn]);
+    if (ran.err) {
+      await this.transport.sendCard(chatId, buildErrorCard('重启任务启动失败', `${ran.err.message}\n${ran.stderr}`.slice(0, 900)));
+      return true;
+    }
+    log.warn(`/restart: scheduled task ${tn} running; this process (pid=${pid}) exits now`);
+    await this.transport.sendCard(chatId, buildInfoCard(
+      '🔄 桥正在重启',
+      `旧进程 \`${pid}\` 即将退出，新进程马上拉起（由计划任务在进程外执行）。\n\n本聊天绑定保持不变；约 5–10 秒后直接发消息即可接续（需要时用 \`/resume\`）。日志：\`${logFile}\``,
+      { template: 'blue' },
+    ));
+    // Give the card a moment to land, then exit; the scheduled task waits for
+    // this PID to disappear before starting the new bridge.
+    setTimeout(() => process.exit(0), 1500).unref?.();
+    return true;
+  }
+
+  /**
+   * Unix restart: spawn a detached restarter that waits for this PID to die,
+   * then re-runs the exact same launcher command line (/proc/<pid>/cmdline of
+   * our parent, or our own). The restarter survives our exit (detached,
+   * stdio to the restart log) — same safety property as the Windows task.
+   */
+  async #restartUnix(chatId) {
+    const pid = process.pid;
+    const dir = this.config.dataDir;
+    const logFile = path.join(dir, 'restart.log');
+    fs.mkdirSync(dir, { recursive: true });
+
+    // Prefer our PARENT's command line (the launcher bash) when it still
+    // exists and looks like the bridge launcher; otherwise our own node dsh.
+    let argv = null;
+    try {
+      const parentCmdline = fs.readFileSync(`/proc/${process.ppid}/cmdline`, 'utf8');
+      const parentArgs = parentCmdline.split('\0').filter(Boolean);
+      if (parentArgs.some((a) => /profile[ -]feishu|dsh/.test(a)) && !parentArgs.some((a) => /hermes/.test(a))) {
+        argv = parentArgs;
+      }
+    } catch {}
+    if (!argv) {
+      argv = [process.execPath, ...process.argv.slice(1)];
+    }
+
+    const env = { ...process.env };
+    delete env.DSH_FEISHU_SCRIPT; // never replay a test script into prod
+    // NOTE: 前缀组（FEISHU_/DSH_/GLM_/…）必须写成 `PREFIX.*` —— 旧正则
+    // `/^(FEISHU_|…|PATH|…)$/` 要求整串完整命中，FEISHU_APP_ID 之类全部被
+    // 静默过滤掉，/restart 拉起的新进程没有飞书凭据 → ws 404 无限重连
+    // （2026-09-05 restart.log 实录）。CODEX_PROXY_API_KEY 同属必需（限额
+    // fallback 的备用模型 key，丢了重启后切不了 gpt）。
+    const envLines = Object.entries(env)
+      .filter(([k]) => /^(FEISHU_.*|DSH_.*|GLM_.*|DASHSCOPE_.*|MIMO_.*|CODEX_PROXY_.*|PATH|HOME|LANG|LC_.*|NODE_.*|http_proxy|https_proxy|no_proxy|OPENAI_API_KEY)$/i.test(k))
+      .map(([k, v]) => `${JSON.stringify(k + '=' + v)}`)
+      .join(' ');
+    const argvQ = argv.map((a) => JSON.stringify(a)).join(' ');
+
+    // POSIX-sh restarter: wait for old pid → optional kill → relaunch
+    const script = [
+      '#!/bin/sh',
+      `# dsh-feishu restarter ${new Date().toISOString()} oldPid=${pid}`,
+      `echo "restart requested $(date -Is) oldPid=${pid}" >> ${JSON.stringify(logFile)}`,
+      `i=0; while [ $i -lt 30 ]; do kill -0 ${pid} 2>/dev/null || break; sleep 0.5; i=$((i+1)); done`,
+      `kill -9 ${pid} 2>/dev/null || true`,
+      'sleep 1',
+      `env ${envLines} ${argvQ} >> ${JSON.stringify(logFile)} 2>&1`,
+      `echo "restart finished $(date -Is)" >> ${JSON.stringify(logFile)}`,
+    ].join('\n');
+    const wrapper = path.join(dir, 'restart-now.sh');
+    fs.writeFileSync(wrapper, script, 'utf8');
+    fs.chmodSync(wrapper, 0o700);
+
+    const { spawn } = await import('node:child_process');
+    const child = spawn('sh', [wrapper], {
+      detached: true,
+      stdio: ['ignore', fs.openSync(logFile, 'a'), fs.openSync(logFile, 'a')],
+    });
+    child.unref();
+
+    log.warn(`/restart: unix restarter spawned (pid=${child.pid}); this process (pid=${pid}) exits now`);
+    await this.transport.sendCard(chatId, buildInfoCard(
+      '🔄 桥正在重启',
+      [
+        `旧进程 \`${pid}\` 即将退出，新进程马上由独立重启器拉起。`,
+        '',
+        '本聊天绑定保持不变；约 5–10 秒后直接发消息即可接续（需要时用 `/resume`）。',
+        `日志：\`${logFile}\``,
+      ].join('\n'),
+      { template: 'blue' },
+    ));
+    setTimeout(() => process.exit(0), 1500).unref?.();
+    return true;
+  }
+}
