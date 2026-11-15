@@ -161,7 +161,8 @@ export function createVoiceIn({ router, driver, store, config, log, socketPath }
     const target = active;
     const sessionId = target.sessionId ?? sessionOf(target.chatId);
     try {
-      const agent = sessionId ? driver?.live?.get?.(sessionId) : null;
+      const entry = sessionId ? driver?.live?.get?.(sessionId) : null;
+      const agent = entry?.agent ?? entry ?? null;   // live stores wrappers
       if (agent && driver?.stop) driver.stop(agent);
       log?.info?.(`voice: cancel#${target.id} (${reason}) session=${sessionId ?? '?'}`);
     } catch (e) {
