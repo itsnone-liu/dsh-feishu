@@ -65,3 +65,18 @@ node test/voice_scenario.mjs            # 沙箱 E2E：真实桥进程 + mock tr
 ## 回滚
 
 `voice.enabled=false` + `/restart`；或 `git revert` 对应提交后 `/restart`。
+
+## 已知问题与运维坑
+
+完整清单（含判定方法与归属）在 ai-passport-hardware 仓库的
+`docs/voice-known-issues.md`。与本模块直接相关的几条：
+
+| 现象 | 判定 | 说明 |
+|---|---|---|
+| 设备按键无反应、桥侧无 `voice: ask#` | 服务端也没收到 `key press` | 固件按键卡死，需断电重启 |
+| `voice: ask#N no text within …` | 桥收到了事件但没文本 | 看门狗阈值必须大于实测最坏轮次（曾用 45 s 误杀 58 s 的正常轮） |
+| 播报把要念的话又交回模型 | 会话里出现一条等于答案的"用户消息" | `speak_notification` 必须走 verbatim，不得再过 `brain.ask` |
+| 屏幕停在 speaking | 服务端 `state.set ok` 却不回 idle | 属固件；服务端已加超时强制归位与日志 |
+
+改造这个模块时的两条硬规矩：**改完必须重启桥**（`/restart`，桥内 agent 不能自杀重启）；
+**任何异常都要 catch 住**，因为这个监听器跑在 `session.append()` 的同步调用栈里。
