@@ -238,6 +238,10 @@ export function createVoiceIn({ router, driver, store, config, log, socketPath }
           return;
         }
         if (text) {
+          // Mark the step boundary: the consumer needs to tell "我先查一下"
+          // (process talk) from the conclusion, and only the conclusion should
+          // spend the read-aloud budget.
+          send(active.socket, { type: 'step', id: active.id });
           if (!active.textLogged) {
             active.textLogged = true;
             log?.info?.(`voice: ask#${active.id} text ${text.length} chars: `
