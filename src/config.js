@@ -39,7 +39,17 @@ const DEFAULTS = {
    *  only, and only the whitelisted chatId can be driven through it.
    *  enabled: start the socket · chatId: which binding the voice lands in
    *  (the same session the user types into) · socketPath: override path. */
-  voice: { enabled: false, chatId: '', socketPath: '', openId: 'voice' },
+  voice: {
+    enabled: false,
+    chatId: '',
+    socketPath: '',
+    openId: 'voice',
+    // Prepended to every spoken turn. The reply will be read aloud, so the model
+    // is asked to answer in one short spoken sentence before it starts working;
+    // without this the first audible sentence was "让我先查一下" twelve seconds
+    // in. Set to '' to disable.
+    promptPrefix: '【语音通道】这条提问来自语音，答复会被直接念出来：先用一句话口语作答（不超过 30 字、不要 markdown/代码/路径/链接），再执行你需要的工具；最终结论单独用一句话说。',
+  },
   /** Agent preset for new sessions ('minimal' | 'standard' | ...). */
   agentPreset: 'minimal',
   /** Model override; empty = use the harness default selection. */

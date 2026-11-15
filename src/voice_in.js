@@ -47,6 +47,12 @@ export function createVoiceIn({ router, driver, store, config, log, socketPath }
   const configuredOpenId = cfg.openId || config?.allowedOpenIds?.[0] || '';
   const openIdWhitelisted = () =>
     Boolean(configuredOpenId) && (config?.allowedOpenIds ?? []).includes(configuredOpenId);
+  // Spoken turns carry one instruction the typed ones do not need: the answer is
+  // read aloud, so it has to arrive before the agent starts running tools
+  // (measured: 12 s of silence while it researched, and the first spoken
+  // sentence was meta-commentary rather than the answer). Empty string in
+  // config disables it.
+  const promptPrefix = cfg.promptPrefix ?? '';
   const sockPath = socketPath || cfg.socketPath || '/tmp/dsh-feishu-voice.sock';
 
   let server = null;
@@ -150,7 +156,7 @@ export function createVoiceIn({ router, driver, store, config, log, socketPath }
       // from collapsing two identical sentences into one turn.
       router.onMessage({
         chatId,
-        text,
+        text: promptPrefix ? `${promptPrefix}\n\n${text}` : text,
         openId: configuredOpenId,
         messageId: `voice-${Date.now()}-${++seq}`,
       });

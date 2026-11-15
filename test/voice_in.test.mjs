@@ -115,7 +115,10 @@ test('ask goes through the same router entry as a typed message', async () => {
 
   assert.equal(h.submitted.length, 1);
   assert.equal(h.submitted[0].chatId, h.chatId);
-  assert.equal(h.submitted[0].text, '今天天气怎么样');
+  // the spoken turn carries the voice-mode instruction ahead of the words
+  assert.ok(h.submitted[0].text.endsWith('今天天气怎么样'),
+    `user words must survive at the end: ${JSON.stringify(h.submitted[0].text)}`);
+  assert.ok(h.submitted[0].text.includes('语音通道'), 'voice-mode instruction must lead');
   assert.ok(h.submitted[0].messageId.startsWith('voice-'), 'dedupe key must be unique per ask');
 
   playTurn(h.voice, h.sessionId);
