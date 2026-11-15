@@ -178,6 +178,13 @@ export function createVoiceIn({ router, driver, store, config, log, socketPath }
   function onSessionEvent(session, event) {
     try {
       if (!active) return;
+      // Diagnostic (first few events per ask): without this, "voice asked and
+      // heard nothing" is invisible from outside the bridge process.
+      if ((active.debugSeen = (active.debugSeen ?? 0) + 1) <= 5) {
+        log?.info?.(`voice: ask#${active.id} saw ${event?.type} `
+          + `session=${String(session?.id ?? '?').slice(-8)} `
+          + `want=${String(active.sessionId ?? '(any)').slice(-8)}`);
+      }
       if (active.sessionId && session?.id && session.id !== active.sessionId) return;
       const type = event?.type;
       if (!type) return;
