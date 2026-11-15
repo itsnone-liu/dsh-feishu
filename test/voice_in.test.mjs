@@ -81,7 +81,9 @@ function harness({ chatId = 'chat-1', sessionId = 's-1', running = false } = {})
     router,
     driver,
     store,
-    config: { allowedOpenIds: [OWNER], voice: { chatId } },
+    // promptPrefix mirrors what config.js supplies in production; the harness
+    // builds the config object itself, so defaults are not applied here.
+    config: { allowedOpenIds: [OWNER], voice: { chatId, promptPrefix: '【语音通道】' } },
     log: quiet,
     socketPath: tmpSock('t'),
   });
