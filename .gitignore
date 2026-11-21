@@ -5,3 +5,12 @@ node_modules/
 .learnings/
 research/out/*
 !research/out/.gitkeep
+
+# 排障探针/临时实验（2026-11-21 桥仓库大扫除：均为一次性现场脚本，勿入库）
+_gw*
+_login.err
+_probe_*.py
+_probe_*.mjs
+*.bak.upgrade*
+grok-gateway.mjs
+tools/*2.mjs
