@@ -10,7 +10,7 @@
  * The renderer never talks to DSH APIs — it only consumes frozen events, so a
  * replayed or resumed session renders identically.
  */
-import { buildTurnCard, buildErrorCard } from './cards.js';
+import { buildTurnCard, buildErrorCard, CARD_ELEMENT_CAP } from './cards.js';
 import { hhmmss, fmtDuration, summarizeToolArguments, previewToolResult, clamp } from './util.js';
 import { log } from './log.js';
 import fs from 'node:fs';
@@ -147,6 +147,7 @@ export class TurnRenderer {
     st.retryNote = '';
     st.outputNote = '';
     st.outputDumped = false;
+    st.fullOutputPath = '';
     st.usage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 };
     st.toolCount = 0;
     st.errorCount = 0;
@@ -305,24 +306,43 @@ export class TurnRenderer {
       return;
     }
     st.sending = true;
-    st.dirty = false;
-    try {
-      // Final flush of an oversized turn → dump the FULL text to the
-      // workspace so the truncated card stays readable (R2 may later upgrade
-      // this to a real Feishu file upload).
-      if (st.final && !st.outputDumped) {
-        const texts = st.blocks.filter((b) => b?.kind === 'text').map((b) => b.text);
-        const total = texts.reduce((n, t) => n + t.length, 0);
-        if (total > this.config.cardTextLimit) {
-          const dest = this.#dumpFullOutput(st, texts);
-          if (dest) st.outputNote = `📄 回复超长（${total} 字符），卡片已截断，完整内容：\`${dest}\``;
-        }
-        st.outputDumped = true;
-      }
-      const card = buildTurnCard(
-        { ...st, blocks: st.blocks.filter(Boolean), footer: this.#footer(st) },
-        this.config.cardTextLimit
-      );
+        st.dirty = false;
+        try {
+          // Dump the FULL text to the workspace so the card stays navigable when
+          // either (a) the visible text exceeds cardTextLimit, or (b) the block
+          // count exceeds the card element cap and the middle gets folded. Case (b)
+          // used to show a fold marker pointing at a file that was never written
+          // (2026-09-20: ".feishu-outputs/ does not exist"), which read as a broken
+          // answer. Dump-on-fold makes the marker truthful. R2 may later upgrade
+          // this to a real Feishu file upload.
+          const visibleBlocks = st.blocks.filter(Boolean);
+          const foldedNow = visibleBlocks.length > CARD_ELEMENT_CAP;
+          const charTotal = st.blocks
+            .filter((b) => b?.kind === 'text')
+            .reduce((n, b) => n + b.text.length, 0);
+          const oversize = charTotal > this.config.cardTextLimit;
+          if ((st.final || foldedNow) && !st.outputDumped && (oversize || foldedNow)) {
+            const texts = st.blocks.filter((b) => b?.kind === 'text').map((b) => b.text);
+            const dest = this.#dumpFullOutput(st, texts);
+            if (dest) {
+              st.fullOutputPath = dest;
+              if (st.final) {
+                st.outputNote = oversize
+                  ? `📄 回复超长（${charTotal} 字符），卡片已截断，完整内容：\`${dest}\``
+                  : `📄 中间过程已折叠（${visibleBlocks.length} 块），完整内容：\`${dest}\``;
+              }
+            }
+            st.outputDumped = true;
+          }
+          const card = buildTurnCard(
+            {
+              ...st,
+              blocks: visibleBlocks,
+              fullOutputPath: st.fullOutputPath,
+              footer: this.#footer(st),
+            },
+            this.config.cardTextLimit
+          );
       if (!st.messageId) {
         const { messageId } = await this.transport.sendCard(st.chatId, card);
         st.messageId = messageId;

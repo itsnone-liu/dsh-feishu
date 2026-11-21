@@ -11,7 +11,7 @@
  *        就按 pollMs 轮询；到点自动补发一条「继续」（可配置）；
  *      · 瞬时限流类（429 / rate limit / 上游负载 / try again in Ns）
  *        → 短退避：30s 起指数退避重试，shortMax 次后**升级为长等待**；
- *  - **限额自动换模型（fallback，双向·不回切）**：配置了 fallbackPrimary +
+ *  - **限额自动换模型（fallback，双向·到点自动切回）**：配置了 fallbackPrimary +
  *    fallbackBackup 时，判定窗口打满（首次 long）不再傻等 —— 方向由
  *    **实际报错的模型**决定（GPT 满 → 切 GLM；GLM 满 → 切 GPT）：
  *      ① 全部 live 会话切到另一侧，并设 driver.defaultOverride（fallback
@@ -23,11 +23,14 @@
  *         自动继续」事故的根因）；driver.submit 对 running 走 steer（置
  *         wakeRequested，驱动循环收尾时自动重开，下一回合走已切换的模型），
  *         对 idle 走 followup，两条路都能接上。
- *      ③ **不自动切回**（2026-09-13 用户定调）：额度恢复不是切换条件——
- *         只要接管侧没满，就留在接管侧干活；想换回手动 /gpt /glm。
- *         恢复探针/快照还原整套已删除，不再有探针 watcher。
- *      ④ 接管侧也限额（两侧都满）：**不切来切去**，只提示一次；之后
- *         等用户在额度恢复后发消息接续（当前侧恢复即可干活）或手动切换。
+ *      ③ **到点自动切回**（2026-11-02 用户要求，替代 2026-09-13「不回切」
+ *         定调）：按受限侧报错里的重置提示/滚动窗口推算恢复点，到点把
+ *         会话切回原模型并给 fallback 期间受阻的会话补发「继续」；受限侧
+ *         若又打满，正常 fallback 再次切走，并按 restoreAttempts 退避重排
+ *         下次切回（防抖）。fallbackAutoRestore=false 回到旧行为；手动
+ *         /gpt /glm /ds /mimo /auto 随时接管并取消自动切回。
+ *      ④ 接管侧也限额（两侧都满）：**不切来切去**，只提示一次；任一侧
+ *         到恢复点仍会自动切回并接续（也可等用户发消息/手动切换）。
  *  - **手动偏好模式**：/gpt /glm 快切。手动选择决定常态模型，但不关闭
  *    额度安全网；当前模型耗尽时仍自动切到另一侧保底。
  *  - 期间用户在本聊天发任何消息 → 取消该会话的纯等待 watcher；
@@ -159,6 +162,21 @@ export class AutoContinue {
      *  方向，不能永远假设 primary(GLM) 报错。 */
     this.limitedModel = null;
     this.takeoverModel = null;
+    /** Wall-clock entry time, used to ignore failures from requests already in flight. */
+    this.fallbackEnteredAt = 0;
+
+    // ---- 到点自动切回（2026-11-02）----
+    /** 自动切回定时器与预计时间点。 */
+    this.restoreTimer = null;
+    this.restoreDueAt = 0;
+    /** 切回失败重入 fallback 的次数（退避基数；恢复健康/手动接管时归零）。 */
+    this.restoreAttempts = 0;
+    /** 进 fallback 前的 driver.defaultOverride（切回时还原；null = 设置默认）。 */
+    this.preFallbackDefault = null;
+    /** fallback 期间受阻/被打断、切回后需补发「继续」的会话。 */
+    this.pendingResume = new Set();
+    /** fallback 发起的聊天（自动切回的绿卡发回这里）。 */
+    this.fallbackChatId = null;
   }
 
   /** 主/备模型对（配置了才可用）。 */
@@ -166,6 +184,10 @@ export class AutoContinue {
   #backup() { return this.config.fallbackBackup ? parsePair(this.config.fallbackBackup) : null; }
   #current(sessionId) {
     try { return this.driver.currentModel(this.driver.live.get(sessionId)?.agent); } catch { return null; }
+  }
+  /** The route that actually produced this terminal event (not the mutable next selection). */
+  #failedRoute(session, event) {
+    try { return this.driver.modelForTerminalEvent?.(session, event) ?? this.#current(session?.id); } catch { return this.#current(session?.id); }
   }
   /** 由实际报错的模型决定切换方向（双向）：GLM 侧满→切 GPT；GPT 侧满→切 GLM。
    *  2026-09-14 修复：额度按账号耗尽（codex-proxy 登录 / GLM coding 套餐），
@@ -175,11 +197,12 @@ export class AutoContinue {
    *  会话跑 codex-gpt/gpt-5.6-sol，GPT 满 → 永不切 GLM，只刷等待卡）。
    *  改为按 provider 侧匹配：limited 记录实际耗尽模型（文案准确），takeover
    *  仍切到配置的 canonical pair。第三方 provider（两侧都不是）→ null。 */
-  #routeFor(sessionId) {
-    const primary = this.#primary(); const backup = this.#backup(); const current = this.#current(sessionId);
+  #routeFor(sessionId, failedRoute = null) {
+    const primary = this.#primary(); const backup = this.#backup();
+    const current = failedRoute ?? this.#current(sessionId);
     if (!primary || !backup) return null;
     if (!current) {
-      log.warn('fallback: no live model for the failing session — staying in wait mode');
+      log.warn('fallback: no durable route for the failing request — staying in wait mode');
       return null;
     }
     if (current.provider === primary.provider) return { limited: current, takeover: backup };
@@ -195,6 +218,17 @@ export class AutoContinue {
     this.takeoverModel = null;
     this.takeoverErrorNotified = false;
     this.takeoverSucceeded = false;
+    this.fallbackEnteredAt = 0;
+  }
+
+  /** 清空自动切回的排程与记录（不重置 restoreAttempts 退避计数）。 */
+  #clearRestoreState() {
+    if (this.restoreTimer) clearTimeout(this.restoreTimer);
+    this.restoreTimer = null;
+    this.restoreDueAt = 0;
+    this.preFallbackDefault = null;
+    this.pendingResume.clear();
+    this.fallbackChatId = null;
   }
 
   /** index.js 的 session/event 钩子转发进来（外层已有 try/catch）。 */
@@ -214,13 +248,16 @@ export class AutoContinue {
 
     if (reason?.kind !== 'error') {
       if (reason?.kind === 'completed') {
+        this.pendingResume.delete(sessionId);
         if (this.fallbackActive) {
-          // 接管侧的成功不是恢复信号（本来就不回切），但证明该侧当前可用：
-          // 重置一次性提示旗，若之后再限额可以再次告知用户。
+          // 接管侧的成功不是恢复信号（切回只在到点/手动发生），但证明该侧
+          // 当前可用：重置一次性提示旗，若之后再限额可以再次告知用户。
           this.takeoverErrorNotified = false;
           this.takeoverSucceeded = true;
           return;
         }
+        // 受限侧恢复后跑通了回合 → 退避计数归零（下次切回按正常节奏）
+        this.restoreAttempts = 0;
         this.lastOkAt = Date.now();
         if (this.watchers.has(sessionId)) this.#finish(sessionId, chatId);
       }
@@ -228,11 +265,23 @@ export class AutoContinue {
     }
 
     const message = [reason.error?.code, reason.error?.message].filter(Boolean).join(': ');
+    const failedRoute = this.#failedRoute(session, event);
+    const selected = this.#current(sessionId);
+    if (failedRoute && selected && (failedRoute.provider !== selected.provider || failedRoute.model !== selected.model)) {
+      log.info(`route changed mid-turn for ${sessionId}: failed=${failedRoute.provider}/${failedRoute.model} (${failedRoute.source ?? 'unknown'}), next=${selected.provider}/${selected.model}`);
+    }
 
-    // fallback 进行中：错误出自接管侧（或用户手动切回的模型），交给
-    // 接管侧错误处理（两侧都满 → 只提示，不切来切去）。
+    // Context overflow is not quota exhaustion. Never invert the provider pair
+    // or claim another model's allowance is empty; compaction owns recovery.
+    if (/CONTEXT_WINDOW_EXCEEDED|context[_ -]?(?:window|length)|上下文.{0,12}(?:溢出|超限|过长)/i.test(message)) {
+      this.#onContextOverflow(sessionId, chatId, failedRoute, message);
+      return;
+    }
+
+    // fallback 进行中：错误出自接管侧（或来自 a pre-switch request still
+    // in flight），交给 durable-route-aware handler。
     if (this.fallbackActive) {
-      this.#onTakeoverSideError(sessionId, chatId, message);
+      this.#onTakeoverSideError(session, event, chatId, failedRoute, message);
       return;
     }
     // 手动偏好模式只表示「把当前模型作为用户偏好」，不能关闭额度安全网
@@ -243,7 +292,7 @@ export class AutoContinue {
       if (this.watchers.has(sessionId)) this.#giveUp(sessionId, chatId, `等待期间出现非额度错误：${message}`);
       return;
     }
-    this.#schedule(sessionId, chatId, kind, message);
+    this.#schedule(sessionId, chatId, kind, message, failedRoute);
   }
 
   /** fallback 中接管侧的回合错误。两侧都满 → 只提示一次，**不切来切去**
@@ -251,24 +300,37 @@ export class AutoContinue {
    *  会话切回受限侧（同 provider 即算——额度是账号级的，切回该侧任何
    *  模型都是回到受限通道），视为主动选择：清掉 fallback 状态，
    *  按全新错误重新分类处理。 */
-  #onTakeoverSideError(sessionId, chatId, message) {
-    const cur = this.#current(sessionId);
+  #onTakeoverSideError(session, event, chatId, failedRoute, message) {
+    const sessionId = session?.id;
+    const cur = failedRoute ?? this.#current(sessionId);
+    const startedAt = this.driver.turnStartedAt?.(session, event);
     if (cur && this.limitedModel && cur.provider === this.limitedModel.provider) {
-      // 用户手动回到了受限侧：fallback 状态作废，重新分类（等待/再切换由事件定）
+      if (startedAt && this.fallbackEnteredAt && startedAt < this.fallbackEnteredAt) {
+        log.info(`fallback ignored stale in-flight error for ${sessionId}: failed=${cur.provider}/${cur.model}, enteredAt=${new Date(this.fallbackEnteredAt).toISOString()}`);
+        return;
+      }
+      // A new request really ran on the previously limited provider (usually an
+      // explicit per-session /model choice): treat it as a fresh exhaustion.
       this.#clearFallbackState();
+      this.#clearRestoreState();
       const kind = classifyFailure(message, this.config.autoContinuePatterns ?? []);
-      if (kind) this.#schedule(sessionId, chatId, kind, message);
+      if (kind) this.#schedule(sessionId, chatId, kind, message, cur);
       return;
     }
-    if (this.takeoverErrorNotified) return;   // 只提示一次，避免错误风暴刷卡
-    this.takeoverErrorNotified = true;
     const takeover = this.takeoverModel ?? this.#backup();
-    const fromTakeover = !!takeover && cur?.provider === takeover.provider && cur?.model === takeover.model;
+    const fromTakeover = !!takeover && cur?.provider === takeover.provider;
     const quotaHit = !!classifyFailure(message);
-    const againAfterSuccess = fromTakeover && quotaHit && this.takeoverSucceeded;
     const text = String(message);
     const missingCredential = /MISSING_CREDENTIAL|no credential|API.?KEY.*not set|not configured/i.test(text);
     const proxyLoggedOut = /not authenticated|please login first|invalid_api_key/i.test(text);
+    // 额度/凭据类受阻 → 记入待续跑名单：自动切回时补发「继续」
+    if (quotaHit || missingCredential || proxyLoggedOut) this.pendingResume.add(sessionId);
+    if (this.takeoverErrorNotified) return;   // 只提示一次，避免错误风暴刷卡
+    this.takeoverErrorNotified = true;
+    const againAfterSuccess = fromTakeover && quotaHit && this.takeoverSucceeded;
+    const etaText = this.config.fallbackAutoRestore === false
+      ? '恢复后直接发消息接续，或手动 `/glm` `/gpt` 切换'
+      : `自动切回${this.restoreDueAt ? `预计 ${new Date(this.restoreDueAt).toLocaleTimeString('zh-CN', { hour12: false })} 前后` : '已排程'}，届时切回并自动接续；也可手动 \`/glm\` \`/gpt\``;
     const title = missingCredential ? '❌ GPT备用通道未配置凭据'
       : proxyLoggedOut ? '⚠️ GPT备用通道未登录'
       : againAfterSuccess ? '⏹ 接管侧额度又耗尽'
@@ -279,16 +341,31 @@ export class AutoContinue {
     const body = missingCredential
       ? `已切换到GPT备用通道，但该通道凭据缺失或未注入；这不是GPT额度耗尽。请检查 CODEX_PROXY_API_KEY。`
       : proxyLoggedOut
-        ? `GPT备用通道的 codex-proxy 会话未登录（Not authenticated / 请先登录）——多为GPT额度窗口耗尽或代理登录过期，不是桥的配置问题。请在 codex-proxy 首页重新登录后再手动 \`/gpt\` 切换。`
+        ? `GPT备用通道的 codex-proxy 会话未登录（Not authenticated / 请先登录）——多为GPT额度窗口耗尽或代理登录过期，不是桥的配置问题。${etaText}；也可在 codex-proxy 首页重新登录后手动 \`/gpt\`。`
         : againAfterSuccess
-          ? `接管侧 **${takeoverName}** 窗口再次打满。桥不自动切回；另一侧 **${limitedName}** 若已恢复可手动 \`/glm\` \`/gpt\` 切换，否则等窗口重置后直接发消息接续。`
+          ? `接管侧 **${takeoverName}** 窗口再次打满。桥不来回切（避免空转）；另一侧 **${limitedName}** ${etaText}。`
           : (fromTakeover && quotaHit)
-            ? `**${limitedName}** 与 **${takeoverName}** 的额度窗口都在限额内。桥**不再来回切换**（避免空转）；等任一侧窗口重置后直接发消息即可接续（当前停在 ${takeoverName}），也可手动 \`/gpt\` \`/glm\` 切换。`
+            ? `**${limitedName}** 与 **${takeoverName}** 的额度窗口都在限额内。桥**不再来回切换**（避免空转）；任一侧窗口恢复后${etaText}。`
             : `fallback 期间接管模型回合出错；桥保持现状，不做自动动作。`;
     this.#send(chatId, buildInfoCard(title, [
       body, '', `\`\`\`\n${String(message).slice(0, 300)}\n\`\`\``,
     ].join('\n'), { template: 'grey' }));
     log.warn(`fallback takeover-side error for ${sessionId}: ${String(message).slice(0, 200)}`);
+  }
+
+  /** Context overflow is a capacity/compaction failure, never a quota signal. */
+  #onContextOverflow(sessionId, chatId, failedRoute, message) {
+    if (this.contextOverflowNotified?.has(sessionId)) return;
+    if (!this.contextOverflowNotified) this.contextOverflowNotified = new Set();
+    this.contextOverflowNotified.add(sessionId);
+    const name = failedRoute ? `${failedRoute.provider}/${failedRoute.model}` : '当前模型';
+    this.#send(chatId, buildInfoCard('⚠️ 会话上下文已超出模型窗口', [
+      `本次失败来自 **${name}** 的上下文容量/压缩链，**不是额度不足**，桥不会因此切换额度通道。`,
+      '',
+      '自动压缩会先尝试恢复；若仍反复失败，请发 `/compact`。压缩仍失败时用 `/new` 开精简会话，并从已落盘的阶段报告/摘要继续。',
+      '', `\`\`\`\n${String(message).slice(0, 300)}\n\`\`\``,
+    ].join('\n'), { template: 'orange' }));
+    log.warn(`context overflow for ${sessionId} on ${name}: ${String(message).slice(0, 200)}`);
   }
 
   /** 用户在聊天里发了新消息 → 取消该会话的自动等待（用户接管优先）。 */
@@ -297,6 +374,7 @@ export class AutoContinue {
       if (w.chatId === chatId) {
         this.#clearTimer(sessionId);
         this.watchers.delete(sessionId);
+        this.pendingResume.delete(sessionId);
         log.info(`auto-continue cancelled for ${sessionId} (user spoke in chat)`);
       }
     }
@@ -305,6 +383,7 @@ export class AutoContinue {
   dispose() {
     for (const sessionId of [...this.watchers.keys()]) this.#clearTimer(sessionId);
     this.watchers.clear();
+    this.#clearRestoreState();
   }
 
   #clearTimer(sessionId) {
@@ -317,7 +396,7 @@ export class AutoContinue {
     this.watchers.clear();
   }
 
-  #schedule(sessionId, chatId, kind, message) {
+  #schedule(sessionId, chatId, kind, message, failedRoute = null) {
     const cfg = this.config;
     const prev = this.watchers.get(sessionId);
     const firstAt = prev?.firstAt ?? Date.now();
@@ -358,7 +437,7 @@ export class AutoContinue {
 
     // —— 限额自动换模型：首次判定窗口打满（long）即切入，原任务换脑续跑。
     //    切换成功后不再安排等待 watcher（任务已立即续跑；回切只能手动）。
-    if (kind === 'long' && this.#maybeEnterFallback(sessionId, chatId, message)) return;
+    if (kind === 'long' && this.#maybeEnterFallback(sessionId, chatId, message, failedRoute)) return;
 
     // —— 计算下一次尝试时间
     let delayMs;
@@ -420,9 +499,9 @@ export class AutoContinue {
 
   /** 首次 long（窗口打满判定）→ 切到另一侧。幂等：只进一次。
    *  返回 true = 已切换（调用方不再安排等待 watcher）。 */
-  #maybeEnterFallback(sessionId, chatId, message) {
+  #maybeEnterFallback(sessionId, chatId, message, failedRoute = null) {
     if (this.fallbackActive) return true;             // 已在 fallback，视作已处理
-    const route = this.#routeFor(sessionId);
+    const route = this.#routeFor(sessionId, failedRoute);
     if (!route) return false;   // 具体 warn 由 #routeFor 记录（含实际模型对）
     const { limited, takeover } = route;
 
@@ -430,6 +509,12 @@ export class AutoContinue {
     this.takeoverErrorNotified = false;
     this.limitedModel = { ...limited };
     this.takeoverModel = { ...takeover };
+    this.fallbackEnteredAt = Date.now();
+    // 自动切回：记住切回目标（进 fallback 前的默认）、受阻会话与发起聊天
+    this.#clearRestoreState();
+    this.preFallbackDefault = this.driver.defaultOverride ? { ...this.driver.defaultOverride } : null;
+    this.pendingResume.add(sessionId);
+    this.fallbackChatId = chatId;
 
     // ① 全量切换 + 新会话默认也走接管模型
     const skipped = this.driver.applyModelToAll(takeover.provider, takeover.model);
@@ -468,23 +553,113 @@ export class AutoContinue {
       setTimeout(() => tryResume(8), 0);
     }
 
-    // ③ 橙卡告知（续跑结果是异步的，成败由后续行为/灰卡体现，不在此预支）
+    // ③ 自动切回排程（先排后发卡，卡里带上预计切回时间）
+    this.#scheduleRestore(message);
+    const etaText = this.config.fallbackAutoRestore === false
+      ? '额度恢复后**不会自动切回**（旧策略）；需要换回时手动 `/gpt` `/glm`。'
+      : `窗口恢复后**自动切回**${this.restoreDueAt ? `（预计 ${new Date(this.restoreDueAt).toLocaleTimeString('zh-CN', { hour12: false })} 前后）` : ''}，也可随时手动 \`/gpt\` \`/glm\` 换回。`;
     this.#send(chatId, buildInfoCard('🔄 额度窗口打满，已切换可用模型', [
       `**${limited.provider}/${limited.model}** 额度窗口耗尽，已把会话切到 **${takeover.provider}/${takeover.model}** 接续干活，被打断的任务将自动继续。`,
       '',
-      `额度恢复后**不会自动切回**（避免来回折腾）；需要换回时手动 \`/gpt\` \`/glm\`。若两侧都在限额内，桥会提示并停止切换。`,
+      `${etaText}若两侧都在限额内，桥会提示并暂停互切，任一侧恢复仍自动切回接续。`,
       '',
       `\`\`\`\n${String(message).slice(0, 300)}\n\`\`\``,
     ].join('\n'), { template: 'orange' }));
-    log.info(`fallback entered: limited=${limited.provider}/${limited.model}, all sessions -> ${takeover.provider}/${takeover.model}`
+    log.info(`fallback entered: session=${sessionId}, limited=${limited.provider}/${limited.model} (${limited.source ?? 'unknown'}), all sessions -> ${takeover.provider}/${takeover.model}`
       + `${skipped.length ? ` (skipped: ${skipped.join(',')})` : ''}`);
     return true;
+  }
+
+  // ------------------------------------------------------ auto-restore ----
+
+  /** 排定自动切回：按受限侧报错里的重置提示/滚动窗口推算恢复点；推算不出
+   *  就按 fallbackRestorePollMs 轮询。上次切回失败（restoreAttempts>0）按
+   *  尝试次数退避，防止「切回→又满→立刻再切回」的抖动。 */
+  #scheduleRestore(message) {
+    if (this.config.fallbackAutoRestore === false) return;
+    if (this.restoreTimer) { clearTimeout(this.restoreTimer); this.restoreTimer = null; }
+    const poll = this.config.fallbackRestorePollMs ?? 10 * 60_000;
+    const cap = this.config.fallbackRestoreMaxMs ?? 6 * 3_600_000;
+    let delayMs;
+    const hint = parseRetryHint(String(message ?? ''));
+    if (hint?.at && hint.at.getTime() > Date.now() + 60_000) {
+      delayMs = hint.at.getTime() - Date.now() + 30_000;
+    } else if (hint?.inMs !== undefined && hint.inMs > 0) {
+      delayMs = hint.inMs + 5_000;
+    } else {
+      // 滚动窗口：恢复点 ≈ 最后一次成功调用 + 窗口长度（1308「5小时」等）
+      const wlenH = parseWindowLength(message);
+      const recoverAt = wlenH && this.lastOkAt ? this.lastOkAt + wlenH * 3_600_000 + 30_000 : null;
+      delayMs = recoverAt && recoverAt > Date.now() + 60_000 ? recoverAt - Date.now() : poll;
+    }
+    // 抖动防护 + 总上限
+    delayMs = Math.min(Math.max(delayMs, poll * Math.min(this.restoreAttempts, 6)), cap);
+    this.restoreDueAt = Date.now() + delayMs;
+    this.restoreTimer = setTimeout(() => this.#attemptRestore(), delayMs);
+    if (this.restoreTimer.unref) this.restoreTimer.unref();
+    log.info(`fallback auto-restore scheduled in ${Math.round(delayMs / 60_000)}min (attempt #${this.restoreAttempts + 1}, limited=${this.limitedModel?.provider}/${this.limitedModel?.model})`);
+  }
+
+  /** 到点自动切回受限侧（2026-11-02 用户要求）：全量切回原模型，再给
+   *  fallback 期间受阻的会话补发「继续」。受限侧若又打满，正常 fallback
+   *  流程会再次切走并按 restoreAttempts 退避重排下次切回。 */
+  #attemptRestore() {
+    if (!this.fallbackActive) return;
+    this.restoreTimer = null;
+    this.restoreAttempts += 1;
+    const limited = this.limitedModel;
+    const primary = this.#primary();
+    const backup = this.#backup();
+    const chatId = this.fallbackChatId;
+    if (!limited || !primary || !backup) return;
+    // 受限侧的 canonical pair：primary 侧满 → 切回 primary；backup 侧满 → 切回 backup
+    const pair = limited.provider === primary.provider ? primary : backup;
+    const preDefault = this.preFallbackDefault;
+    const resumed = [...this.pendingResume];
+    try {
+      this.driver.defaultOverride = preDefault ? { ...preDefault } : null;
+      this.driver.applyModelToAll(pair.provider, pair.model);
+    } catch (e) {
+      log.error(`fallback auto-restore apply failed: ${e.message}`);
+      this.#scheduleRestore('');   // 排下次（按退避轮询）
+      return;
+    }
+    this.pendingResume.clear();
+    this.preFallbackDefault = null;
+    this.#clearFallbackState();
+    // 给 fallback 期间受阻的会话补发「继续」（只动空闲者；忙者自行收尾）
+    for (const sessionId of resumed) {
+      const entry = this.driver.live.get(sessionId);
+      const agent = entry?.agent;
+      if (!agent || agent.status !== 'idle') continue;
+      const text = this.config.autoContinueMessage ?? '继续';
+      const tryResume = (left) => {
+        try {
+          this.driver.submit(agent, text);
+        } catch (e) {
+          if (left > 0) { setTimeout(() => tryResume(left - 1), 250); return; }
+          log.warn(`auto-restore resume submit failed for ${sessionId}: ${e.message}`);
+        }
+      };
+      setTimeout(() => tryResume(8), 0);
+    }
+    if (chatId) {
+      this.#send(chatId, buildInfoCard('✅ 额度窗口已恢复，已自动切回', [
+        `**${pair.provider}/${pair.model}** 的额度窗口已恢复，会话已切回原模型，${resumed.length ? '受阻的任务已自动补发「继续」' : '无需人工干预'}。`,
+        '',
+        '若窗口再次打满，桥会自动切到另一侧，并按退避安排下一次自动切回。',
+      ].join('\n'), { template: 'green' }));
+    }
+    log.info(`fallback auto-restored: all sessions -> ${pair.provider}/${pair.model} (queued resume for ${resumed.length})`);
   }
 
   // ------------------------------------------------------------ manual ----
 
   /** /gpt /glm /auto 手动切换（commands.js 调用）。返回 { ok, text }。 */
   manualSwitch(target) {
+    // 手动接管是用户明确意志：取消自动切回排程与续跑记录，退避计数归零
+    this.#clearRestoreState();
+    this.restoreAttempts = 0;
     const backup = this.#backup();
     const primary = this.#primary();
     if (target === 'gpt' || target === 'glm') {
@@ -522,6 +697,21 @@ export class AutoContinue {
       this.driver.applyModelToAll(pair.provider, pair.model);
       return { ok: true, text: `已切到 ${pair.provider}/${pair.model}（百炼 DeepSeek，手动模式；不在额度切换对内，桥不会自动切走）。\n下回合起生效。/glm 切回主模型 · /gpt 切备用 · /auto 恢复自动` };
     }
+    if (target === 'mimo') {
+      const pair = this.config.mimoModel ? parsePair(this.config.mimoModel) : null;
+      if (!pair?.provider || !pair.model) {
+        return { ok: false, text: 'mimoModel 未配置（config.json 或内置默认）' };
+      }
+      // 与 /ds 同款隔离语义：手动接管，停等待 watcher、退出 fallback 状态；
+      // mimo 不在 fallback 对里：额度切换永不路由到它；它额度耗尽时
+      // #routeFor 对第三方 provider 返回 null → 只同模型等待恢复，不切走。
+      this.#clearAllWatchers();
+      this.#clearFallbackState();
+      this.mode = 'manual';
+      this.driver.defaultOverride = { ...pair };
+      this.driver.applyModelToAll(pair.provider, pair.model);
+      return { ok: true, text: `已切到 ${pair.provider}/${pair.model}（小米 MiMo，手动模式；不在额度切换对内，桥不会自动切走）。\n下回合起生效。/glm 切回主模型 · /gpt 切备用 · /auto 恢复自动` };
+    }
     if (target === 'auto') {
       this.mode = 'auto';
       this.#clearAllWatchers();
@@ -539,10 +729,13 @@ export class AutoContinue {
     if (this.fallbackActive) {
       const t = this.takeoverModel ?? backup;
       const l = this.limitedModel ?? primary;
-      return `模型切换：**额度耗尽已切换**（${t.provider}/${t.model} 接管，${l.provider}/${l.model} 限额；不自动切回，手动 /gpt /glm）`;
+      const eta = this.restoreDueAt
+        ? `预计 ${new Date(this.restoreDueAt).toLocaleTimeString('zh-CN', { hour12: false })} 自动切回`
+        : this.config.fallbackAutoRestore === false ? '不自动切回' : '自动切回待排程';
+      return `模型切换：**额度耗尽已切换**（${t.provider}/${t.model} 接管，${l.provider}/${l.model} 限额；${eta}，手动 /gpt /glm 亦可）`;
     }
     if (this.mode === 'manual') return `模型切换：**手动偏好**（额度安全网仍启用；/auto 恢复默认自动策略）`;
-    return `模型切换：自动双向（任一侧额度耗尽 → 切另一侧续跑，不自动切回；默认 ${primary.provider}/${primary.model}）`;
+    return `模型切换：自动双向（任一侧额度耗尽 → 切另一侧续跑，窗口恢复后自动切回；默认 ${primary.provider}/${primary.model}）`;
   }
 
   // ------------------------------------------------------------- timer ----

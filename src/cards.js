@@ -49,8 +49,19 @@ function turnHeader(state) {
  * Sparse holes (undefined entries) are tolerated and skipped; the number of
  * rendered elements is capped (Feishu rejects oversized cards outright, which
  * would freeze streaming) with a fold marker for the middle.
+ *
+ * Cap history: 28 (2026-08-23, v0.3.0) was tuned for short Q&A turns where a
+ * turn held 1-4 blocks. Tool-heavy agent turns (e.g. a 19-step debug loop)
+ * routinely accumulate 40-50 blocks and folded away HALF the turn, which read
+ * as "the answer is incomplete". Raised to 60; still well under Feishu's card
+ * element ceiling, and the full text is now dumped to disk whenever a fold
+ * happens (see renderer.js #maybeDumpFullOutput), so the fold marker is no
+ * longer a dead end.
  */
-const MAX_CARD_ELEMENTS = 28;
+const MAX_CARD_ELEMENTS = 60;
+
+/** Exported so the renderer can dump the full text whenever the card folds. */
+export const CARD_ELEMENT_CAP = MAX_CARD_ELEMENTS;
 
 export function buildTurnCard(state, textLimit) {
   const [template, title] = turnHeader(state);
@@ -62,7 +73,10 @@ export function buildTurnCard(state, textLimit) {
     const head = Math.ceil(MAX_CARD_ELEMENTS * 0.6);
     const tail = Math.floor(MAX_CARD_ELEMENTS * 0.3);
     folded = blocks.length - head - tail;
-    shown = [...blocks.slice(0, head), { kind: 'text', text: `…（已折叠 ${folded} 个中间块，完整内容见落盘文件或继续等待）…` }, ...blocks.slice(-tail)];
+    const hint = state.fullOutputPath
+      ? `完整内容：\`${state.fullOutputPath}\``
+      : '完整内容已落盘（见工作区 .feishu-outputs/）';
+    shown = [...blocks.slice(0, head), { kind: 'text', text: `…（已折叠 ${folded} 个中间块，${hint}）…` }, ...blocks.slice(-tail)];
   }
   const elements = [];
   for (const b of shown) {

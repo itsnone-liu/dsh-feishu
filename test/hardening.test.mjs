@@ -10,6 +10,8 @@
  *  3. 卡片更新连续失败 → 有界退避重试 + 第 5 次后换发新卡（messageId 置空）。
  *  4. selfguard：杀宿主命令被识别，普通命令/杀无关进程不误伤（宽界限内）。
  *  5. inspect_image：本地文件 → data URL 构造 + mock fetch 往返（不发真请求）。
+ *  6. isBootFatalError：plugin tree failed to load 类错误识别为 boot 致命
+ *     （2026-10-31 僵尸桥加固——半死进程每条消息都报 inactive context）。
  */
 import assert from 'node:assert';
 import fs from 'node:fs';
@@ -20,6 +22,7 @@ import { TurnRenderer } from '../src/renderer.js';
 import { buildTurnCard } from '../src/cards.js';
 import { threatensHost } from '../src/selfguard.js';
 import { callVisionEndpoint, sniffImageMediaType } from '../src/vision-tool.js';
+import { isBootFatalError } from '../src/index.js';
 
 let pass = 0;
 let fail = 0;
@@ -63,12 +66,27 @@ await ok('sparse blocks: tool-call@0 + text@2 no crash', async () => {
 });
 
 // ---------------------------------------------------------------- 2 元素上限
-await ok('card element cap: 60 blocks fold to <= 30 elements', async () => {
+// 2026-09-20: cap raised 28 -> 60. A tool-heavy turn (40-50 blocks) used to fold
+// away half the work, which read to the user as "the answer is incomplete".
+// The cap exists only to stay under Feishu's card element ceiling; the full text
+// is now dumped to disk whenever a fold happens (renderer #dumpFullOutput).
+await ok('card element cap: 60 blocks do NOT fold (cap is now 60)', async () => {
   const blocks = Array.from({ length: 60 }, (_, i) => ({ kind: 'text', text: `block-${i} ` + 'x'.repeat(50) }));
   const card = buildTurnCard({ phase: 'working', turnNo: 3, title: 't', blocks, usage: {}, footer: 'f' }, 4000);
-  const mdCount = card.elements.filter((e) => e.tag === 'div').length;
-  assert.ok(mdCount <= 30, `div 元素 ${mdCount} <= 30`);
-  assert.ok(JSON.stringify(card).includes('已折叠'), '折叠标记存在');
+  const flat = JSON.stringify(card);
+  assert.ok(!flat.includes('已折叠'), '60 blocks is at the cap -> no fold');
+  assert.ok(flat.includes('block-0') && flat.includes('block-59'), '首尾块都在');
+});
+
+await ok('card element cap: 61 blocks DO fold, keeping head+tail', async () => {
+  const blocks = Array.from({ length: 61 }, (_, i) => ({ kind: 'text', text: `block-${i} ` + 'x'.repeat(50) }));
+  const card = buildTurnCard({ phase: 'working', turnNo: 3, title: 't', blocks, usage: {}, footer: 'f' }, 4000);
+  const flat = JSON.stringify(card);
+  assert.ok(flat.includes('已折叠'), '61 blocks exceeds cap -> fold marker present');
+  assert.ok(flat.includes('block-0') && flat.includes('block-60'), 'first + last block kept');
+  // cap 60 -> head = ceil(36), tail = 18 -> folded range is [36, 43)
+  assert.ok(!flat.includes('block-36 '), 'folded middle block-36 must NOT render');
+  assert.ok(flat.includes('block-35'), 'last kept head block still renders');
 });
 
 await ok('card builder tolerates sparse/undefined blocks', async () => {
@@ -177,6 +195,25 @@ await ok('callVisionEndpoint surfaces http errors without throwing raw', async (
     globalThis.fetch = realFetch;
     delete process.env.TEST_VISION_KEY;
   }
+});
+
+// ------------------------------------------- 6 boot-fatal 识别（2026-10-31 加固）
+await ok('isBootFatalError: matches plugin-tree failures, ignores runtime noise', async () => {
+  // 2026-10-31 实录：credentials.yaml 缩进丢失 → 顶层键校验拒绝 → 插件树加载失败
+  const bootFatal = new Error(
+    'dsh: plugin tree failed to load: failed to apply loader entry include (cordis:include): '
+    + 'Error: credentials-local: unknown top-level key "glm_coding" in C:\\Users\\pc\\.dsh\\.credentials.yaml',
+  );
+  assert.equal(isBootFatalError(bootFatal), true);
+  // 原因链出现在 stack 里（dsh 包装 cause）也要识别
+  const withCause = new Error('boom');
+  withCause.stack = 'Error: boom\n    at boot (...)\nCaused by: Error: dsh: plugin tree failed to load: invalid document';
+  assert.equal(isBootFatalError(withCause), true);
+  // 运行期错误不得误伤——那些仍走「只记日志不退出」的兜底
+  assert.equal(isBootFatalError(new Error('cannot get required service "agents" in inactive context')), false);
+  assert.equal(isBootFatalError(new Error('HTTP 429 rate limited')), false);
+  assert.equal(isBootFatalError(null), false);
+  assert.equal(isBootFatalError('string reason'), false);
 });
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

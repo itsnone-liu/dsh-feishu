@@ -53,6 +53,64 @@ export class SessionDriver {
     return null;
   }
 
+  /**
+   * Route frozen into the request that produced a terminal event.
+   *
+   * `currentModel()` is the mutable NEXT-request selection. A /model command or
+   * global fallback can rewrite it while another request is still in flight, so
+   * it must never be used to attribute that request's eventual error. The agent
+   * loop writes request/header before calling the provider; that durable header
+   * is authoritative. request/context and llm/retry are compatibility fallbacks
+   * for older/fake sessions.
+   */
+  modelForTerminalEvent(session, terminalEvent) {
+    const events = session?.events ?? [];
+    const endSeq = Number.isSafeInteger(terminalEvent?.seq) ? terminalEvent.seq : Number.POSITIVE_INFINITY;
+    const turn = terminalEvent?.data?.turn;
+    let turnStartSeq = -1;
+    if (turn !== undefined) {
+      for (let i = events.length - 1; i >= 0; i--) {
+        const e = events[i];
+        if (e.seq > endSeq) continue;
+        if (e.type === 'turn/start' && e.data?.turn === turn) { turnStartSeq = e.seq; break; }
+      }
+    }
+    let context = null;
+    let retryProvider = '';
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i];
+      if (e.seq > endSeq) continue;
+      if (e.type === 'request/header') {
+        const cfg = e.data?.header?.config;
+        if (cfg?.provider && cfg?.model) return { provider: cfg.provider, model: cfg.model, source: 'request/header' };
+      }
+      if (!context && e.type === 'request/context' && e.data?.provider && e.data?.model) {
+        context = { provider: e.data.provider, model: e.data.model, source: 'request/context' };
+      }
+      if (!retryProvider && e.seq >= turnStartSeq && e.type === 'llm/retry' && e.data?.provider) {
+        retryProvider = e.data.provider;
+      }
+    }
+    if (context) return context;
+    if (retryProvider) {
+      const cur = this.currentModel(this.live.get(session?.id)?.agent);
+      return { provider: retryProvider, model: cur?.provider === retryProvider ? cur.model : '(unknown)', source: 'llm/retry' };
+    }
+    const cur = this.currentModel(this.live.get(session?.id)?.agent);
+    return cur ? { ...cur, source: 'selection-fallback' } : null;
+  }
+
+  /** Start time of the turn ending in `terminalEvent` (for stale in-flight detection). */
+  turnStartedAt(session, terminalEvent) {
+    const turn = terminalEvent?.data?.turn;
+    const endSeq = Number.isSafeInteger(terminalEvent?.seq) ? terminalEvent.seq : Number.POSITIVE_INFINITY;
+    for (let i = (session?.events?.length ?? 0) - 1; i >= 0; i--) {
+      const e = session.events[i];
+      if (e.seq <= endSeq && e.type === 'turn/start' && e.data?.turn === turn) return e.time ?? null;
+    }
+    return null;
+  }
+
   #selection() {
     if (this.defaultOverride) {
       return { provider: this.defaultOverride.provider, model: this.defaultOverride.model };

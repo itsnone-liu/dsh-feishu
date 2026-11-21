@@ -315,7 +315,8 @@ export class LarkTransport {
       const sender = event.sender ?? {};
       const chatType = message.chat_type;
       const type = message.message_type;
-      if (type !== 'text' && type !== 'image' && type !== 'file') return;
+      // 2026-10-28: audio(语音)/media(视频) 与 file 同路径（与 sdk.js 对齐）。
+      if (type !== 'text' && type !== 'image' && type !== 'file' && type !== 'audio' && type !== 'media') return;
       if (chatType !== 'p2p') {
         const adm = groupAdmission(this.config, chatType, type, message.mentions ?? [], await this.#ensureBotOpenId());
         if (!adm.ok) return;
@@ -343,7 +344,9 @@ export class LarkTransport {
           }
         }
       } else {
-        // file message: content is {"file_key": "...", "file_name": "..."}
+        // file/audio/media message: content is {"file_key": "...", ...}.
+        // audio = {"duration":..,"file_key":..}；media = {"file_key":..,"image_key":..}
+        // — file_name 仅 file 消息携带，语音/视频按类型合成可读名。
         let fileKey = '';
         let fileName = '';
         try {
@@ -351,6 +354,8 @@ export class LarkTransport {
           fileKey = c.file_key ?? '';
           fileName = c.file_name ?? '';
         } catch {}
+        if (!fileName && type === 'audio') fileName = `voice_${message.message_id}.opus`;
+        if (!fileName && type === 'media') fileName = `video_${message.message_id}.mp4`;
         if (fileKey) {
           try {
             files = [await this.downloadMessageResource(message.message_id, fileKey, 'file', fileName || fileKey)];

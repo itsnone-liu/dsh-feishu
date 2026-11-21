@@ -71,7 +71,10 @@ export class SdkTransport {
         const message = data?.message ?? {};
         const chatType = message.chat_type;
         const type = message.message_type;
-        if (type !== 'text' && type !== 'image' && type !== 'file') return;
+        // 2026-10-28: audio(语音)/media(视频) 与 file 同路径处理 —— 下载后走
+        // router 的 .feishu-files 落盘；此前这两类被静默丢弃（用户发视频/语音
+        // 收不到，桥日志无痕迹）。post/sticker 仍忽略（无文件载荷或不可用）。
+        if (type !== 'text' && type !== 'image' && type !== 'file' && type !== 'audio' && type !== 'media') return;
         // group gate (p2p always passes)
         if (chatType !== 'p2p') {
           const adm = groupAdmission(this.config, chatType, type, message.mentions ?? [], await this.#ensureBotOpenId());
@@ -105,7 +108,9 @@ export class SdkTransport {
             }
           }
         } else {
-          // file message: content is {"file_key": "...", "file_name": "..."}
+          // file/audio/media message: content is {"file_key": "...", ...}.
+          // audio = {"duration":..,"file_key":..}；media = {"file_key":..,"image_key":..}
+          // — file_name 仅 file 消息携带，语音/视频按类型合成可读名。
           let fileKey = '';
           let fileName = '';
           try {
@@ -113,6 +118,8 @@ export class SdkTransport {
             fileKey = c.file_key ?? '';
             fileName = c.file_name ?? '';
           } catch {}
+          if (!fileName && type === 'audio') fileName = `voice_${message.message_id}.opus`;
+          if (!fileName && type === 'media') fileName = `video_${message.message_id}.mp4`;
           if (fileKey) {
             try {
               files = [await this.downloadMessageResource(message.message_id, fileKey, 'file', fileName || fileKey)];
@@ -144,6 +151,12 @@ export class SdkTransport {
           });
         }
       },
+      // Read receipts arrive for EVERY message any user reads; with no
+      // registered handler the SDK warns `no im.message.message_read_v1
+      // handle` per receipt — that one line was ~90% of bridge.err.log's
+      // 94 MB (2026-11-01). Deliberate no-op: read state is not consumed
+      // anywhere in the bridge.
+      'im.message.message_read_v1': async () => {},
     });
     this.wsClient = new this.sdk.WSClient({
       appId: this.config.appId,

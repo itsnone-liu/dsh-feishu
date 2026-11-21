@@ -278,8 +278,10 @@ function fbHarness(cfgOver = {}) {
   let alwaysLocked = false;   // true = submit 永远抛锁错（测重试用尽）
   let failFirstN = 0;          // 额外前 N 次调用也抛错（测重试成功路径）
   let submitCalls = 0;
+  const session = { id: 'session-test', events: [] };
   const agent = {
     id: 'session-test',
+    session,
     status: 'idle',
     followup(m) { submitted.push({ how: 'followup', text: m.content?.[0]?.text ?? '' }); },
     steer(m) { submitted.push({ how: 'steer', text: m.content?.[0]?.text ?? '' }); },
@@ -288,6 +290,10 @@ function fbHarness(cfgOver = {}) {
     live: new Map([['session-test', { agent }]]),
     defaultOverride: null,
     currentModel: () => ({ provider: 'glm-coding', model: 'glm-5.3' }),
+    modelForTerminalEvent: (_session, event) => event.testRoute
+      ? { ...event.testRoute, source: 'test-route' }
+      : driver.currentModel(),
+    turnStartedAt: (_session, event) => event.testStartedAt ?? null,
     setModel: (_a, provider, model) => { applied.push(`${provider}/${model}`); },
     applyModelToAll: (provider, model) => { applied.push(`ALL:${provider}/${model}`); return []; },
     // 与真实 SessionDriver.submit 同语义：running→steer，idle→followup；
@@ -315,15 +321,18 @@ function fbHarness(cfgOver = {}) {
     autoContinuePatterns: [],
     fallbackPrimary: 'glm-coding/glm-5.3',
     fallbackBackup: 'codex-gpt/gpt-5.6-luna',
+    fallbackAutoRestore: true,
+    fallbackRestorePollMs: 120,
+    fallbackRestoreMaxMs: 5_000,
     ...cfgOver,
   };
   const ac = new AutoContinue({ config: cfg, driver, renderer, transport });
-  const turnEnd = (reason) => {
+  const turnEnd = (reason, meta = {}) => {
     inDispatch = true;
-    try { ac.onEvent({ id: 'session-test' }, { type: 'turn/end', data: { reason } }); }
+    try { ac.onEvent(session, { type: 'turn/end', data: { reason }, ...meta }); }
     finally { inDispatch = false; }
   };
-  return { ac, cards, submitted, applied, driver, turnEnd, agent,
+  return { ac, cards, submitted, applied, driver, turnEnd, agent, session,
     mocks: { lockAlways(v) { alwaysLocked = v; }, failFirst(v) { failFirstN = v; }, calls: () => submitCalls } };
 }
 
@@ -372,6 +381,50 @@ await ok('fallback: 同provider非默认模型满额也切换（2026-09-14 事�
   h.ac.dispose();
 });
 
+await ok('fallback: mid-turn selection change attributes quota to durable failed route', async () => {
+  const h = fbHarness();
+  h.driver.currentModel = () => ({ provider: 'codex-gpt', model: 'gpt-6.1-sol' });
+  h.turnEnd(
+    { kind: 'error', error: { code: '1308', message: '已达到5小时的使用上限，额度耗尽' } },
+    { testRoute: { provider: 'glm-coding', model: 'glm-5.3' } },
+  );
+  assert.deepEqual(h.ac.limitedModel.provider, 'glm-coding', 'failed request route wins over next selection');
+  assert.ok(h.applied.includes('ALL:codex-gpt/gpt-5.6-luna'), 'direction switches away from exhausted GLM');
+  assert.ok(h.cards.some((c) => /glm-coding\/glm-5.3/.test(JSON.stringify(c))), 'card names actual failed route');
+  h.ac.dispose();
+});
+
+await ok('context overflow is not displayed or routed as quota exhaustion', () => {
+  const h = fbHarness();
+  h.turnEnd(
+    { kind: 'error', error: { code: 'CONTEXT_WINDOW_EXCEEDED', message: 'pi-ai detected context overflow for model "gpt-6-luna"' } },
+    { testRoute: { provider: 'codex-gpt', model: 'gpt-6-luna' } },
+  );
+  assert.equal(h.applied.length, 0, 'no quota fallback switch');
+  assert.ok(!h.ac.fallbackActive, 'fallback remains inactive');
+  assert.ok(h.cards.some((c) => /会话上下文已超出模型窗口/.test(c.header.title.content)
+    && /不是额度不足/.test(JSON.stringify(c))), 'actionable context card');
+  h.ac.dispose();
+});
+
+await ok('fallback: stale pre-switch failure is ignored instead of clearing fallback', () => {
+  const h = fbHarness();
+  h.turnEnd(
+    { kind: 'error', error: { code: '1308', message: '已达到5小时的使用上限，额度耗尽' } },
+    { testRoute: { provider: 'glm-coding', model: 'glm-5.3' } },
+  );
+  const entered = h.ac.fallbackEnteredAt;
+  const applied = h.applied.length;
+  h.turnEnd(
+    { kind: 'error', error: { code: '1308', message: 'stale GLM request failed after switch' } },
+    { testRoute: { provider: 'glm-coding', model: 'glm-5.3' }, testStartedAt: entered - 1 },
+  );
+  assert.ok(h.ac.fallbackActive, 'stale failure does not clear fallback');
+  assert.equal(h.applied.length, applied, 'no second switch');
+  assert.ok(!h.cards.some((c) => /两侧额度都在限额内/.test(c.header.title.content)), 'no false both-limited card');
+  h.ac.dispose();
+});
+
 await ok('fallback: GLM 侧非默认模型满额 → 切 GPT（对称成立）', async () => {
   const h = fbHarness();
   h.driver.currentModel = () => ({ provider: 'glm-coding', model: 'glm-4.7' });
@@ -392,14 +445,77 @@ await ok('fallback: 第三方 provider 满额 → 仍不切换（维持等待老
   h.ac.dispose();
 });
 
-await ok('fallback: 不自动切回 — 接管侧正常干活时不还原（2026-09-13 定调）', async () => {
+await ok('fallback: 自动切回 — 到点切回受限侧并补发继续（2026-11-02 用户要求）', async () => {
   const h = fbHarness();
   h.turnEnd({ kind: 'error', error: { code: '429', message: '已达到5小时的使用上限，额度耗尽' } }); // GLM→GPT
-  assert.ok(h.applied.includes('ALL:codex-gpt/gpt-5.6-luna'));
-  await sleep(250);   // 足够 firstMs/pollMs 触发多次 —— 什么都不该再发生
-  assert.ok(h.ac.fallbackActive, 'stays on takeover side (no recovery exit)');
-  assert.ok(!h.applied.includes('glm-coding/glm-5.3'), 'no restore without exhaustion');
-  assert.equal(h.ac.watchers.size, 0, 'no probe/wait watcher armed');
+  assert.ok(h.ac.fallbackActive, 'fallback entered');
+  assert.ok(h.applied.includes('ALL:codex-gpt/gpt-5.6-luna'), 'switched to takeover side');
+  const resumedBefore = h.submitted.filter((s) => s.text === '继续').length;
+  await sleep(400);   // fallbackRestorePollMs=120ms → 到点自动切回
+  assert.ok(!h.ac.fallbackActive, 'fallback exited after auto-restore');
+  assert.ok(h.applied.includes('ALL:glm-coding/glm-5.3'), 'sessions restored to the limited side');
+  assert.deepEqual(h.driver.defaultOverride, null, 'default override restored to pre-fallback state');
+  assert.ok(h.cards.some((c) => /已自动切回/.test(c.header.title.content)), 'green restore card');
+  assert.ok(h.submitted.filter((s) => s.text === '继续').length > resumedBefore, 'blocked task got a resume on restore');
+  assert.equal(h.ac.watchers.size, 0, 'no wait watcher left');
+  h.ac.dispose();
+});
+
+await ok('fallback: fallbackAutoRestore=false 回到不回切旧行为', async () => {
+  const h = fbHarness({ fallbackAutoRestore: false });
+  h.turnEnd({ kind: 'error', error: { code: '429', message: '已达到5小时的使用上限，额度耗尽' } });
+  await sleep(400);
+  assert.ok(h.ac.fallbackActive, 'stays on takeover side (old policy)');
+  assert.ok(!h.applied.includes('ALL:glm-coding/glm-5.3'), 'no automatic restore');
+  assert.ok(h.cards.some((c) => /不会自动切回/.test(JSON.stringify(c))), 'card states the old policy');
+  h.ac.dispose();
+});
+
+await ok('fallback: 手动切换取消自动切回排程', async () => {
+  const h = fbHarness();
+  h.turnEnd({ kind: 'error', error: { code: '429', message: '已达到5小时的使用上限，额度耗尽' } }); // GLM→GPT
+  h.ac.manualSwitch('gpt');
+  const restored = () => h.applied.filter((x) => x === 'ALL:glm-coding/glm-5.3').length;
+  const before = restored();
+  await sleep(400);
+  assert.equal(restored(), before, 'manual switch cancels the auto-restore timer');
+  h.ac.dispose();
+});
+
+await ok('fallback: 切回失败再进 fallback → 退避递增防抖', async () => {
+  const h = fbHarness();
+  h.driver.currentModel = () => ({ provider: 'glm-coding', model: 'glm-5.3' });
+  h.turnEnd({ kind: 'error', error: { code: '1308', message: '已达到5小时的使用上限' } }); // GLM→GPT
+  await sleep(400);   // 自动切回 GLM
+  assert.ok(!h.ac.fallbackActive, 'auto-restored');
+  assert.equal(h.ac.restoreAttempts, 1, 'restore attempt recorded');
+  h.turnEnd({ kind: 'error', error: { code: '1308', message: '已达到5小时的使用上限' } }); // GLM 又满
+  assert.ok(h.ac.fallbackActive, 're-enters fallback after a failed restore');
+  assert.equal(h.ac.restoreAttempts, 1, 'attempt count preserved for backoff');
+  const etaIn = h.ac.restoreDueAt - Date.now();
+  assert.ok(etaIn >= 100, `next auto-restore backed off (in ${Math.round(etaIn)}ms)`);
+  h.ac.dispose();
+});
+
+await ok('fallback: 自动切回按重置提示排程（Try again in …）', () => {
+  const h = fbHarness();
+  h.driver.currentModel = () => ({ provider: 'codex-gpt', model: 'gpt-5.6-luna' });
+  h.turnEnd({ kind: 'error', error: { code: 'usage_limit_reached', message: 'You have 0 weighted tokens left; usage limit reached. Try again in 2 seconds.' } });
+  assert.ok(h.ac.fallbackActive, 'GPT exhausted → GLM takeover');
+  const etaIn = h.ac.restoreDueAt - Date.now();
+  assert.ok(etaIn > 1_500 && etaIn < 3_500, `restore follows the 2s retry hint (in ${Math.round(etaIn)}ms)`);
+  h.ac.dispose();
+});
+
+await ok('fallback: 两侧都满 → 自动切回时补发继续', async () => {
+  const h = fbHarness();
+  h.turnEnd({ kind: 'error', error: { code: '429', message: '已达到5小时的使用上限，额度耗尽' } }); // GLM→GPT
+  h.driver.currentModel = () => ({ provider: 'codex-gpt', model: 'gpt-5.6-luna' });
+  h.turnEnd({ kind: 'error', error: { code: '429', message: 'usage limit reached (额度耗尽)' } }); // 两侧都满
+  await sleep(400);   // GLM 恢复点到 → 自动切回
+  assert.ok(!h.ac.fallbackActive, 'auto-restored after both-sides-full');
+  assert.ok(h.applied.includes('ALL:glm-coding/glm-5.3'), 'restored to GLM');
+  assert.ok(h.submitted.filter((s) => s.text === '继续').length >= 2, 'resume sent on entry and on restore');
   h.ac.dispose();
 });
 
@@ -412,7 +528,7 @@ await ok('fallback: long quota error → switch to other side + resume + orange 
   await sleep(30);   // resume 已异步化：等宏任务越过重入锁窗口
   assert.ok(submitted.some((s) => s.text === '继续'), 'interrupted task auto-resumed');
   assert.ok(cards.some((c) => /切换可用模型/.test(c.header.title.content)), 'switch card');
-  assert.ok(cards.some((c) => /不会自动切回/.test(JSON.stringify(c))), 'card states the no-switch-back policy');
+  assert.ok(cards.some((c) => /自动切回/.test(JSON.stringify(c))), 'card states the auto-restore policy');
   assert.equal(ac.watchers.size, 0, 'no wait/probe watcher after switching');
   ac.dispose();
 });
@@ -534,15 +650,15 @@ await ok('fallback: short 429 does NOT switch; only escalated long does', () => 
   ac.dispose();
 });
 
-await ok('fallback: probe success → restore snapshot + green card', async () => {
-  // 2026-09-13 起「恢复探针/自动切回」整组行为已删除：探针不存在，
-  // 恢复只能手动。此测试改为守护"没有自动还原"这条策略本身。
+await ok('fallback: 恢复到点 → 自动还原 + 绿卡（2026-11-02 策略回归）', async () => {
+  // 2026-09-13 曾删除自动还原；2026-11-02 用户要求恢复「GLM 恢复自动切回」。
+  // 本测试守护新策略：到点必还原、绿卡必发。
   const { ac, cards, applied, turnEnd } = fbHarness();
   turnEnd({ kind: 'error', error: { code: '429', message: '额度耗尽 quota exhausted' } });
-  await sleep(150); // firstMs 早已过期，什么探针都不存在
-  assert.ok(ac.fallbackActive, 'fallback stays (no probe, no exit)');
-  assert.ok(!applied.some((x) => x === 'glm-coding/glm-5.3'), 'sessions NOT restored automatically');
-  assert.ok(!cards.some((c) => /已自动切回/.test(c.header.title.content)), 'no recovery card');
+  await sleep(400); // fallbackRestorePollMs=120ms 到点
+  assert.ok(!ac.fallbackActive, 'fallback exits at the restore point');
+  assert.ok(applied.some((x) => x === 'ALL:glm-coding/glm-5.3'), 'sessions restored automatically');
+  assert.ok(cards.some((c) => /已自动切回/.test(c.header.title.content)), 'green recovery card');
   assert.equal(ac.watchers.size, 0, 'watcher cleared');
   ac.dispose();
 });
