@@ -27,13 +27,14 @@ const HELP = [
   '- 直接发文字 = 和 agent 说话（运行中发送会作为下一步转向输入）',
   '- **直接发图片 = 识图**：无需切模型 —— 文本模型会自动调用 `inspect_image` 外挂识图（Qwen-VL）；若当前模型本身支持视觉则原生识图。连发多张图会自动合并为一个回合（1.5 秒窗口）',
   '- 订阅额度耗尽时桥会**自动等待恢复并继续**；配置了模型对时会**双向自动切换**：任一侧（GPT或GLM）额度满→自动切到另一侧续跑；**额度恢复不自动切回**（需换回手动 `/gpt` `/glm`）；两侧都满则只提示、不来回切',
-  '- `/gpt` `/glm` `/auto` `/ds` 手动快切模型：选择常态模型（启动/新建默认 GLM），手动选择不关闭额度安全网；`/ds` 切百炼 DeepSeek（独立通道，不参与额度切换对，切走/切回都靠手动）',
+  '- `/gpt` `/glm` `/auto` `/ds` `/mimo` 手动快切模型：选择常态模型（启动/新建默认 GLM），手动选择不关闭额度安全网；`/ds` 切百炼 DeepSeek、`/mimo` 切小米 MiMo（均为独立通道，不参与额度切换对，切走/切回都靠手动）',
   '- **`/plan` `/exec` `/review` 相位工作流**：`/plan`→网页额度做方案规划（不写码）· `/exec`→方案存档+切回执行模型开工并记审计起点 · `/review [档位|commit]`→收集 diff 切网页额度审计（默认轻档 light，复杂改动 `/review high` 深审）· 审完 `/exec` 修复循环。产物存档于工作区 `.dsh/phases/`；网页通道故障自动降级 Codex 额度继续',
   '- `/new [cwd]` 新会话 · `/stop` 停止本轮 · `/status` 状态 · `/doctor` 诊断（识图链路体检）',
   '- `/mode` 查看/切换权限模式（`/mode ro` 只读 · `/mode rw` 工作区可写 · `/mode full` 全权）',
   '- `/model` 查看/切换模型（如 `/model glm-5.3`；跨厂商用 `厂商/模型` 全称；📷 标记原生支持识图）',
   '- `/preset` 查看/切换预设（极简 minimal · 标准 standard · code · cordis；有历史的会话自动开新会话）',
-  '- `/sessions` 列出本工作区会话 · `/resume <id前缀>` 接续旧会话',
+  '- `/sessions` 列出本工作区会话（含会话名） · `/resume <id前缀>` 接续旧会话',
+  '- `/name <名字>` 给当前会话命名（如 `/name 103-B视频`）；新会话首条消息会自动充当名字',
   '- `/cwd <路径>` 设定下次新会话的工作区',
   '- `/restart` 安全重启桥（在进程外拉起新进程；会话可接续）',
   '',
@@ -69,9 +70,14 @@ export function buildWindowsRestartScript({ pid, stamp, launcher, runBridge, log
   ].join('\n');
 }
 
+/** 本地时区 "YYYY-MM-DD HH:mm"（会话列表/登记表给人看，别用UTC）。 */
+const localStamp = (t = Date.now()) => {
+  const d = new Date(t), p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+};
+
 /** Friendly aliases → preset table keys (applied only when the key exists). */
-const MODE_ALIASES = {
-  ro: 'read-only',
+const MODE_ALIASES = {  ro: 'read-only',
   readonly: 'read-only',
   read: 'read-only',
   rw: 'workspace-write',
@@ -84,9 +90,11 @@ const MODE_ALIASES = {
 };
 
 export class Commands {
-  constructor({ config, store, driver, renderer, transport, permissionPresets, llm, agentPresets, visionReady = false, autoContinue = null, phases = null }) {
+  constructor({ config, store, titles = null, driver, renderer, transport, permissionPresets, llm, agentPresets, visionReady = false, autoContinue = null, phases = null }) {
     this.config = config;
     this.store = store;
+    /** 会话命名（2026-11-21 P1/P2）。 */
+    this.titles = titles;
     this.driver = driver;
     this.renderer = renderer;
     this.transport = transport;
@@ -133,6 +141,8 @@ export class Commands {
           return await this.cmdQuickSwitch(chatId, 'auto');
         case 'ds':
           return await this.cmdQuickSwitch(chatId, 'ds');
+        case 'mimo':
+          return await this.cmdQuickSwitch(chatId, 'mimo');
         case 'plan':
           return await this.cmdPhase(chatId, arg, 'plan');
         case 'exec':
@@ -146,6 +156,9 @@ export class Commands {
         case 'session':
         case 'ls':
           return await this.cmdSessions(chatId);
+        case 'name':
+        case 'rename':
+          return await this.cmdName(chatId, arg);
         case 'resume':
         case 'switch':
           return await this.cmdResume(chatId, arg);
@@ -181,6 +194,7 @@ export class Commands {
     const agent = await this.driver.ensure(binding);
     // persist AFTER ensure() minted the session id (ensure mutates binding)
     this.store.update(chatId, { sessionId: binding.sessionId, cwd: binding.cwd });
+    this.#registryAppend('（新会话，首条消息自动命名）', binding.sessionId, cwd, 'new');
     this.renderer.attach(agent.id, chatId);
     await this.transport.sendCard(chatId, buildInfoCard('新会话已就绪', [
       `session：\`${agent.id}\``,
@@ -380,6 +394,19 @@ export class Commands {
     return `- \`${name}\`（${label}）：sandbox \`${spec.sandbox}\` · 审批 \`${spec.approval}\`${desc}${mark}`;
   }
 
+  /**
+   * rc.7: permissionPresets.current(events)  ·  0.2.1: current(session)
+   * 探测式兼容：session 形式失败时退回 events 形式。
+   * [2026-11-13 升级补丁2：自中心机同款插件移植]
+   */
+  #modeCurrent(service, session) {
+    try {
+      return service.current(session);
+    } catch {
+      return service.current(session.events);
+    }
+  }
+
   async cmdMode(chatId, arg) {
     const service = this.permissionPresets;
     if (!service) {
@@ -396,7 +423,7 @@ export class Commands {
 
     if (!arg) {
       // bare /mode — current + table
-      const current = service.current(agent.session.events);
+      const current = this.#modeCurrent(service, agent.session);
       const names = [...service.names];
       if (!names.includes(current)) names.push(current); // e.g. 'custom'
       const lines = [
@@ -419,9 +446,9 @@ export class Commands {
       await this.transport.sendCard(chatId, buildErrorCard('未知模式', `\`${arg}\`\n可用：${service.names.join('、')}\n别名：ro / rw / full`));
       return true;
     }
-    const before = service.current(agent.session.events);
+    const before = this.#modeCurrent(service, agent.session);
     service.set(agent.session, target);
-    const after = service.current(agent.session.events);
+    const after = this.#modeCurrent(service, agent.session);
     const spec = service.resolve(target);
     const lines = [
       `${before} → **${after}**`,
@@ -495,7 +522,7 @@ export class Commands {
     // resolve the target
     let provider;
     let model;
-    if (arg === 'gpt' || arg === 'glm' || arg === 'ds') {
+    if (arg === 'gpt' || arg === 'glm' || arg === 'ds' || arg === 'mimo') {
       // 快捷别名 → 手动快切（保证 fallback 状态机同步，不能裸 setModel）
       return await this.cmdQuickSwitch(chatId, arg);
     }
@@ -682,13 +709,55 @@ export class Commands {
     const lines = mine.length === 0
       ? [`工作区 \`${cwd}\` 下没有持久会话。`]
       : mine.slice(0, 15).map((s) => {
-          const when = s.createdAt ? new Date(s.createdAt).toISOString().slice(0, 16).replace('T', ' ') : '?';
+          const when = s.createdAt ? localStamp(s.createdAt) : '?';
           const mark = binding?.sessionId === s.id ? ' ← 当前' : '';
-          return `- \`${s.id.replace(/^session-/, '').slice(0, 8)}\` ${when} [${s.preset ?? '-'}]${mark}`;
+          const title = (this.titles && this.titles.get(s.id)) || '（未命名）';
+          return `- \`${s.id.replace(/^session-/, '').slice(0, 8)}\` **${title}** ${when} [${s.preset ?? '-'}]${mark}`;
         });
     if (mine.length > 15) lines.push(`… 共 ${mine.length} 个`);
     await this.transport.sendCard(chatId, buildInfoCard(`会话（${mine.length}）· ${cwd}`, lines.join('\n')));
     return true;
+  }
+
+  /** /name <名字>（2026-11-21 P2）：给当前会话命名；写入登记表（P3）。 */
+  async cmdName(chatId, arg) {
+    const title = (arg ?? '').trim();
+    if (!title) {
+      const cur = this.store.get(chatId);
+      const curTitle = cur?.sessionId && this.titles ? (this.titles.get(cur.sessionId) ?? '（未命名）') : '—';
+      await this.transport.sendCard(chatId, buildInfoCard('会话命名', [
+        `当前会话名：**${curTitle}**`,
+        '',
+        '用法：`/name 103-B视频`（建议格式：课程号-工作线）',
+        '未显式命名的会话，首条消息会自动充当名字。',
+      ].join('\n'), { template: 'grey' }));
+      return true;
+    }
+    const binding = this.store.get(chatId);
+    if (!binding?.sessionId) {
+      await this.transport.sendCard(chatId, buildErrorCard('没有活动会话', '当前聊天还没绑定会话；先发条消息或 /new 创建。'));
+      return true;
+    }
+    this.titles?.set(binding.sessionId, title.slice(0, 40));
+    this.#registryAppend(title.slice(0, 40), binding.sessionId, binding.cwd, 'name');
+    await this.transport.sendCard(chatId, buildInfoCard('已命名', [
+      `会话 \`${binding.sessionId.replace(/^session-/, '').slice(0, 8)}\` → **${title.slice(0, 40)}**`,
+      '`/sessions` 可查看全部会话名。',
+    ].join('\n'), { template: 'green' }));
+    return true;
+  }
+
+  /** P3：登记表追加（失败静默，绝不影响命令本体）。 */
+  #registryAppend(title, sessionId, cwd, via) {
+    const reg = this.config.sessionsRegistry;
+    if (!reg) return;
+    try {
+      const id8 = String(sessionId ?? '').replace(/^session-/, '').slice(0, 8);
+      const date = localStamp();
+      fs.appendFileSync(reg, `\n| ${title} | \`${id8}\` | ${cwd ?? '-'} | ${via} | ${date} |`, 'utf8');
+    } catch (e) {
+      log.warn(`sessionsRegistry append failed: ${e.message}`);
+    }
   }
 
   async cmdResume(chatId, prefix) {
@@ -720,7 +789,7 @@ export class Commands {
     try {
       const agent = await this.driver.ensure(binding, { allowCreate: false });
       this.renderer.attach(agent.id, chatId);
-      const when = target.createdAt ? new Date(target.createdAt).toISOString().slice(0, 16).replace('T', ' ') : '?';
+      const when = target.createdAt ? localStamp(target.createdAt) : '?';
       await this.transport.sendCard(chatId, buildInfoCard('已接续会话', `\`${target.id}\`\n创建于 ${when}\n工作区 \`${target.cwd}\``, { template: 'green' }));
     } catch (e) {
       await this.transport.sendCard(chatId, buildErrorCard('接续失败', e.message));

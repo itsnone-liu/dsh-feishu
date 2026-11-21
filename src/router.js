@@ -14,9 +14,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 export class ChatRouter {
-  constructor({ config, store, driver, renderer, transport, interactions, commands, visionReady = false, autoContinue = null }) {
+  constructor({ config, store, titles = null, driver, renderer, transport, interactions, commands, visionReady = false, autoContinue = null, sendState = null }) {
     this.config = config;
     this.store = store;
+    /** 会话命名（2026-11-21 P1）：首条用户消息自动命名，/name 可覆盖。 */
+    this.titles = titles;
     this.driver = driver;
     this.renderer = renderer;
     this.transport = transport;
@@ -25,6 +27,9 @@ export class ChatRouter {
     /** inspect_image registered → text-only models can still take images. */
     this.visionReady = visionReady;
     this.autoContinue = autoContinue;
+    /** Shared with the send_file tool (src/send-tool.js): most recent chat that
+     *  passed the whitelist — outbound default target. */
+    this.sendState = sendState ?? { lastChatId: '' };
     /** chatId → promise tail (serial handling) */
     this.queues = new Map();
     /** LRU-ish dedup of inbound message ids */
@@ -131,6 +136,8 @@ export class ChatRouter {
       }
       return;
     }
+    // whitelisted → remember as the send_file default target (2026-10-28)
+    this.sendState.lastChatId = chatId;
 
     // any real user activity cancels pending quota auto-continue for this chat
     this.autoContinue?.cancelForChat(chatId);
@@ -189,6 +196,10 @@ export class ChatRouter {
 
     // normal text traffic → agent
     const agent = await this.#agentFor(chatId);
+    // P1 自动命名：该会话第一条用户消息截断为名（/name 显式命名优先，永不覆盖）
+    if (this.titles) {
+      try { this.titles.setAuto(agent.id, norm); } catch { /* 命名失败绝不影响消息 */ }
+    }
     const mode = this.driver.submit(agent, norm);
     if (mode === 'steer') {
       this.renderer.setSteerNote(agent.id, norm);
@@ -426,7 +437,9 @@ export class ChatRouter {
       const ext = path.extname(s.name).toLowerCase();
       const kind = /^\.(txt|md|csv|json|py|js|ts|mjs|cjs|html|css|xml|yml|yaml|log|ini|toml|sh|bat|ps1|java|c|cpp|h|go|rs|sql|env)$/.test(ext)
         ? '文本，可直接读取'
-        : '二进制，请按扩展名选择工具处理';
+        : /^\.(mp4|m4v|mov|mkv|webm|mp3|m4a|wav|flac|aac|ogg|opus)$/.test(ext)
+          ? '音视频，用 ffmpeg 处理（抽音轨/截取/转码）'
+          : '二进制，请按扩展名选择工具处理';
       return `- 「${s.name}」（${(s.bytes / 1024).toFixed(1)} KB，${kind}）：\n  ${s.dest}`;
     });
     const note = [

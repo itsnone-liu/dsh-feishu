@@ -49,8 +49,9 @@ const DEFAULTS = {
   imageBatchMs: 1500,
   /** Max images per coalesced batch; reaching it flushes immediately. */
   imageBatchMax: 9,
-  /** Max bytes for one received (non-image) file message. */
-  fileMaxBytes: 10485760,
+  /** Max bytes for one received (non-image) file/audio/media message.
+   *  2026-10-28: 10MB → 30MB，对齐飞书文件消息 30MB 上限（用户要发视频）。 */
+  fileMaxBytes: 31457280,
   /** Hard cap on visible markdown per card before truncation. */
   cardTextLimit: 6000,
   /** Base delay (ms) for card-patch failure backoff; retries double up to 15×. */
@@ -81,6 +82,8 @@ const DEFAULTS = {
   restartLauncher: '',
   /** inspect_image vision tool (see src/vision-tool.js). `false` disables. */
   vision: null,
+  /** send_file 出站文件工具（see src/send-tool.js，2026-10-28）。`false` 关闭。 */
+  sendFile: null,
   /** 额度耗尽自动继续（see src/autocontinue.js）。`false` 关闭。 */
   autoContinue: true,
   /** 自动继续时补发的消息文本。 */
@@ -95,16 +98,30 @@ const DEFAULTS = {
   autoContinueShortMax: 6,
   /** 追加的额度错误匹配正则（字符串数组，不区分大小写）。 */
   autoContinuePatterns: [],
-  /** 双向限额自动切换（2026-09-13 定调）：任一侧额度窗口打满时切到另一侧
-   *  继续干活；**不自动切回**（额度恢复不是切换条件，换回手动 /gpt /glm）；
-   *  两侧都满只提示不互切。'' 或 null = 关闭（纯等待老行为）。 */
+  /** 双向限额自动切换：任一侧额度窗口打满时切到另一侧继续干活；窗口恢复后
+   *  **到点自动切回**（2026-11-02 用户要求，替代 2026-09-13「不回切」定调）；
+   *  两侧都满只提示不互切，任一侧恢复仍自动切回接续。'' 或 null = 关闭
+   *  （纯等待老行为）。 */
   fallbackPrimary: 'glm-coding/glm-5.3',
   /** 另一侧模型（须已在 dsh settings.yaml providers 里配好）。 */
   fallbackBackup: 'codex-gpt/gpt-6-luna',
-  /** /ds 手动切换目标（2026-09-20）：百炼 Token 套餐 DeepSeek V4.1 Flash。
-   *  独立于 fallback 对——仅用户手动选择；额度切换永不路由到它，它出错
-   *  也只同模型等待/报错，不自动切走。须已在 dsh settings.yaml 配好。 */
-  dsModel: 'bailian-ds/deepseek-v4.1-flash',
+  /** 窗口恢复后自动切回原模型（见 autocontinue.js #attemptRestore）。
+   *  `false` = 回到 2026-09-13「不自动切回」旧行为（只手动 /gpt /glm）。 */
+  fallbackAutoRestore: true,
+  /** 自动切回探测间隔（ms）：无重置提示时按此轮询；也用作切回失败后的退避基数。 */
+  fallbackRestorePollMs: 10 * 60_000,
+  /** 自动切回总上限（ms）：fallback 超过此时长仍未恢复即放弃自动切回（等手动）。 */
+  fallbackRestoreMaxMs: 6 * 3_600_000,
+  /** /ds 手动切换目标（2026-09-20 建；2026-10-31 用户定默认锁 1017 快照）：
+   *  百炼 Token 套餐 DeepSeek V4.1 Flash 10-17 日期快照（滚动 ID 也保留在
+   *  settings.yaml 可切）。独立于 fallback 对——仅用户手动选择；额度切换永不
+   *  路由到它，它出错也只同模型等待/报错，不自动切走。须已在 dsh settings.yaml 配好。 */
+  dsModel: 'bailian-ds/deepseek-v4.1-flash-1017',
+  /** /mimo 手动切换目标（2026-10-31 接入）：小米 MiMo Token Plan v2.6 Pro。
+   *  与 /ds 同款隔离语义——不在 fallback 对内，仅用户手动选择；额度切换
+   *  永不路由到它，它额度耗尽时也只同模型等待/报错，不自动切走。
+   *  须已在 dsh settings.yaml 配好（provider: mimo，含 v2.6-flash 可 /model 切）。 */
+  mimoModel: 'mimo/mimo-v2.6-pro',
   /** 网页额度相位（/plan /exec /review，2026-09-20 方案，见 src/phases.js）。
    *  `false` 关闭。 */
   phaseWeb: true,
@@ -124,6 +141,15 @@ const DEFAULTS = {
   phaseReviewBudgetChars: 150_000,
   /** 单文件全文上限（字符）。 */
   phaseReviewFileMaxChars: 60_000,
+  /** P3（2026-11-21）：会话登记表路径。/new 与 /name 时桥自动追加一行
+   *  （Markdown 表格行）。'' = 关闭。 */
+  sessionsRegistry: '',
+  /** 方案C（2026-11-21）：桥启动后自动归档老旧会话——
+   *  >N 天未动 且 未显式命名 且 非任何聊天绑定 → 移入 sessions-archive/。
+   *  同盘rename可逆；绑定/命名/近60分钟改动的会话一律不动。false = 关闭。 */
+  sessionSweep: true,
+  /** 自动归档保留天数。 */
+  sessionSweepDays: 30,
 };
 
 function coerce(raw) {
@@ -139,7 +165,7 @@ function coerce(raw) {
   if (process.env.DSH_FEISHU_MOCK_AGENT === '1') cfg.mockAgent = true;
   // legacy boolean → groups enum
   if (raw?.allowGroupChats === true) cfg.groups = 'mention';
-  // 限额自动切换：false 显式关闭（探针配置已随"不自动切回"策略删除）
+  // 限额自动切换：false 显式关闭（自动切回由 fallbackAutoRestore 控制）
   if (raw?.fallbackPrimary === false) cfg.fallbackPrimary = '';
   if (raw?.fallbackBackup === false) cfg.fallbackBackup = '';
   if (!['off', 'mention', 'all'].includes(cfg.groups)) cfg.groups = 'off';
