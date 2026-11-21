@@ -673,23 +673,25 @@ export class Commands {
     const root = path.join(dshHome(), 'sessions');
     const out = [];
     if (!fs.existsSync(root)) return out;
+    // dsh 新版把活动转录写成 session.v4.jsonl(.zstd)（2026-11-21 实测当前会话只含
+    // v4 文件，旧探测只认 session.jsonl* → v4 会话从 /sessions 消失）；v4 头一帧
+    // 的 schema 与旧版兼容（cwd/createdAt/agentPreset 都在）。候选按优先级取第一个存在的。
+    const CANDIDATES = ['session.v4.jsonl.zstd', 'session.v4.jsonl', 'session.jsonl.zstd', 'session.jsonl'];
     for (const proj of fs.readdirSync(root)) {
       const projDir = path.join(root, proj);
       if (!fs.statSync(projDir).isDirectory()) continue;
       for (const id of fs.readdirSync(projDir)) {
         const dir = path.join(projDir, id);
         try {
-          const f = path.join(dir, 'session.jsonl.zstd');
-          const existsZ = fs.existsSync(f);
-          const existsRaw = !existsZ && fs.existsSync(path.join(dir, 'session.jsonl'));
-          if (!existsZ && !existsRaw) continue;
+          const f = CANDIDATES.map((n) => path.join(dir, n)).find((p) => fs.existsSync(p));
+          if (!f) continue;
           let header;
-          if (existsZ) {
+          if (f.endsWith('.zstd')) {
             // the header is its own leading zstd frame — single-frame decode is enough
             const first = zlib.zstdDecompressSync(fs.readFileSync(f)).toString('utf8').split('\n')[0];
             header = JSON.parse(first);
           } else {
-            const first = fs.readFileSync(path.join(dir, 'session.jsonl'), 'utf8').split('\n')[0];
+            const first = fs.readFileSync(f, 'utf8').split('\n')[0];
             header = JSON.parse(first);
           }
           out.push({ id, cwd: header.cwd, createdAt: header.createdAt, preset: header.agentPreset });
