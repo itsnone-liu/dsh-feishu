@@ -43,6 +43,12 @@ const HELP = [
   'agent 提问或请求审批时会弹出按钮卡片；直接回复文字等于自由输入。',
 ].join('\n');
 
+/** 本地时区 "YYYY-MM-DD HH:mm"。会话列表/登记表是给人看的，别用 UTC。 */
+const localStamp = (t = Date.now()) => {
+  const d = new Date(t), p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+};
+
 /** Friendly aliases → preset table keys (applied only when the key exists). */
 const MODE_ALIASES = {
   ro: 'read-only',
@@ -58,7 +64,7 @@ const MODE_ALIASES = {
 };
 
 export class Commands {
-  constructor({ config, store, driver, renderer, transport, permissionPresets, llm, agentPresets, visionReady = false, autoContinue = null, auditController = null, dshCommands = null }) {
+  constructor({ config, store, titles = null, driver, renderer, transport, permissionPresets, llm, agentPresets, visionReady = false, autoContinue = null, auditController = null, dshCommands = null }) {
     this.config = config;
     this.store = store;
     this.driver = driver;
@@ -163,6 +169,9 @@ export class Commands {
         case 'session':
         case 'ls':
           return await this.cmdSessions(chatId);
+        case 'name':
+        case 'rename':
+          return await this.cmdName(chatId, arg);
         case 'resume':
         case 'switch':
           return await this.cmdResume(chatId, arg);
@@ -786,6 +795,47 @@ export class Commands {
     return out.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
   }
 
+  /** /name <名字>：显式命名当前会话，并追加一行到登记表。 */
+  async cmdName(chatId, arg) {
+    const title = (arg ?? '').trim();
+    if (!title) {
+      const cur = this.store.get(chatId);
+      const curTitle = cur?.sessionId && this.titles ? (this.titles.get(cur.sessionId) ?? '（未命名）') : '—';
+      await this.transport.sendCard(chatId, buildInfoCard('会话命名', [
+        `当前会话名：**${curTitle}**`,
+        '',
+        '用法：`/name 103-B视频`（建议格式：课程号-工作线）',
+        '未显式命名的会话，首条消息会自动充当名字。',
+      ].join('\n'), { template: 'grey' }));
+      return true;
+    }
+    const binding = this.store.get(chatId);
+    if (!binding?.sessionId) {
+      await this.transport.sendCard(chatId, buildErrorCard('没有活动会话', '当前聊天还没绑定会话；先发条消息或 /new 创建。'));
+      return true;
+    }
+    this.titles?.set(binding.sessionId, title.slice(0, 40));
+    this.#registryAppend(title.slice(0, 40), binding.sessionId, binding.cwd, 'name');
+    await this.transport.sendCard(chatId, buildInfoCard('已命名', [
+      `会话 \`${binding.sessionId.replace(/^session-/, '').slice(0, 8)}\` → **${title.slice(0, 40)}**`,
+      '`/sessions` 可查看全部会话名。',
+    ].join('\n'), { template: 'green' }));
+    return true;
+  }
+
+  /** 往 sessionsRegistry 追加一行 markdown 表格。未配置则静默跳过。 */
+  #registryAppend(title, sessionId, cwd, via) {
+    const reg = this.config.sessionsRegistry;
+    if (!reg) return;
+    try {
+      const id8 = String(sessionId ?? '').replace(/^session-/, '').slice(0, 8);
+      const date = localStamp();
+      fs.appendFileSync(reg, `\n| ${title} | \`${id8}\` | ${cwd ?? '-'} | ${via} | ${date} |`, 'utf8');
+    } catch (e) {
+      log.warn(`sessionsRegistry append failed: ${e.message}`);
+    }
+  }
+
   async cmdSessions(chatId) {
     const binding = this.store.get(chatId);
     const cwd = binding?.cwd ?? this.config.defaultCwd;
@@ -794,9 +844,10 @@ export class Commands {
     const lines = mine.length === 0
       ? [`工作区 \`${cwd}\` 下没有持久会话。`]
       : mine.slice(0, 15).map((s) => {
-          const when = s.createdAt ? new Date(s.createdAt).toISOString().slice(0, 16).replace('T', ' ') : '?';
+          const when = s.createdAt ? localStamp(s.createdAt) : '?';
           const mark = binding?.sessionId === s.id ? ' ← 当前' : '';
-          return `- \`${s.id.replace(/^session-/, '').slice(0, 8)}\` ${when} [${s.preset ?? '-'}]${mark}`;
+          const title = (this.titles && this.titles.get(s.id)) || '（未命名）';
+          return `- \`${s.id.replace(/^session-/, '').slice(0, 8)}\` **${title}** ${when} [${s.preset ?? '-'}]${mark}`;
         });
     if (mine.length > 15) lines.push(`… 共 ${mine.length} 个`);
     await this.transport.sendCard(chatId, buildInfoCard(`会话（${mine.length}）· ${cwd}`, lines.join('\n')));

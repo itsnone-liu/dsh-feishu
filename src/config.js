@@ -148,6 +148,15 @@ const DEFAULTS = {
       retryDelayMs: 5000,
     },
   },
+  /** 会话登记表路径（markdown 表格）。/name 与 /new 时追加一行。'' = 关闭。
+   *  2026-11-21：会话按名字管理后，这张表就是人工可读的索引。 */
+  sessionsRegistry: '',
+  /** 桥启动后自动归档老旧会话：>N 天未动 且 未显式命名 且 非任何聊天绑定
+   *  → 移入 sessions-archive/<日期>/<工作区>/。同盘 rename 可逆。
+   *  绑定 / 命名 / 近 60 分钟改动的一律不动。false = 关闭。 */
+  sessionSweep: true,
+  /** 自动归档保留天数。 */
+  sessionSweepDays: 30,
 };
 
 function coerce(raw) {

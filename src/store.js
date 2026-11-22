@@ -26,6 +26,11 @@ export class BindingStore {
     return this.data.get(chatId) ?? null;
   }
 
+  /** 所有聊天当前绑定的 sessionId（去重；方案C清扫保护名单用）。 */
+  sessionIds() {
+    return [...new Set([...this.data.values()].map((b) => b.sessionId).filter(Boolean))];
+  }
+
   /** Upsert fields on a chat binding. */
   update(chatId, patch) {
     const cur = this.data.get(chatId) ?? { sessionId: null, cwd: null, createdAt: Date.now() };
@@ -33,6 +38,57 @@ export class BindingStore {
     this.data.set(chatId, next);
     this.#flush();
     return next;
+  }
+
+  #flush() {
+    const obj = Object.fromEntries(this.data);
+    const tmp = `${this.file}.tmp`;
+    fs.mkdirSync(path.dirname(this.file), { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify(obj, null, 2));
+    fs.renameSync(tmp, this.file);
+  }
+}
+
+/** sessionId → 会话名（2026-11-21 P1/P2：/sessions 列表显示名）。
+ *  显式 /name 优先；未命名的新会话由 router 捕获首条用户消息自动命名。
+ *  sidecar 独立于 dsh 转录（zstd 多帧桥侧不可解），桥重启不丢。 */
+export class TitleStore {
+  constructor(dataDir) {
+    this.file = path.join(dataDir, 'session-titles.json');
+    this.data = new Map();
+    try {
+      if (fs.existsSync(this.file)) {
+        const parsed = JSON.parse(fs.readFileSync(this.file, 'utf8'));
+        for (const [k, v] of Object.entries(parsed ?? {})) this.data.set(k, v);
+      }
+    } catch (e) {
+      log.warn(`session-titles unreadable (${e.message}) — starting empty`);
+    }
+  }
+
+  get(sessionId) {
+    return this.data.get(sessionId)?.title ?? null;
+  }
+
+  /** 显式命名过的 sessionId 列表（方案C清扫保护名单用）。 */
+  explicitIds() {
+    return [...this.data.entries()].filter(([, v]) => v?.explicit).map(([k]) => k);
+  }
+
+  /** 显式命名（/name）：覆盖一切。 */
+  set(sessionId, title) {
+    this.data.set(sessionId, { title: String(title).slice(0, 40), explicit: true, at: Date.now() });
+    this.#flush();
+  }
+
+  /** 自动命名：仅当该会话尚无任何名字（首条用户消息截断）。 */
+  setAuto(sessionId, text) {
+    if (this.data.has(sessionId)) return false;
+    const t = String(text ?? '').replace(/\s+/g, ' ').trim().slice(0, 24);
+    if (!t) return false;
+    this.data.set(sessionId, { title: t, explicit: false, at: Date.now() });
+    this.#flush();
+    return true;
   }
 
   #flush() {

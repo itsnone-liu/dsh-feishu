@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 export class ChatRouter {
-  constructor({ config, store, driver, renderer, transport, interactions, commands, visionReady = false, autoContinue = null }) {
+  constructor({ config, store, titles = null, driver, renderer, transport, interactions, commands, visionReady = false, autoContinue = null }) {
     this.config = config;
     this.store = store;
     this.driver = driver;
@@ -114,6 +114,10 @@ export class ChatRouter {
     const { chatId, openId, messageId, text } = msg;
     // normalize: full-width slash (mobile IME) + stray whitespace
     const norm = typeof text === 'string' ? text.replace(/^\s*／/, '/').trim() : text;
+    // 会话命名：该会话第一条用户消息自动成为名字（/name 显式命名优先，永不覆盖）
+    if (this.titles && norm && !norm.startsWith('/') && binding?.sessionId) {
+      try { this.titles.setAuto(binding.sessionId, norm); } catch { /* 命名失败绝不影响消息 */ }
+    }
 
     // dedup (Feishu may redeliver)
     if (messageId) {

@@ -21,7 +21,8 @@
 import z from '@deepseek-ai/schemastery';
 import { loadConfig } from './config.js';
 import { log, setLogFile } from './log.js';
-import { BindingStore } from './store.js';
+import { BindingStore, TitleStore } from './store.js';
+import { sweepShelve } from './shelve.js';
 import { TurnRenderer } from './renderer.js';
 import { SessionDriver } from './driver.js';
 import { ChatRouter } from './router.js';
@@ -81,6 +82,8 @@ function apply(ctx, config) {
   }
 
   const store = new BindingStore(cfg.dataDir);
+  /** sessionId → 会话名。sidecar（session-titles.json），独立于 dsh 转录。 */
+  const titles = new TitleStore(cfg.dataDir);
   const driver = new SessionDriver({ ctx, config: cfg });
   /** Set once the transport is up; the session/event listener reads it each event. */
   let voiceIn = null;
@@ -94,7 +97,7 @@ function apply(ctx, config) {
         config: cfg,
         chatOfSession: (sessionId) => renderer.chatOf(sessionId),
       });
-      const commands = new Commands({ config: cfg, store, driver, renderer, transport, permissionPresets: ctx.permissionPresets, llm: ctx.llm, agentPresets: ctx.agentPresets, visionReady, autoContinue: null, dshCommands: (typeof ctx.get === 'function' ? ctx.get('commands') : ctx.commands) ?? null });
+      const commands = new Commands({ config: cfg, store, titles, driver, renderer, transport, permissionPresets: ctx.permissionPresets, llm: ctx.llm, agentPresets: ctx.agentPresets, visionReady, autoContinue: null, dshCommands: (typeof ctx.get === 'function' ? ctx.get('commands') : ctx.commands) ?? null });
       const autoContinue = new AutoContinue({ config: cfg, driver, renderer, transport });
       commands.autoContinue = autoContinue; // 注入（构造顺序：Commands 先建，AutoContinue 需要 transport 就绪）
       // P-E（2026-09-29 用户拍板）：桥内不再做 LLM 枚举恢复 / 自动代码修复。
@@ -213,7 +216,17 @@ function apply(ctx, config) {
       commands.auditLifecycle.restoreActive().catch((e) => {
         log.error(`audit lifecycle restore failed: ${e?.stack ?? e}`);
       });
-      const router = new ChatRouter({ config: cfg, store, driver, renderer, transport, interactions, commands, visionReady, autoContinue });
+      const router = new ChatRouter({ config: cfg, store, titles, driver, renderer, transport, interactions, commands, visionReady, autoContinue });
+      // 会话自动归档（2026-11-21）：桥启动后扫一遍，把「久未动 + 未命名 +
+      // 未绑定」的会话移进 sessions-archive/。任何失败只记日志，绝不影响启动。
+      if (cfg.sessionSweep) {
+        try {
+          const r = sweepShelve({ config: cfg, store, titles });
+          log.info(`session sweep done: moved=${r.moved} kept=${r.kept}`);
+        } catch (e) {
+          log.warn(`session sweep skipped: ${e?.message ?? e}`);
+        }
+      }
       // Voice ingress is opt-in (config.voice.enabled) and local-only. It is
       // created even when disabled so a later config flip needs no code change.
       voiceIn = createVoiceIn({ router, driver, store, config: cfg, log });
