@@ -17,6 +17,7 @@ export class ChatRouter {
   constructor({ config, store, titles = null, driver, renderer, transport, interactions, commands, visionReady = false, autoContinue = null }) {
     this.config = config;
     this.store = store;
+    this.titles = titles;   // 2026-11-22 修复合并遗漏
     this.driver = driver;
     this.renderer = renderer;
     this.transport = transport;

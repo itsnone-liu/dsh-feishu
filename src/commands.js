@@ -67,6 +67,7 @@ export class Commands {
   constructor({ config, store, titles = null, driver, renderer, transport, permissionPresets, llm, agentPresets, visionReady = false, autoContinue = null, auditController = null, dshCommands = null }) {
     this.config = config;
     this.store = store;
+    this.titles = titles;   // 2026-11-22 修复合并遗漏：漏了这行导致 /name 静默无效
     this.driver = driver;
     this.renderer = renderer;
     this.transport = transport;
