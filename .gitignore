@@ -5,3 +5,4 @@ node_modules/
 .learnings/
 research/out/*
 !research/out/.gitkeep
+*.bak-*

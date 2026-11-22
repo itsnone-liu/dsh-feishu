@@ -116,6 +116,7 @@ export class ChatRouter {
     // normalize: full-width slash (mobile IME) + stray whitespace
     const norm = typeof text === 'string' ? text.replace(/^\s*／/, '/').trim() : text;
     // 会话命名：该会话第一条用户消息自动成为名字（/name 显式命名优先，永不覆盖）
+    const binding = this.store.get(chatId);
     if (this.titles && norm && !norm.startsWith('/') && binding?.sessionId) {
       try { this.titles.setAuto(binding.sessionId, norm); } catch { /* 命名失败绝不影响消息 */ }
     }

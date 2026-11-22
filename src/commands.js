@@ -861,9 +861,22 @@ export class Commands {
       return true;
     }
     const all = this.#listPersistedSessions();
-    const hits = all.filter((s) => s.id.includes(prefix));
+    let hits = all.filter((s) => s.id.includes(prefix));
+    if (hits.length === 0 && this.titles) {
+      // 2026-11-22 用户需求：/resume 支持按 /name 的会话名匹配（id 前缀优先，没命中再按名找）
+      const byName = this.titles.findByTitle(prefix)
+        .map((e) => all.find((s) => s.id === e.id))
+        .filter(Boolean);
+      if (byName.length === 1) {
+        hits = byName;
+      } else if (byName.length > 1) {
+        await this.transport.sendCard(chatId, buildErrorCard('歧义（多个会话名匹配）',
+          `会话名匹配多个，改用 id 前缀（/sessions 查 id）：\n${byName.map((h) => `${this.titles.get(h.id)} → \`${h.id.replace(/^session-/, '').slice(0, 8)}\``).join('\n')}`));
+        return true;
+      }
+    }
     if (hits.length === 0) {
-      await this.transport.sendCard(chatId, buildErrorCard('没找到', `没有匹配 ${prefix} 的持久会话`));
+      await this.transport.sendCard(chatId, buildErrorCard('没找到', `没有匹配 ${prefix} 的持久会话（id 前缀与会话名都没命中）`));
       return true;
     }
     if (hits.length > 1) {
@@ -884,6 +897,16 @@ export class Commands {
     try {
       const agent = await this.driver.ensure(binding, { allowCreate: false });
       this.renderer.attach(agent.id, chatId);
+      // 2026-11-22 用户需求：会话被本聊天接续后，解除其他聊天对同一会话的绑定，防止两边串台
+      if (typeof this.store.all === 'function') {
+        for (const [cid, b] of this.store.all()) {
+          if (cid === chatId || !b?.sessionId || b.sessionId !== target.id) continue;
+          this.store.update(cid, { sessionId: null });
+          this.transport.sendCard(cid, buildInfoCard('会话已被接走',
+            `会话 \`${target.id.replace(/^session-/, '').slice(0, 8)}\`（${this.titles?.get(target.id) ?? '未命名'}）已在其他聊天接续。\n这里下次发消息会开一个新会话。`,
+            { template: 'grey' })).catch(() => {});
+        }
+      }
       const when = target.createdAt ? new Date(target.createdAt).toISOString().slice(0, 16).replace('T', ' ') : '?';
       await this.transport.sendCard(chatId, buildInfoCard('已接续会话', `\`${target.id}\`\n创建于 ${when}\n工作区 \`${target.cwd}\``, { template: 'green' }));
     } catch (e) {

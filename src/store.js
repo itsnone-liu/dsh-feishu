@@ -31,6 +31,11 @@ export class BindingStore {
     return [...new Set([...this.data.values()].map((b) => b.sessionId).filter(Boolean))];
   }
 
+  /** 全部绑定条目 [chatId, binding]，供跨聊天解绑检查（2026-11-22 resume 防串台）。 */
+  all() {
+    return [...this.data.entries()];
+  }
+
   /** Upsert fields on a chat binding. */
   update(chatId, patch) {
     const cur = this.data.get(chatId) ?? { sessionId: null, cwd: null, createdAt: Date.now() };
@@ -68,6 +73,20 @@ export class TitleStore {
 
   get(sessionId) {
     return this.data.get(sessionId)?.title ?? null;
+  }
+
+  /** 按会话名找会话（2026-11-22 /resume 按名匹配）：精确 > 前缀 > 包含，大小写不敏感。返回 [{ id, title }]。 */
+  findByTitle(q) {
+    const query = String(q ?? '').trim().toLowerCase();
+    if (!query) return [];
+    const entries = [...this.data.entries()]
+      .filter(([, v]) => v?.title)
+      .map(([id, v]) => ({ id, title: String(v.title) }));
+    const exact = entries.filter((e) => e.title.toLowerCase() === query);
+    if (exact.length) return exact;
+    const prefix = entries.filter((e) => e.title.toLowerCase().startsWith(query));
+    if (prefix.length) return prefix;
+    return entries.filter((e) => e.title.toLowerCase().includes(query));
   }
 
   /** 显式命名过的 sessionId 列表（方案C清扫保护名单用）。 */
