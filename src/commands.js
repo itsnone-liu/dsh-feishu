@@ -126,7 +126,7 @@ export class Commands {
   }
 
   /** Returns true when the text was a command (and has been answered). */
-  async handle(chatId, text) {
+  async handle(chatId, text, msg = null) {
     if (!text.startsWith('/')) return false;
     const [rawCmd, ...rest] = text.slice(1).trim().split(/\s+/);
     const arg = rest.join(' ');
@@ -169,7 +169,7 @@ export class Commands {
         case 'sessions':
         case 'session':
         case 'ls':
-          return await this.cmdSessions(chatId);
+          return await this.cmdSessions(chatId, arg, msg?.chatType ?? 'p2p');
         case 'name':
         case 'rename':
           return await this.cmdName(chatId, arg);
@@ -837,21 +837,39 @@ export class Commands {
     }
   }
 
-  async cmdSessions(chatId) {
+  async cmdSessions(chatId, arg, chatType = 'p2p') {
     const binding = this.store.get(chatId);
     const cwd = binding?.cwd ?? this.config.defaultCwd;
+    const showAll = (arg ?? '').trim().toLowerCase() === 'all';
     const all = this.#listPersistedSessions();
-    const mine = all.filter((s) => s.cwd && (s.cwd === cwd || s.cwd.startsWith(cwd + path.sep)));
-    const lines = mine.length === 0
-      ? [`工作区 \`${cwd}\` 下没有持久会话。`]
-      : mine.slice(0, 15).map((s) => {
+    const titleOf = (s) => (this.titles && this.titles.get(s.id)) || null;
+    // 2026-11-24: 群聊 = 单会话作用域（一个群只有它自己那条会话，列表默认只显示当前会话）。
+    // 私聊才是「当前工作区 ∪ 全部允许工作区」，方便跨工作区 /resume。
+    const isGroup = chatType !== 'p2p';
+    const roots = isGroup
+      ? [cwd]
+      : [cwd, ...(this.config.allowedWorkspaces ?? [])].filter(Boolean);
+    const under = (s, r) => s.cwd === r || s.cwd.startsWith(r.endsWith(path.sep) ? r : r + path.sep);
+    const mineAll = all.filter((s) => s.cwd && roots.some((r) => under(s, r)));
+    const scoped = isGroup && !showAll
+      ? mineAll.filter((s) => s.id === binding?.sessionId)
+      : mineAll;
+    const named = scoped.filter((s) => titleOf(s)).sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+    const unnamed = scoped.filter((s) => !titleOf(s)).sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+    const shown = (showAll ? [...named, ...unnamed] : (isGroup ? scoped : named)).slice(0, 12);
+    const lines = shown.length === 0
+      ? [`工作区 \`${cwd}\` 下没有会话。`]
+      : shown.map((s) => {
           const when = s.createdAt ? localStamp(s.createdAt) : '?';
           const mark = binding?.sessionId === s.id ? ' ← 当前' : '';
-          const title = (this.titles && this.titles.get(s.id)) || '（未命名）';
-          return `- \`${s.id.replace(/^session-/, '').slice(0, 8)}\` **${title}** ${when} [${s.preset ?? '-'}]${mark}`;
+          const title = titleOf(s) || '（未命名）';
+          const where = s.cwd && s.cwd !== cwd ? ` \`${path.basename(s.cwd)}\`` : '';
+          return `- \`${s.id.replace(/^session-/, '').slice(0, 8)}\` **${title}** ${when} [${s.preset ?? '-'}]${where}${mark}`;
         });
-    if (mine.length > 15) lines.push(`… 共 ${mine.length} 个`);
-    await this.transport.sendCard(chatId, buildInfoCard(`会话（${mine.length}）· ${cwd}`, lines.join('\n')));
+    if (isGroup && !showAll) lines.push('群聊默认只显示当前会话；\`/sessions all\` 展开本工作区全部会话。');
+    else if (!showAll && unnamed.length) lines.push(`… 另有 ${unnamed.length} 个未命名会话（\`/sessions all\` 查看）`);
+    if (showAll && scoped.length > shown.length) lines.push(`… 共 ${scoped.length} 个，仅显示前 ${shown.length} 个`);
+    await this.transport.sendCard(chatId, buildInfoCard(`会话· ${shown.length} / 共 ${scoped.length} · ${cwd}`, lines.join('\n')));
     return true;
   }
 

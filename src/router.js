@@ -171,7 +171,7 @@ export class ChatRouter {
     }
 
     // commands
-    if (await this.commands.handle(chatId, norm)) return;
+    if (await this.commands.handle(chatId, norm, msg)) return;
 
     // image traffic → (optional burst window) → sniff → gate → durable commit → image blocks
     if (msg.images?.length) {
