@@ -843,20 +843,25 @@ export class Commands {
     const showAll = (arg ?? '').trim().toLowerCase() === 'all';
     const all = this.#listPersistedSessions();
     const titleOf = (s) => (this.titles && this.titles.get(s.id)) || null;
-    // 2026-11-24: 群聊 = 单会话作用域（一个群只有它自己那条会话，列表默认只显示当前会话）。
-    // 私聊才是「当前工作区 ∪ 全部允许工作区」，方便跨工作区 /resume。
+    // 2026-11-24: 群聊列表 = 所有群会话（chat-meta.json 里登记过的群聊用过的会话，
+    // 含当前这条）。群聊之间可能共用同一工作区，单靠 cwd 分不出群/私，故按登记表收口。
+    // 私聊 = 「当前工作区 ∪ 全部允许工作区」，方便跨工作区 /resume。
     const isGroup = chatType !== 'p2p';
-    const roots = isGroup
-      ? [cwd]
-      : [cwd, ...(this.config.allowedWorkspaces ?? [])].filter(Boolean);
     const under = (s, r) => s.cwd === r || s.cwd.startsWith(r.endsWith(path.sep) ? r : r + path.sep);
-    const mineAll = all.filter((s) => s.cwd && roots.some((r) => under(s, r)));
-    const scoped = isGroup && !showAll
-      ? mineAll.filter((s) => s.id === binding?.sessionId)
-      : mineAll;
+    let scoped;
+    if (isGroup && !showAll) {
+      const ids = this.#groupSessionIds();
+      scoped = all.filter((s) => ids.has(s.id));
+      if (scoped.length === 0 && binding?.sessionId) {
+        scoped = all.filter((s) => s.id === binding.sessionId);
+      }
+    } else {
+      const roots = [cwd, ...(this.config.allowedWorkspaces ?? [])].filter(Boolean);
+      scoped = all.filter((s) => s.cwd && roots.some((r) => under(s, r)));
+    }
     const named = scoped.filter((s) => titleOf(s)).sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
     const unnamed = scoped.filter((s) => !titleOf(s)).sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
-    const shown = (showAll ? [...named, ...unnamed] : (isGroup ? scoped : named)).slice(0, 12);
+    const shown = (showAll || isGroup ? [...named, ...unnamed] : named).slice(0, 12);
     const lines = shown.length === 0
       ? [`工作区 \`${cwd}\` 下没有会话。`]
       : shown.map((s) => {
@@ -866,11 +871,25 @@ export class Commands {
           const where = s.cwd && s.cwd !== cwd ? ` \`${path.basename(s.cwd)}\`` : '';
           return `- \`${s.id.replace(/^session-/, '').slice(0, 8)}\` **${title}** ${when} [${s.preset ?? '-'}]${where}${mark}`;
         });
-    if (isGroup && !showAll) lines.push('群聊默认只显示当前会话；\`/sessions all\` 展开本工作区全部会话。');
+    if (isGroup && !showAll) lines.push(`群会话列表（共 ${scoped.length} 条）；\`/sessions all\` 可展开本工作区全部会话。`);
     else if (!showAll && unnamed.length) lines.push(`… 另有 ${unnamed.length} 个未命名会话（\`/sessions all\` 查看）`);
     if (showAll && scoped.length > shown.length) lines.push(`… 共 ${scoped.length} 个，仅显示前 ${shown.length} 个`);
-    await this.transport.sendCard(chatId, buildInfoCard(`会话· ${shown.length} / 共 ${scoped.length} · ${cwd}`, lines.join('\n')));
+    const heading = isGroup && !showAll ? `群会话（${scoped.length}）` : `会话· ${shown.length} / 共 ${scoped.length}`;
+    await this.transport.sendCard(chatId, buildInfoCard(`${heading} · ${cwd}`, lines.join('\n')));
     return true;
+  }
+
+  /** 所有「群聊」用过的会话 id（chat-meta.json 登记）。 */
+  #groupSessionIds() {
+    const ids = new Set();
+    try {
+      const f = path.join(this.config.dataDir, 'chat-meta.json');
+      const meta = JSON.parse(fs.readFileSync(f, 'utf8'));
+      for (const v of Object.values(meta)) {
+        if (v && v.group) for (const id of v.sessions ?? []) ids.add(id);
+      }
+    } catch { /* 无登记表 → 空集合，调用方回退到当前会话 */ }
+    return ids;
   }
 
   async cmdResume(chatId, prefix) {

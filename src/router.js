@@ -113,6 +113,8 @@ export class ChatRouter {
 
   async #handle(msg) {
     const { chatId, openId, messageId, text } = msg;
+    // 2026-11-24: 每条消息都记一下这个聊天是 p2p 还是群（供群会话列表区分）
+    if (msg.chatType) this.#noteChat(chatId, null, msg.chatType);
     // normalize: full-width slash (mobile IME) + stray whitespace
     const norm = typeof text === 'string' ? text.replace(/^\s*／/, '/').trim() : text;
     // 会话命名：该会话第一条用户消息自动成为名字（/name 显式命名优先，永不覆盖）
@@ -236,7 +238,35 @@ export class ChatRouter {
     const agent = await this.driver.ensure(binding);
     this.store.update(chatId, { sessionId: binding.sessionId, cwd: binding.cwd });
     if (this.renderer.chatOf(agent.id) !== chatId) this.renderer.attach(agent.id, chatId);
+    // 2026-11-24: 记下「这个聊天用过哪些会话 + 它是不是群聊」，供 /sessions 在
+    // 群聊里列出「所有群会话」——群聊之间共用工作区时，单靠 cwd 无法区分。
+    this.#noteChat(chatId, binding.sessionId);
     return agent;
+  }
+
+  /** chat-meta.json: chatId → { group: bool, sessions: [id…] }（追加式，仅用于列表展示）。 */
+  #noteChat(chatId, sessionId, chatType = null) {
+    try {
+      const f = path.join(this.config.dataDir, 'chat-meta.json');
+      let meta = {};
+      try { meta = JSON.parse(fs.readFileSync(f, 'utf8')); } catch { meta = {}; }
+      const cur = meta[chatId] ?? { group: false, sessions: [] };
+      let dirty = false;
+      if (chatType && Boolean(cur.group) !== (chatType !== 'p2p')) {
+        cur.group = chatType !== 'p2p';
+        dirty = true;
+      }
+      if (sessionId && !cur.sessions.includes(sessionId)) {
+        cur.sessions.push(sessionId);
+        if (cur.sessions.length > 20) cur.sessions = cur.sessions.slice(-20);
+        dirty = true;
+      }
+      if (!dirty && meta[chatId]) return;
+      meta[chatId] = cur;
+      fs.writeFileSync(f, JSON.stringify(meta, null, 2));
+    } catch (e) {
+      log.debug(`chat-meta write failed: ${e.message}`);
+    }
   }
 
   // ---------------------------------------------------------- image bursts
